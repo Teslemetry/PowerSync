@@ -11997,6 +11997,7 @@ class SolcastForecastCoordinator(DataUpdateCoordinator):
                 "forecast_periods": len(full_forecasts) if full_forecasts else len(hourly_forecast),
                 "last_update": dt_util.utcnow(),
                 "source": "solcast_integration",
+                "resource_ids": list(self._resource_ids),
             }
 
         except (ValueError, TypeError, AttributeError) as e:
@@ -12100,7 +12101,7 @@ class SolcastForecastCoordinator(DataUpdateCoordinator):
             _LOGGER.debug(f"Error fetching estimated_actuals: {e}")
             return None
 
-    def _combine_forecasts(self, base: list[dict], additional: list[dict]) -> list[dict]:
+    def _combine_forecasts(self, base: list[dict], additional: list[dict]) -> list[dict] | None:
         """Combine forecasts from multiple resources by summing pv_estimate values.
 
         Args:
@@ -12108,8 +12109,38 @@ class SolcastForecastCoordinator(DataUpdateCoordinator):
             additional: Additional forecast list to add
 
         Returns:
-            Combined forecast list with summed values
+            Combined forecast list with summed values, or ``None`` when the
+            resource responses do not cover the same periods.
         """
+        if not base or not additional:
+            return None
+
+        base_periods = [forecast.get("period_end") for forecast in base]
+        additional_periods = [forecast.get("period_end") for forecast in additional]
+        if (
+            None in base_periods
+            or None in additional_periods
+            or len(set(base_periods)) != len(base_periods)
+            or len(set(additional_periods)) != len(additional_periods)
+            or set(base_periods) != set(additional_periods)
+        ):
+            _LOGGER.warning(
+                "Solcast resource forecast periods do not match; "
+                "discarding the incomplete multi-resource aggregate"
+            )
+            return None
+
+        estimate_fields = _SOLCAST_ESTIMATE_FIELDS[self._estimate_type]
+        if any(
+            not any(forecast.get(field) is not None for field in estimate_fields)
+            for forecast in (*base, *additional)
+        ):
+            _LOGGER.warning(
+                "Solcast resource forecast is missing the configured estimate; "
+                "discarding the incomplete multi-resource aggregate"
+            )
+            return None
+
         additional_lookup = {f.get("period_end"): f for f in additional}
 
         combined = []
@@ -12129,6 +12160,20 @@ class SolcastForecastCoordinator(DataUpdateCoordinator):
             combined.append(result)
 
         return combined
+
+    def _has_complete_forecast(self, data: dict[str, Any] | None) -> bool:
+        """Return whether cached data belongs to the configured resources.
+
+        Multi-resource data written before completeness metadata existed cannot
+        safely be distinguished from a single-site partial aggregate, so it is
+        rejected as a fallback. Single-resource legacy caches remain usable.
+        """
+        if not data or not data.get("available"):
+            return False
+        cached_resource_ids = data.get("resource_ids")
+        if cached_resource_ids is None:
+            return len(self._resource_ids) == 1
+        return cached_resource_ids == self._resource_ids
 
     async def _restore_rate_limit_state(self) -> None:
         """Restore API call counter from persistent storage."""
@@ -12170,6 +12215,7 @@ class SolcastForecastCoordinator(DataUpdateCoordinator):
                 "_daily_forecast_date": self._daily_forecast_date,
                 "_daily_forecast_kwh": self._daily_forecast_kwh,
                 "_daily_forecast_peak_kw": self._daily_forecast_peak_kw,
+                "resource_ids": data.get("resource_ids", list(self._resource_ids)),
             }
             await self._forecast_store.async_save(cache)
         except Exception:
@@ -12186,6 +12232,12 @@ class SolcastForecastCoordinator(DataUpdateCoordinator):
         try:
             cache = await self._forecast_store.async_load()
             if not cache:
+                return
+            cached_resource_ids = cache.get("resource_ids")
+            if cached_resource_ids is None:
+                if len(self._resource_ids) != 1:
+                    return
+            elif cached_resource_ids != self._resource_ids:
                 return
             cached_estimate_type = cache.get("estimate_type")
             if (
@@ -12221,6 +12273,12 @@ class SolcastForecastCoordinator(DataUpdateCoordinator):
         try:
             cache = await self._forecast_store.async_load()
             if cache and cache.get("date") == dt_util.now().strftime("%Y-%m-%d"):
+                cached_resource_ids = cache.get("resource_ids")
+                if cached_resource_ids is None:
+                    if len(self._resource_ids) != 1:
+                        return None
+                elif cached_resource_ids != self._resource_ids:
+                    return None
                 cached_estimate_type = cache.get("estimate_type")
                 if (
                     cached_estimate_type != self._estimate_type
@@ -12248,6 +12306,7 @@ class SolcastForecastCoordinator(DataUpdateCoordinator):
                     "forecast_periods": n_periods,
                     "last_update": dt_util.utcnow(),
                     "source": f"{cache.get('source', 'cache')}_restored",
+                    "resource_ids": list(self._resource_ids),
                 }
             return None
         except Exception:
@@ -12260,6 +12319,11 @@ class SolcastForecastCoordinator(DataUpdateCoordinator):
         If that's 0 (from a previous bug), queries the recorder for the last non-zero value
         from today's history.
         """
+        # A scalar sensor state has no proof that all configured resources were
+        # represented. Never use it as a multi-resource fallback.
+        if len(self._resource_ids) > 1:
+            return None
+
         entity_ids = [
             "sensor.power_sync_solcast_today_forecast",
             "sensor.power_sync_solar_forecast_today",
@@ -12279,6 +12343,7 @@ class SolcastForecastCoordinator(DataUpdateCoordinator):
                 "forecast_periods": 0,
                 "last_update": dt_util.utcnow(),
                 "source": source,
+                "resource_ids": list(self._resource_ids),
             }
 
         try:
@@ -12403,7 +12468,7 @@ class SolcastForecastCoordinator(DataUpdateCoordinator):
             # Today's total forecast should never drop to 0 mid-day.
             new_kwh = solcast_data.get("today_forecast_kwh", 0)
             cached_kwh = self.data.get("today_forecast_kwh", 0) if self.data else 0
-            if new_kwh == 0 and cached_kwh > 0:
+            if new_kwh == 0 and cached_kwh > 0 and self._has_complete_forecast(self.data):
                 _LOGGER.info(
                     f"Solcast HA integration reported 0kWh but cached forecast is "
                     f"{cached_kwh:.1f}kWh — likely rate-limited, using cached data"
@@ -12417,7 +12482,7 @@ class SolcastForecastCoordinator(DataUpdateCoordinator):
         # Check if we're rate limited — but verify with a real API call
         # on first update after restore (persisted counter may be stale)
         if self._rate_limited:
-            if self.data and self.data.get("today_forecast_kwh", 0) > 0:
+            if self._has_complete_forecast(self.data):
                 _LOGGER.debug(
                     f"Solcast API rate limited - using cached forecast data. "
                     f"API calls today: {self._api_calls_today}/{self.DAILY_API_LIMIT}"
@@ -12454,7 +12519,7 @@ class SolcastForecastCoordinator(DataUpdateCoordinator):
                     f"Solcast API rate limited and no cached forecast available. "
                     f"API calls today: {self._api_calls_today}/{self.DAILY_API_LIMIT}"
                 )
-                return self.data or {"available": False}
+                return self.data if self._has_complete_forecast(self.data) else {"available": False}
 
         # Solcast integration not available - make our own API calls
         # Hard guard: refuse to make API calls if daily limit already reached
@@ -12466,7 +12531,7 @@ class SolcastForecastCoordinator(DataUpdateCoordinator):
                 f"Using cached data."
             )
             self._rate_limited = True
-            if self.data and self.data.get("today_forecast_kwh", 0) > 0:
+            if self._has_complete_forecast(self.data):
                 return self.data
             restored = await self._restore_forecast_cache()
             if restored:
@@ -12474,7 +12539,7 @@ class SolcastForecastCoordinator(DataUpdateCoordinator):
             restored = await self._restore_from_ha_state()
             if restored:
                 return restored
-            return self.data or {"available": False}
+            return self.data if self._has_complete_forecast(self.data) else {"available": False}
 
         try:
             async with asyncio.timeout(60):  # Longer timeout for multiple API calls
@@ -12488,7 +12553,7 @@ class SolcastForecastCoordinator(DataUpdateCoordinator):
                 forecasts = await self._fetch_forecast_for_resource(self._resource_ids[0])
                 if not forecasts:
                     _LOGGER.warning("No forecasts from Solcast API")
-                    if self.data and self.data.get("today_forecast_kwh", 0) > 0:
+                    if self._has_complete_forecast(self.data):
                         return self.data
                     # Try persistent cache (survives restarts)
                     restored = await self._restore_forecast_cache()
@@ -12509,19 +12574,40 @@ class SolcastForecastCoordinator(DataUpdateCoordinator):
 
                 # If multiple resources, fetch and combine
                 if len(self._resource_ids) > 1:
+                    complete_aggregate = True
                     for resource_id in self._resource_ids[1:]:
                         if not self._can_make_api_call():
                             _LOGGER.warning(
                                 f"Solcast API daily limit reached — skipping resource {resource_id[:8]}..."
                             )
+                            complete_aggregate = False
                             break
                         self._track_api_call()
                         additional_forecasts = await self._fetch_forecast_for_resource(resource_id)
-                        if additional_forecasts:
-                            forecasts = self._combine_forecasts(forecasts, additional_forecasts)
-                        else:
+                        if not additional_forecasts:
                             _LOGGER.warning(f"Failed to fetch forecast from resource {resource_id[:8]}...")
+                            complete_aggregate = False
+                            break
+                        combined_forecasts = self._combine_forecasts(forecasts, additional_forecasts)
+                        if combined_forecasts is None:
+                            complete_aggregate = False
+                            break
+                        forecasts = combined_forecasts
 
+                    if not complete_aggregate:
+                        _LOGGER.warning(
+                            "Solcast multi-resource fetch was incomplete; "
+                            "not publishing a partial aggregate"
+                        )
+                        if self._has_complete_forecast(self.data):
+                            return self.data
+                        restored = await self._restore_forecast_cache()
+                        if restored:
+                            return restored
+                        restored = await self._restore_from_ha_state()
+                        if restored:
+                            return restored
+                        return {"available": False}
                     _LOGGER.info(f"Combined data from {len(self._resource_ids)} Solcast sites")
 
             if not forecasts:
@@ -12648,6 +12734,7 @@ class SolcastForecastCoordinator(DataUpdateCoordinator):
                 "estimate_type": self._estimate_type,
                 "last_update": dt_util.utcnow(),
                 "source": "api",
+                "resource_ids": list(self._resource_ids),
             }
             # Persist good forecast data so it survives restarts
             self.hass.async_create_task(self._save_forecast_cache(result))
