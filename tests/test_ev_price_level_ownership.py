@@ -280,6 +280,78 @@ def test_auto_schedule_runtime_uses_plan_departure_policy_across_midnight(
     assert "Grid price" not in state.last_decision_reason
 
 
+def test_auto_schedule_rearms_after_dynamic_solar_owner_cleanup(monkeypatch):
+    """A released dynamic controller must not leave Smart Schedule latched."""
+    now = datetime(2026, 10, 11, 9, 47, tzinfo=timezone.utc)
+    monkeypatch.setattr(ev_planner.dt_util, "now", lambda: now)
+    monkeypatch.setattr(ev_planner, "get_ev_location", AsyncMock(return_value="home"))
+    monkeypatch.setattr(ev_planner, "is_ev_plugged_in", AsyncMock(return_value=True))
+
+    class _SolarPlanner:
+        def _is_grid_charging_blocked_at(self, _now):
+            return False
+
+        async def should_charge_now(self, **kwargs):
+            return True, "solar window eligible", "solar_surplus"
+
+    hass = _FakeHass()
+    entry = _FakeConfigEntry()
+    executor = ev_planner.AutoScheduleExecutor(hass, entry, planner=_SolarPlanner())
+    executor._get_vehicle_soc = AsyncMock(return_value=53)
+    executor._resolve_effective_charger_capability = AsyncMock(return_value=None)
+
+    settings = ev_planner.AutoScheduleSettings(
+        enabled=True,
+        vehicle_id=VIN,
+        target_soc=85,
+        priority=ev_planner.ChargingPriority.SOLAR_ONLY,
+    )
+    state = executor.get_state(VIN)
+    state.current_plan = SimpleNamespace(
+        windows=[
+            SimpleNamespace(
+                start_time="2026-10-11T09:00:00",
+                end_time="2026-10-11T10:00:00",
+                source="solar_surplus",
+                estimated_power_kw=2.0,
+            )
+        ],
+        target_time="2026-10-11T13:15:00",
+    )
+    state.last_plan_update = now.replace(tzinfo=None)
+    state.is_charging = True
+    state.curtailment_override_active = True
+
+    async def rearm(*_args, **_kwargs):
+        state.is_charging = True
+        return True
+
+    executor._start_charging = AsyncMock(side_effect=rearm)
+    executor._restore_curtailment = AsyncMock()
+
+    from power_sync.automations import ev_ownership
+
+    monkeypatch.setattr(ev_ownership, "get_active_ev_owner_mode", lambda *args: None)
+
+    asyncio.run(
+        executor._evaluate_vehicle(
+            VIN,
+            settings,
+            {
+                "battery_soc": 53,
+                "solar_power": 8000,
+                "load_power": 700,
+                "grid_power": -2300,
+            },
+            current_price_cents=25.6,
+        )
+    )
+
+    executor._restore_curtailment.assert_awaited_once_with(state)
+    executor._start_charging.assert_awaited_once()
+    assert state.is_charging is True
+
+
 def test_price_log_value_formats_unknown_without_cents_suffix():
     assert ev_planner._format_price_log_value(None) == "unknown"
     assert ev_planner._format_price_log_value(12) == "12.0c"
@@ -1213,6 +1285,106 @@ def test_available_ev_power_uses_vehicle_minimum_and_other_ev_reservations():
         minimum_charging_power_kw=1.15,
         charging_power_step_kw=0.23,
     ) == 0
+
+
+def test_solar_only_plan_does_not_label_grid_capacity_as_solar(monkeypatch):
+    brisbane_tz = timezone(timedelta(hours=10))
+    monkeypatch.setattr(
+        ev_planner.dt_util,
+        "now",
+        lambda: datetime(2026, 10, 11, 9, 0, tzinfo=brisbane_tz),
+    )
+    monkeypatch.setattr(
+        ev_planner.dt_util,
+        "as_local",
+        lambda value: value.astimezone(brisbane_tz),
+        raising=False,
+    )
+    planner = ev_planner.ChargingPlanner(_FakeHass(), _FakeConfigEntry())
+    planner._grid_capacity_kw = 25.2
+    planner._get_solar_surplus_config = AsyncMock(return_value={})
+    hour = "2026-10-11T09:00:00"
+
+    plan = asyncio.run(
+        planner._plan_solar_only(
+            vehicle_id=VIN,
+            current_soc=53,
+            target_soc=85,
+            target_time=datetime(2026, 10, 11, 13, 15, tzinfo=brisbane_tz),
+            energy_needed_kwh=4.0,
+            charger_power_kw=7.36,
+            surplus_forecast=[
+                ev_planner.SurplusForecast(
+                    hour=hour,
+                    solar_kw=2.7,
+                    load_kw=0.7,
+                    surplus_kw=2.0,
+                    confidence=1.0,
+                )
+            ],
+            battery_power_schedule={hour: 0.0},
+            minimum_charging_power_kw=1.15,
+            charging_power_step_kw=0.23,
+        )
+    )
+
+    assert plan.windows[0].estimated_power_kw == pytest.approx(1.84)
+    assert plan.estimated_solar_kwh == pytest.approx(1.84)
+    assert plan.estimated_grid_kwh == 0
+    assert plan.can_meet_target is False
+
+
+def test_solar_only_plan_respects_battery_and_other_ev_solar_reservations(
+    monkeypatch,
+):
+    brisbane_tz = timezone(timedelta(hours=10))
+    monkeypatch.setattr(
+        ev_planner.dt_util,
+        "now",
+        lambda: datetime(2026, 10, 11, 9, 0, tzinfo=brisbane_tz),
+    )
+    monkeypatch.setattr(
+        ev_planner.dt_util,
+        "as_local",
+        lambda value: value.astimezone(brisbane_tz),
+        raising=False,
+    )
+    planner = ev_planner.ChargingPlanner(_FakeHass(), _FakeConfigEntry())
+    planner._grid_capacity_kw = 25.2
+    planner._get_solar_surplus_config = AsyncMock(return_value={})
+    hour = "2026-10-11T09:00:00"
+    kwargs = {
+        "vehicle_id": VIN,
+        "current_soc": 53,
+        "target_soc": 85,
+        "target_time": datetime(2026, 10, 11, 13, 15, tzinfo=brisbane_tz),
+        "energy_needed_kwh": 4.0,
+        "charger_power_kw": 7.36,
+        "surplus_forecast": [
+            ev_planner.SurplusForecast(
+                hour=hour,
+                solar_kw=2.7,
+                load_kw=0.7,
+                surplus_kw=2.0,
+                confidence=1.0,
+            )
+        ],
+        "battery_power_schedule": {hour: 0.5},
+        "minimum_charging_power_kw": 1.15,
+        "charging_power_step_kw": 0.23,
+    }
+
+    battery_only = asyncio.run(planner._plan_solar_only(**kwargs))
+    battery_and_other_ev = asyncio.run(
+        planner._plan_solar_only(
+            **kwargs,
+            reserved_ev_power_schedule={hour: 1.15},
+        )
+    )
+
+    assert battery_only.windows[0].estimated_power_kw == pytest.approx(1.38)
+    assert battery_and_other_ev.windows == []
+    assert battery_and_other_ev.estimated_solar_kwh == 0
 
 
 def test_cost_optimized_trims_partial_window_to_declared_energy(monkeypatch):

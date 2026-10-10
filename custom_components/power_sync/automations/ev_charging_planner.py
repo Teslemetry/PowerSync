@@ -2890,6 +2890,7 @@ class ChargingPlanner:
         reserved_ev_power_schedule: Optional[Dict[str, float]] = None,
         minimum_charging_power_kw: float = MIN_CHARGING_POWER_KW,
         charging_power_step_kw: Optional[float] = None,
+        allow_grid_import: bool = True,
     ) -> float:
         """Calculate available power for EV charging at a given hour.
 
@@ -2901,6 +2902,8 @@ class ChargingPlanner:
             charger_max_kw: Maximum EV charger power
             battery_power_schedule: Dict of hour -> battery charging power
             solar_surplus_kw: Available solar surplus (can exceed grid capacity)
+            allow_grid_import: Whether unused site grid capacity may supplement
+                the solar surplus for this strategy.
 
         Returns:
             Available power for EV in kW
@@ -2909,7 +2912,16 @@ class ChargingPlanner:
         reserved_ev_power = (reserved_ev_power_schedule or {}).get(hour, 0)
         grid_capacity_kw = self._get_grid_capacity_kw()
 
-        if solar_surplus_kw > 0:
+        if not allow_grid_import:
+            # Solar Only must not turn unused grid headroom into forecast solar.
+            # Keep the shared battery and other-EV reservations in the same
+            # budget, then let the common charger-limit/quantization path below
+            # enforce the physical minimum and current step.
+            total_available = max(
+                0,
+                solar_surplus_kw - max(0, battery_power) - reserved_ev_power,
+            )
+        elif solar_surplus_kw > 0:
             # Solar surplus available - EV can use surplus + remaining grid
             # Solar powers both battery and EV, only grid import is limited
             grid_needed_by_battery = max(0, battery_power - solar_surplus_kw)
@@ -3150,6 +3162,7 @@ class ChargingPlanner:
                     reserved_ev_power_schedule=reserved_ev_power_schedule,
                     minimum_charging_power_kw=minimum_charging_power_kw,
                     charging_power_step_kw=charging_power_step_kw,
+                    allow_grid_import=False,
                 )
 
                 if available_power < minimum_charging_power_kw:
@@ -6573,7 +6586,7 @@ class AutoScheduleExecutor:
         )
         active_owner_mode = None
         switch_active_controller = False
-        if should_charge and state.is_charging:
+        if state.is_charging:
             from .ev_ownership import get_active_ev_owner_mode
 
             active_owner_mode = get_active_ev_owner_mode(
@@ -6586,6 +6599,21 @@ class AutoScheduleExecutor:
                 in {"smart_schedule", "smart_schedule_solar_surplus"}
                 and active_owner_mode != desired_owner_mode
             )
+
+            if should_charge and source == "solar_surplus" and active_owner_mode is None:
+                # Dynamic cleanup can release the controller and ownership
+                # lease independently of this executor. Reconcile the cached
+                # flag before evaluating the start gate, otherwise an eligible
+                # vehicle remains permanently marked as charging with no
+                # controller to rearm it.
+                _LOGGER.info(
+                    "Auto-schedule: Reconciled stale solar charging state for %s "
+                    "after its controller was released",
+                    vehicle_id,
+                )
+                await self._restore_curtailment(state)
+                state.is_charging = False
+                state.started_at = None
 
         # Take action
         if should_charge and (not state.is_charging or switch_active_controller):
