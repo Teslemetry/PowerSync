@@ -6099,24 +6099,17 @@ class InverterStatusSensor(RestoreEntity, SensorEntity):
             return "Error"
 
         control_mode = self._control_mode()
+        physical_converged = self._entry_data().get(
+            "inverter_curtailment_physical_converged"
+        )
         if control_mode == INVERTER_CONTROL_MODE_LOAD_FOLLOWING:
-            if (
-                self._entry_data().get(
-                    "inverter_curtailment_physical_converged"
-                )
-                is False
-            ):
+            if physical_converged is not True:
                 return "Load Following Pending"
             return "Load Following"
         elif control_mode == INVERTER_CONTROL_MODE_SHUTDOWN:
             return "Shutdown"
         elif control_mode == INVERTER_CONTROL_MODE_CURTAILED or self._cached_state == "curtailed":
-            if (
-                self._entry_data().get(
-                    "inverter_curtailment_physical_converged"
-                )
-                is False
-            ):
+            if physical_converged is not True:
                 return "Curtailment Pending"
             return "Curtailed"
         elif self._cached_state == "running":
@@ -6174,10 +6167,15 @@ class InverterStatusSensor(RestoreEntity, SensorEntity):
         # Add description based on state after cached attrs so the public
         # dashboard text remains specific to PowerSync's active control mode.
         if control_mode == INVERTER_CONTROL_MODE_LOAD_FOLLOWING:
-            if attrs["physical_converged"] is False:
-                attrs["description"] = (
-                    "Inverter limit confirmed - waiting for physical site convergence"
-                )
+            if attrs["physical_converged"] is not True:
+                if attrs["physical_converged"] is False:
+                    attrs["description"] = (
+                        "Inverter limit confirmed - waiting for physical site convergence"
+                    )
+                else:
+                    attrs["description"] = (
+                        "Inverter load-following physical convergence unverified"
+                    )
             elif target_power_w is not None and target_power_w > 0:
                 attrs["description"] = f"Inverter curtailed - load following at {target_power_w}W"
             else:
@@ -6185,10 +6183,15 @@ class InverterStatusSensor(RestoreEntity, SensorEntity):
         elif control_mode == INVERTER_CONTROL_MODE_SHUTDOWN:
             attrs["description"] = "Inverter curtailed - shutdown mode"
         elif self._cached_state == "curtailed":
-            if attrs["physical_converged"] is False:
-                attrs["description"] = (
-                    "Inverter curtailment applied - site is still exporting"
-                )
+            if attrs["physical_converged"] is not True:
+                if attrs["physical_converged"] is False:
+                    attrs["description"] = (
+                        "Inverter curtailment applied - site is still exporting"
+                    )
+                else:
+                    attrs["description"] = (
+                        "Inverter curtailment physical convergence unverified"
+                    )
             else:
                 attrs["description"] = "Inverter curtailed"
         elif self._cached_state == "running":

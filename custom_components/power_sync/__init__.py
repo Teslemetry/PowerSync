@@ -9086,6 +9086,37 @@ class BatteryHealthView(HomeAssistantView):
             )
 
 
+def _apply_inverter_physical_convergence_status(
+    state_dict: dict[str, Any], entry_data: dict[str, Any]
+) -> None:
+    """Keep API status pending until physical curtailment is proven."""
+    control_mode = entry_data.get("inverter_control_mode")
+    physical_converged = entry_data.get(
+        "inverter_curtailment_physical_converged"
+    )
+    state_dict["control_mode"] = control_mode
+    state_dict["target_power_w"] = entry_data.get("inverter_power_limit_w")
+    state_dict["device_limit_confirmed"] = entry_data.get(
+        "inverter_curtailment_device_limit_confirmed"
+    )
+    state_dict["physical_converged"] = physical_converged
+    state_dict["residual_export_w"] = entry_data.get(
+        "inverter_curtailment_residual_export_w"
+    )
+    if (
+        control_mode
+        in (
+            INVERTER_CONTROL_MODE_LOAD_FOLLOWING,
+            INVERTER_CONTROL_MODE_CURTAILED,
+        )
+        and physical_converged is not True
+        and state_dict.get("status") not in {"offline", "error", "sleep"}
+    ):
+        state_dict["status"] = "curtailment_pending"
+        state_dict["is_curtailed"] = False
+        state_dict["is_curtailment_requested"] = True
+
+
 class InverterStatusView(HomeAssistantView):
     """HTTP view to get AC-coupled inverter status for mobile app."""
 
@@ -9216,6 +9247,7 @@ class InverterStatusView(HomeAssistantView):
                 "online" if cached_state == "running" else cached_state or "unknown"
             )
             state_dict["is_curtailed"] = cached_state == "curtailed"
+            _apply_inverter_physical_convergence_status(state_dict, entry_data)
             return web.json_response({
                 "success": True,
                 "enabled": True,
@@ -9276,32 +9308,7 @@ class InverterStatusView(HomeAssistantView):
             elif inverter_last_state in ("normal", "running"):
                 state_dict["is_curtailed"] = False
 
-            control_mode = entry_data.get("inverter_control_mode")
-            physical_converged = entry_data.get(
-                "inverter_curtailment_physical_converged"
-            )
-            state_dict["control_mode"] = control_mode
-            state_dict["target_power_w"] = entry_data.get(
-                "inverter_power_limit_w"
-            )
-            state_dict["device_limit_confirmed"] = entry_data.get(
-                "inverter_curtailment_device_limit_confirmed"
-            )
-            state_dict["physical_converged"] = physical_converged
-            state_dict["residual_export_w"] = entry_data.get(
-                "inverter_curtailment_residual_export_w"
-            )
-            if (
-                control_mode
-                in (
-                    INVERTER_CONTROL_MODE_LOAD_FOLLOWING,
-                    INVERTER_CONTROL_MODE_CURTAILED,
-                )
-                and physical_converged is False
-            ):
-                state_dict["status"] = "curtailment_pending"
-                state_dict["is_curtailed"] = False
-                state_dict["is_curtailment_requested"] = True
+            _apply_inverter_physical_convergence_status(state_dict, entry_data)
 
             # Check if it's nighttime for sleep detection
             is_night = False

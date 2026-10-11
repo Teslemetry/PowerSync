@@ -26,6 +26,51 @@ def _method_source(class_name: str, method_name: str) -> str:
     raise AssertionError(f"{class_name}.{method_name} not found")
 
 
+def _compiled_method(class_name: str, method_name: str):
+    module = ast.parse(SENSOR_PATH.read_text())
+    for node in module.body:
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef) and item.name == method_name:
+                    item = copy.deepcopy(item)
+                    item.decorator_list = []
+                    tree = ast.fix_missing_locations(
+                        ast.Module(body=[item], type_ignores=[])
+                    )
+                    namespace = {
+                        "Any": object,
+                        "CONF_AC_INVERTER_CURTAILMENT_ENABLED": "enabled",
+                        "CONF_INVERTER_BRAND": "brand",
+                        "CONF_INVERTER_HOST": "host",
+                        "CONF_INVERTER_MODEL": "model",
+                        "INVERTER_CONTROL_MODE_LOAD_FOLLOWING": "load_following",
+                        "INVERTER_CONTROL_MODE_SHUTDOWN": "shutdown",
+                        "INVERTER_CONTROL_MODE_CURTAILED": "curtailed",
+                    }
+                    exec(compile(tree, str(SENSOR_PATH), "exec"), namespace)
+                    return namespace[method_name]
+    raise AssertionError(f"{class_name}.{method_name} not found")
+
+
+def _compiled_init_function(function_name: str):
+    module = ast.parse(INIT_PATH.read_text())
+    function = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == function_name
+    )
+    namespace = {
+        "Any": object,
+        "INVERTER_CONTROL_MODE_LOAD_FOLLOWING": "load_following",
+        "INVERTER_CONTROL_MODE_CURTAILED": "curtailed",
+    }
+    tree = ast.fix_missing_locations(
+        ast.Module(body=[function], type_ignores=[])
+    )
+    exec(compile(tree, str(INIT_PATH), "exec"), namespace)
+    return namespace[function_name]
+
+
 def _function(function_name: str):
     module = ast.parse(SENSOR_PATH.read_text())
     functions = {
@@ -64,6 +109,83 @@ def test_load_following_status_distinguishes_pending_physical_convergence():
     assert "device_limit_confirmed" in attributes
     assert "physical_converged" in attributes
     assert "residual_export_w" in attributes
+
+
+def test_unknown_fronius_convergence_is_pending_and_description_is_unverified():
+    native_value = _compiled_method("InverterStatusSensor", "native_value")
+    extra_state_attributes = _compiled_method(
+        "InverterStatusSensor", "extra_state_attributes"
+    )
+
+    class Sensor:
+        _cached_state = "running"
+        _cached_attrs = {}
+
+        def _entry_data(self):
+            return {
+                "inverter_control_mode": "load_following",
+                "inverter_curtailment_physical_converged": None,
+                "inverter_power_limit_w": 966,
+            }
+
+        def _control_mode(self):
+            return "load_following"
+
+        def _target_power_w(self):
+            return 966
+
+        def _get_config_value(self, key, default=None):
+            return default
+
+    sensor = Sensor()
+    assert native_value(sensor) == "Load Following Pending"
+    attrs = extra_state_attributes(sensor)
+    assert attrs["description"] == (
+        "Inverter load-following physical convergence unverified"
+    )
+    assert "curtailed - load following" not in attrs["description"]
+
+
+def test_physical_convergence_api_overlay_fails_closed_for_false_and_unknown():
+    apply_status = _compiled_init_function(
+        "_apply_inverter_physical_convergence_status"
+    )
+
+    for physical_converged in (None, False):
+        state = {"status": "curtailed", "is_curtailed": True}
+        apply_status(
+            state,
+            {
+                "inverter_control_mode": "load_following",
+                "inverter_curtailment_physical_converged": physical_converged,
+                "inverter_power_limit_w": 966,
+            },
+        )
+        assert state["status"] == "curtailment_pending"
+        assert state["is_curtailed"] is False
+        assert state["is_curtailment_requested"] is True
+        assert state["target_power_w"] == 966
+
+    converged_state = {"status": "curtailed", "is_curtailed": True}
+    apply_status(
+        converged_state,
+        {
+            "inverter_control_mode": "load_following",
+            "inverter_curtailment_physical_converged": True,
+        },
+    )
+    assert converged_state["status"] == "curtailed"
+    assert converged_state["is_curtailed"] is True
+
+    offline_state = {"status": "offline", "is_curtailed": True}
+    apply_status(
+        offline_state,
+        {
+            "inverter_control_mode": "load_following",
+            "inverter_curtailment_physical_converged": None,
+        },
+    )
+    assert offline_state["status"] == "offline"
 
 
 def test_sleeping_inverter_keeps_same_day_daily_generation():

@@ -88,7 +88,7 @@ def test_sensor_polling_preserves_specific_control_modes():
 def test_inverter_status_api_reports_pending_separately_from_curtailment():
     init_source = INIT_PATH.read_text()
     status_section = init_source[
-        init_source.index("class InverterStatusView"):
+        init_source.index("def _apply_inverter_physical_convergence_status"):
         init_source.index("class SigenergyTariffView")
     ]
 
