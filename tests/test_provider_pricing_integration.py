@@ -96,8 +96,7 @@ def test_provider_pricing_device_helper_links_to_entry_device():
     assert "def provider_pricing_device_info(" in source
     assert '"name": name' in source
     assert '"model": "Electricity Pricing"' in source
-    assert 'info["via_device_id"] = parent_id' in source
-    assert '"via_device": (DOMAIN, entry_id)' not in source
+    assert "device_parent_info(" in source
     assert 'f"{entry_id}_{provider_key}_pricing"' in source
     assert 'name = "GloBird Pricing"' in source
     assert 'name = "Flow Power Pricing"' in source
@@ -119,6 +118,9 @@ def test_provider_pricing_registration_uses_resolved_parent_id():
         "SENSOR_FAMILY_FLOW_POWER": "flow_power",
         "Any": object,
         "_entry_device_id": lambda _hass, _entry_id: "parent-id",
+        "device_parent_info": lambda _hass, parent_id, _identifier: {
+            "via_device_id": parent_id
+        },
     }
     module = ast.Module(body=[helper], type_ignores=[])
     ast.fix_missing_locations(module)
@@ -158,8 +160,15 @@ def test_provider_pricing_resolves_parent_without_deprecated_registry_lookup(mon
             assert config_entry_id == "entry-1"
             return None
 
-        def async_get_or_create(self, **kwargs):
-            self.created = kwargs
+        def async_get_or_create(
+            self, *, config_entry_id, identifiers, via_device_id=None
+        ):
+            self.created = {
+                "config_entry_id": config_entry_id,
+                "identifiers": identifiers,
+            }
+            if via_device_id is not None:
+                self.created["via_device_id"] = via_device_id
             return SimpleNamespace(id="parent-id")
 
     registry = FakeRegistry()
@@ -179,6 +188,9 @@ def test_provider_pricing_resolves_parent_without_deprecated_registry_lookup(mon
         "SENSOR_FAMILY_FLOW_POWER": "flow_power",
         "Any": object,
         "_LOGGER": SimpleNamespace(debug=lambda *_args, **_kwargs: None),
+        "device_parent_info": lambda _hass, parent_id, _identifier: {
+            "via_device_id": parent_id
+        },
     }
     module = ast.Module(body=functions, type_ignores=[])
     ast.fix_missing_locations(module)

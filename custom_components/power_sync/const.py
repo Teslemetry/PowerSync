@@ -6,6 +6,8 @@ from pathlib import Path
 from urllib.parse import urlencode
 from typing import Any
 
+from .registry_compat import device_parent_info
+
 # Integration domain
 DOMAIN = "power_sync"
 
@@ -2579,7 +2581,7 @@ def powerwall_device_info(entry_id: str, *, hass: Any | None = None) -> dict:
         "model": "Powerwall",
     }
     if parent_id := _entry_device_id(hass, entry_id):
-        info["via_device_id"] = parent_id
+        info.update(device_parent_info(hass, parent_id, (DOMAIN, entry_id)))
     return info
 
 
@@ -2608,7 +2610,7 @@ def provider_pricing_device_info(
         "model": "Electricity Pricing",
     }
     if parent_id := _entry_device_id(hass, entry_id):
-        info["via_device_id"] = parent_id
+        info.update(device_parent_info(hass, parent_id, (DOMAIN, entry_id)))
     return info
 
 
@@ -2635,5 +2637,11 @@ def powerwall_block_device_info(
         {(DOMAIN, f"{entry_id}_powerwall")},
         entry_id,
     ):
-        info["via_device_id"] = parent_id
+        info.update(
+            device_parent_info(
+                hass,
+                parent_id,
+                (DOMAIN, f"{entry_id}_powerwall"),
+            )
+        )
     return info
