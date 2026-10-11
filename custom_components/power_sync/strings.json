@@ -207,7 +207,7 @@
           "chip_mode_threshold": "Price threshold"
         },
         "data_description": {
-          "spike_protection_enabled": "When Amber detects a price spike, artificially inflate buy prices to prevent your battery from charging from grid.",
+          "spike_protection_enabled": "Block automatic Smart Optimization grid charging during Amber spike or potential-spike intervals. Keep real prices for charts and cost accounting. Native tariff sync raises protected buy rates to discourage charging. This does not block household imports or manual Force Charge.",
           "forecast_discrepancy_alert": "Send a mobile notification when Amber predicted and High (higher-price) forecasts diverge significantly. Indicates the forecast spread is large and conservative scheduling may be preferable.",
           "forecast_discrepancy_threshold": "Average price difference between Amber predicted and High forecasts that triggers the alert. Default 10 in the selected price unit.",
           "force_tariff_mode_toggle": "After uploading a new tariff, briefly toggle operation mode to force immediate recalculation. Tesla only, causes a ~5 second interruption.",
@@ -2129,7 +2129,7 @@
           "auto_sync_enabled": "When enabled, PowerSync uploads a new TOU tariff schedule to your battery every 5 minutes based on current Amber prices.",
           "amber_forecast_type": "Predicted is balanced. Low assumes cheaper prices (more aggressive charging). High assumes expensive prices (more conservative).",
           "battery_curtailment_enabled": "Stop battery export when earnings fall below the configured threshold. This controls the battery/Tesla path only; supported DC solar curtailment has its own opt-in.",
-          "spike_protection_enabled": "When Amber detects a price spike, artificially inflate buy prices to prevent your battery from charging from grid.",
+          "spike_protection_enabled": "Block automatic Smart Optimization grid charging during Amber spike or potential-spike intervals. Keep real prices for charts and cost accounting. Native tariff sync raises protected buy rates to discourage charging. This does not block household imports or manual Force Charge.",
           "ac_inverter_curtailment_enabled": "Shut down a separate AC-coupled or string solar inverter (Fronius, Sungrow, GoodWe, Enphase) when export earnings drop below the configured threshold. Do not enable this for the hybrid battery inverter already configured as the battery system.",
           "forecast_discrepancy_alert": "Send a mobile notification when Amber predicted and High (higher-price) forecasts diverge significantly. Indicates the forecast spread is large and conservative scheduling may be preferable.",
           "forecast_discrepancy_threshold": "Average price difference between Amber predicted and High forecasts that triggers the alert. Default 10 in the selected price unit.",

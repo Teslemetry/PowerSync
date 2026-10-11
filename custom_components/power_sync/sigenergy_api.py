@@ -1401,12 +1401,13 @@ def apply_chip_mode_sigenergy(
 def apply_spike_protection_sigenergy(
     buy_prices: list[dict],
     threshold_cents: float = 100.0,
-    replacement_cents: float = 50.0,
+    replacement_cents: float = 1000.0,
 ) -> list[dict]:
     """Apply spike protection to Sigenergy buy prices.
 
-    During price spikes, this caps buy prices to prevent the battery from
-    charging from the grid at extremely high prices.
+    During price spikes, raise buy prices to discourage native grid charging.
+    Never make an expensive import appear cheaper. Callers should choose an
+    override above the highest scheduled sell price.
 
     Args:
         buy_prices: List of {timeRange: "HH:MM-HH:MM", price: float} in cents
@@ -1414,7 +1415,7 @@ def apply_spike_protection_sigenergy(
         replacement_cents: Price to use when spike is detected (c/kWh)
 
     Returns:
-        Modified list with capped buy prices
+        Modified list with raised buy prices
     """
     protected_count = 0
 
@@ -1422,8 +1423,7 @@ def apply_spike_protection_sigenergy(
         time_range = slot.get("timeRange", "")
         original_price = slot.get("price", 0)
 
-        # If price exceeds threshold, cap it
-        if original_price > threshold_cents:
+        if original_price > threshold_cents and replacement_cents > original_price:
             protected_count += 1
             _LOGGER.debug(
                 "%s: Spike protection - price %.2fc → %.2fc (threshold=%.1fc)",
@@ -1433,7 +1433,7 @@ def apply_spike_protection_sigenergy(
 
     if protected_count > 0:
         _LOGGER.info(
-            "Sigenergy spike protection: %d periods capped (threshold=%.1fc, replacement=%.1fc)",
+            "Sigenergy spike protection: %d periods raised (threshold=%.1fc, replacement=%.1fc)",
             protected_count, threshold_cents, replacement_cents
         )
 

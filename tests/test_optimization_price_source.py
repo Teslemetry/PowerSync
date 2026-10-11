@@ -1307,6 +1307,92 @@ def test_amber_dynamic_import_forecast_uses_advanced_price_predicted(opt_module)
     assert coordinator._last_display_import_prices == pytest.approx(import_prices)
 
 
+@pytest.mark.parametrize("status", ["spike", "potential"])
+def test_amber_spike_protection_preserves_billable_prices_and_blocks_charge(
+    opt_module, status,
+):
+    start = datetime(2026, 5, 3, 8, 30, tzinfo=timezone.utc)
+    spike = _dynamic_price_entry(
+        start, 2399.4, "general", advanced_price={"predicted": 381.58},
+    )
+    spike["spikeStatus"] = status
+    normal = _dynamic_price_entry(start + timedelta(minutes=30), 20.0, "general", advanced_price={"predicted": 20.0})
+    coordinator = _coordinator_with_dynamic_price_provider(
+        opt_module, "amber", [spike, normal], horizon_hours=2,
+    )
+    coordinator._entry.options["spike_protection_enabled"] = True
+    imports, _ = asyncio.run(coordinator._get_price_forecast())
+
+    assert imports[:6] == pytest.approx([3.8158] * 6)
+    assert coordinator._last_display_import_prices[:6] == pytest.approx([3.8158] * 6)
+    assert coordinator._last_settlement_import_prices[:6] == pytest.approx([3.8158] * 6)
+    assert coordinator._grid_charge_cap_import_prices(imports)[:6] == pytest.approx([3.8158] * 6)
+    allowed = coordinator._grid_charge_allowed_slots(imports, [0.0] * 24, [0.0] * 24, 0.2)
+    assert allowed == [False] * 6 + [True] * 18
+
+
+@pytest.mark.parametrize("provider,enabled", [("amber", False), ("octopus", True)])
+def test_amber_spike_protection_respects_setting_and_provider(opt_module, provider, enabled):
+    start = datetime(2026, 5, 3, 8, 30, tzinfo=timezone.utc)
+    spike = _dynamic_price_entry(start, 200.0, "general", advanced_price={"predicted": 200.0})
+    spike["spikeStatus"] = "spike"
+    coordinator = _coordinator_with_dynamic_price_provider(opt_module, provider, [spike])
+    coordinator._entry.options["spike_protection_enabled"] = enabled
+    imports, _ = asyncio.run(coordinator._get_price_forecast())
+    assert imports[:6] == pytest.approx([2.0] * 6)
+    assert coordinator._grid_charge_allowed_slots(imports, [], [], 0.2) == [True] * 12
+
+
+def test_amber_spike_protection_clips_active_interval_and_does_not_pad_status(opt_module, monkeypatch):
+    start = datetime(2026, 5, 3, 8, 30, tzinfo=timezone.utc)
+    now = start + timedelta(minutes=20)
+    monkeypatch.setattr(opt_module.dt_util, "now", lambda: now)
+    spike = _dynamic_price_entry(start, 200.0, "general", interval_type="CurrentInterval")
+    spike["spikeStatus"] = "potential"
+    coordinator = _coordinator_with_dynamic_price_provider(opt_module, "amber", [], current=[spike])
+    coordinator._entry.options["spike_protection_enabled"] = True
+    imports, _ = asyncio.run(coordinator._get_price_forecast())
+    assert coordinator._grid_charge_allowed_slots(imports, [], [], 0.2) == [False] * 2 + [True] * 10
+
+
+def test_amber_spike_protection_overrides_charge_deadline_in_real_solver(opt_module):
+    start = datetime(2026, 5, 3, 8, 30, tzinfo=timezone.utc)
+    spike = _dynamic_price_entry(start, 107.32, "general", advanced_price={"predicted": 107.32})
+    spike["spikeStatus"] = "spike"
+    later = start + timedelta(minutes=30)
+    forecast = [spike, _dynamic_price_entry(start, 0.0, "feedIn", advanced_price={"predicted": 0.0}),
+                _dynamic_price_entry(later, 1000.0, "general", advanced_price={"predicted": 1000.0}),
+                _dynamic_price_entry(later, 800.0, "feedIn", advanced_price={"predicted": -800.0})]
+    coordinator = _coordinator_with_dynamic_price_provider(opt_module, "amber", forecast)
+    imports, exports = asyncio.run(coordinator._get_price_forecast())
+
+    def solve(enabled, solar_kw=0.0):
+        coordinator._entry.options["spike_protection_enabled"] = enabled
+        optimizer = opt_module.BatteryOptimizer(
+            capacity_wh=10000, max_charge_w=5000, max_discharge_w=5000,
+            backup_reserve=0.05, interval_minutes=5, horizon_hours=1, terminal_weight=0.0,
+        )
+        optimizer.pre_window_slot = 6
+        optimizer.pre_window_soc_target = 0.3
+        return optimizer.optimize(
+            import_prices=imports, export_prices=exports,
+            solar_forecast=[solar_kw] * 6 + [0.0] * 6, load_forecast=[0.0] * 12,
+            current_soc=0.1, allow_grid_charge=True,
+            grid_charge_allowed=coordinator._grid_charge_allowed_slots(imports, [], [], 0.1),
+        )
+
+    unprotected = solve(False)
+    protected = solve(True)
+    assert unprotected.feasible and protected.feasible
+    assert max(a.battery_charge_w for a in unprotected.schedule.actions[:6]) > 1000
+    assert max(a.battery_charge_w for a in protected.schedule.actions[:6]) < 1
+    assert max(protected.grid_import_w[:6]) < 1
+    solar_protected = solve(True, solar_kw=5.0)
+    assert solar_protected.feasible
+    assert max(a.battery_charge_w for a in solar_protected.schedule.actions[:6]) > 1000
+    assert max(solar_protected.grid_import_w[:6]) < 1
+
+
 def test_amber_dynamic_import_forecast_honors_configured_forecast_type(opt_module):
     start = datetime(2026, 5, 3, 8, 30, tzinfo=timezone.utc)
     forecast = []

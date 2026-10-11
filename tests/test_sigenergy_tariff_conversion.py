@@ -17,6 +17,44 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 COMPONENT_ROOT = ROOT / "custom_components" / "power_sync"
+
+
+def test_sigenergy_spike_protection_never_makes_expensive_import_cheaper(sigenergy_api_module):
+    prices = [{"timeRange": "17:00-17:30", "price": 107.32},
+              {"timeRange": "17:30-18:00", "price": 2399.4},
+              {"timeRange": "18:00-18:30", "price": 20.0}]
+    protected = sigenergy_api_module.apply_spike_protection_sigenergy(
+        copy.deepcopy(prices), replacement_cents=500.0,
+    )
+    assert [slot["price"] for slot in protected] == [500.0, 2399.4, 20.0]
+    # Existing callers passing the old 50c replacement must never lower a spike.
+    legacy = sigenergy_api_module.apply_spike_protection_sigenergy(
+        copy.deepcopy(prices), replacement_cents=50.0,
+    )
+    assert legacy == prices
+
+
+def test_sigenergy_sync_spike_override_exceeds_future_export_value(sigenergy_api_module):
+    source = (COMPONENT_ROOT / "__init__.py").read_text()
+    tree = ast.parse(source)
+    spike_branch = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and any(isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+                and child.func.id == "apply_spike_protection_sigenergy"
+                for child in ast.walk(node))
+        and isinstance(node.test, ast.Name) and node.test.id == "spike_protection_enabled"
+    )
+    namespace = {
+        "spike_protection_enabled": True,
+        "buy_prices": [{"timeRange": "17:00-17:30", "price": 107.32},
+                       {"timeRange": "18:00-18:30", "price": 2399.4}],
+        "sell_prices": [{"timeRange": "18:00-18:30", "price": 381.58}],
+        "apply_spike_protection_sigenergy": sigenergy_api_module.apply_spike_protection_sigenergy,
+    }
+    exec(compile(ast.Module(body=[spike_branch], type_ignores=[]), str(COMPONENT_ROOT / "__init__.py"), "exec"), namespace)
+    assert namespace["buy_prices"][0]["price"] > 381.58
+    assert namespace["buy_prices"][1]["price"] == 2399.4
 _SENTINEL = object()
 
 

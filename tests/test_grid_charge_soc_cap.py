@@ -507,3 +507,50 @@ def test_runtime_blackout_cancels_only_optimizer_owned_force_charge(opt_module):
     asyncio.run(coordinator._execute_optimizer_action(action))
     assert battery.restored == 1
     assert coordinator._last_executed_action is None
+
+
+@pytest.mark.parametrize("source", ["optimizer", "user", None])
+@pytest.mark.parametrize("restore_success", [True, False])
+def test_runtime_amber_spike_blocks_cached_charge_and_retries_restore(
+    opt_module, source, restore_success,
+):
+    class Battery:
+        restored = 0
+
+        async def restore_normal(self):
+            self.restored += 1
+            return restore_success
+
+    battery = Battery()
+    coordinator = _coordinator(opt_module)
+    coordinator._entry = SimpleNamespace(
+        options={"electricity_provider": "amber", "spike_protection_enabled": True}, data={},
+    )
+    now = opt_module.dt_util.now()
+    coordinator.price_coordinator = SimpleNamespace(data={"current": [{
+        "channelType": "general", "spikeStatus": "spike",
+        "valid_from": now.isoformat(), "valid_to": (now + timedelta(minutes=5)).isoformat(),
+    }]})
+    coordinator._executor = SimpleNamespace(battery_controller=battery)
+    coordinator._effective_runtime_action = lambda action: action
+    coordinator._monitoring_mode_active = lambda: False
+    coordinator._solar_export_hold = None
+    coordinator.hass = SimpleNamespace(data={"power_sync": {"entry-1": {}}})
+    coordinator.entry_id = "entry-1"
+    state = {"active": True, "type": "charge", "source": source, "scope": "optimizer"} if source else None
+    coordinator._get_active_force_state = lambda: state
+    coordinator._optimizer_force_state = dict(state or {})
+    coordinator._clear_optimizer_force_state = lambda: coordinator._optimizer_force_state.clear()
+    coordinator._force_state_clearer = None
+    coordinator._last_executed_action = None
+    coordinator._last_executed_planned_action = None
+    # A cached plan predates the newly flagged live interval.
+    action = SimpleNamespace(action="charge", power_w=1000, timestamp=now - timedelta(minutes=5))
+    asyncio.run(coordinator._execute_optimizer_action(action))
+    assert battery.restored == (0 if source == "user" else 1)
+    if source == "user" or not restore_success:
+        assert coordinator._last_executed_action is None
+        assert coordinator._optimizer_force_state == dict(state or {})
+    else:
+        assert coordinator._last_executed_action == "self_consumption"
+        assert not coordinator._optimizer_force_state

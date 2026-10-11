@@ -10810,6 +10810,43 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Optimizer-triggered force modes can be overridden if the LP changes
         # its mind (e.g. LP planned 1 export step but now wants self_consumption).
         force_state = self._get_active_force_state()
+        user_force_active = bool(
+            force_state and force_state.get("active")
+            and force_state.get("source", "user") != "optimizer"
+        )
+        optimizer_charge_active = bool(
+            force_state and force_state.get("active")
+            and force_state.get("source") == "optimizer"
+            and force_state.get("type") == "charge"
+        )
+        if (
+            not user_force_active
+            and (runtime_action == "charge" or optimizer_charge_active)
+            and self._amber_spike_protected_slots(1, dt_util.now())[0]
+        ):
+            _LOGGER.info(
+                "Optimizer: Amber Spike Protection blocks automatic grid charge; "
+                "restoring self_consumption"
+            )
+            restore_success = False
+            if hasattr(battery, "restore_normal"):
+                restore_success = await battery.restore_normal()
+            elif hasattr(battery, "set_self_consumption_mode"):
+                restore_success = await battery.set_self_consumption_mode()
+            if restore_success is False:
+                _LOGGER.warning(
+                    "Optimizer: spike-protection restore failed; retaining force "
+                    "state for retry"
+                )
+                return
+            if optimizer_charge_active:
+                if force_state.get("scope") == "optimizer":
+                    self._clear_optimizer_force_state()
+                elif self._force_state_clearer:
+                    self._force_state_clearer()
+            self._last_executed_planned_action = action.action
+            self._last_executed_action = "self_consumption"
+            return
         if force_state and force_state.get("active"):
                 force_type = force_state.get("type", "unknown")
                 force_source = force_state.get("source", "user")
@@ -16292,45 +16329,8 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             )
                         display_export_raw = display_export_raw[:n_steps]
 
-                    # Spike protection: cap buy prices during Amber spike periods
-                    # so the LP optimizer won't choose to charge at extreme prices
-                    if import_prices and general:
-                        spike_protection_on = False
-                        if self._entry:
-                            from ..const import CONF_SPIKE_PROTECTION_ENABLED
-                            spike_protection_on = self._entry.options.get(
-                                CONF_SPIKE_PROTECTION_ENABLED,
-                                self._entry.data.get(CONF_SPIKE_PROTECTION_ENABLED, False),
-                            )
-
-                        if spike_protection_on:
-                            median_price = sorted(import_prices)[len(import_prices) // 2]
-                            cap_price = max(median_price * 2, 0.50)  # At least 50c/kWh cap
-                            for idx, e in enumerate(general):
-                                spike_status = e.get("spikeStatus", "none")
-                                if spike_status in ("spike", "potential"):
-                                    base_idx = entry_positions[idx]
-                                    entry_expand = (
-                                        entry_expands_general[idx]
-                                        if idx < len(entry_expands_general)
-                                        else max(1, e.get("duration", 30) // interval)
-                                    )
-                                    if entry_expand == 0:
-                                        continue
-                                    original_price = e.get("perKwh", 0)
-                                    capped_count = 0
-                                    for j in range(entry_expand):
-                                        pos = base_idx + j
-                                        if pos < len(import_prices) and import_prices[pos] > cap_price:
-                                            import_prices[pos] = cap_price
-                                            capped_count += 1
-                                    if capped_count:
-                                        _LOGGER.info(
-                                            "Spike protection: capped %d intervals at %.1fc/kWh "
-                                            "(was %.1fc, status=%s)",
-                                            capped_count, cap_price * 100,
-                                            original_price, spike_status,
-                                        )
+                    # Keep billable Amber prices intact. Spike Protection is a
+                    # hard grid-charge eligibility gate, not a cheaper LP price.
 
                     if import_prices:
                         display_import_steps = actual_price_intervals
@@ -19308,6 +19308,46 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             cap_prices.extend(import_prices[len(cap_prices):])
         return cap_prices
 
+    def _amber_spike_protected_slots(
+        self,
+        n_steps: int,
+        start: datetime | None = None,
+    ) -> list[bool]:
+        """Identify actual Amber spike intervals without padding their status."""
+        protected = [False] * n_steps
+        entry = getattr(self, "_entry", None)
+        if entry is None or self._electricity_provider() != "amber":
+            return protected
+        from ..const import CONF_SPIKE_PROTECTION_ENABLED
+
+        if not entry.options.get(
+            CONF_SPIKE_PROTECTION_ENABLED,
+            entry.data.get(CONF_SPIKE_PROTECTION_ENABLED, False),
+        ):
+            return protected
+        coordinator = getattr(self, "price_coordinator", None)
+        data = getattr(coordinator, "data", None) or {}
+        if start is None:
+            timestamps = self._price_timestamps(n_steps)
+            if not timestamps:
+                return protected
+            start = timestamps[0]
+        for price_entry in list(data.get("current", []) or []) + list(
+            data.get("forecast", []) or []
+        ):
+            if (
+                price_entry.get("channelType") != "general"
+                or price_entry.get("spikeStatus") not in ("spike", "potential")
+            ):
+                continue
+            bounds = self._entry_slot_bounds(
+                price_entry, start, self._config.interval_minutes, n_steps,
+            )
+            if bounds is not None:
+                first, last = bounds
+                protected[first:last] = [True] * (last - first)
+        return protected
+
     def _grid_charge_allowed_slots(
         self,
         import_prices: list[float],
@@ -19316,7 +19356,10 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         current_soc: float,
     ) -> list[bool]:
         """Return per-slot permission for forced grid battery charging."""
-        allowed = [True] * len(import_prices)
+        allowed = [
+            not protected
+            for protected in self._amber_spike_protected_slots(len(import_prices))
+        ]
         # The stored config value is already $/kWh — coerce, do not re-normalize
         # (re-applying the cents heuristic would divide a >$1/kWh cap by 100).
         price_cap = self._coerce_optional_price(
