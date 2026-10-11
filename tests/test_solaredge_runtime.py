@@ -498,6 +498,149 @@ def test_curtailment_client_closes_before_mutation_lock_is_released(result):
     assert events == ["lock", "write", "disconnect", "unlock"]
 
 
+@pytest.mark.parametrize("curtailed", [False, True])
+@pytest.mark.parametrize(
+    "outcome", ["confirmed", "rejected", "unknown", "permission_denied", "not_ready"]
+)
+def test_curtailment_handler_uses_coordinator_mutation_boundary(
+    monkeypatch, curtailed, outcome
+):
+    """Ticket #87: exercise the public wrapper instead of bypassing it with a fake."""
+    from test_solaredge_controller import (
+        SolarEdgeEnergyController,
+        _MemoryStore,
+        _SEHass,
+    )
+
+    async def scenario():
+        hass = _SEHass()
+        journal = _MemoryStore()
+        monkeypatch.setattr(
+            SolarEdgeEnergyController, "_create_store", lambda *_: journal
+        )
+        controller = SolarEdgeEnergyController(hass, entity_prefix="solaredge")
+        session = controller._coordinator()
+        await controller._load_session(session)
+        klass = next(
+            node
+            for node in ast.parse(
+                (ROOT / "custom_components/power_sync/coordinator.py").read_text()
+            ).body
+            if getattr(node, "name", None) == "SolarEdgeEnergyCoordinator"
+        )
+        methods = {
+            name: _load_node(
+                next(node for node in klass.body if getattr(node, "name", None) == name),
+                {},
+            )
+            for name in (
+                "run_external_mutation",
+                "_control_result",
+                "control_health",
+                "mutation_active",
+            )
+        }
+        coordinator = type("CoordinatorMethods", (), methods)()
+        coordinator._controller = controller
+        coordinator._native_control_allowed = Mock(
+            return_value=outcome != "not_ready"
+        )
+        coordinator.data = {"battery_level": 55}
+        coordinator.async_set_updated_data = lambda data: setattr(
+            coordinator, "data", data
+        )
+        disconnected = []
+
+        async def disconnect():
+            # The curtailment connection must close while the battery lock is held.
+            disconnected.append(session.lock.locked())
+
+        direct = SimpleNamespace(
+            curtail=AsyncMock(return_value=outcome == "confirmed"),
+            restore=AsyncMock(return_value=outcome == "confirmed"),
+            disconnect=AsyncMock(side_effect=disconnect),
+            last_limit_write_was_determinate=Mock(return_value=outcome == "rejected"),
+        )
+        store = _MemoryStore()
+        store.data = {"solaredge_curtailment_owned": True} if curtailed else {}
+        original_state = "curtailed" if curtailed else "normal"
+        entry_data = {
+            "solaredge_coordinator": coordinator,
+            "solaredge_curtailment_state": original_state,
+            "store": store,
+        }
+        hass.data = {"power_sync": {"entry": entry_data}}
+        permission = Mock(return_value=outcome != "permission_denied")
+        namespace = {
+            "hass": hass,
+            "entry": SimpleNamespace(
+                entry_id="entry", options={"enabled": True}, data={}
+            ),
+            "DOMAIN": "power_sync",
+            "CONF_SOLAREDGE_DC_CURTAILMENT_ENABLED": "enabled",
+            "battery_connection_profile": SimpleNamespace(
+                profile_id="solaredge_composite"
+            ),
+            "_LOGGER": logging.getLogger(__name__),
+            "_get_solaredge_curtailment_controller": lambda _: direct,
+            "_direct_dc_curtailment_write_allowed": permission,
+            "_solaredge_force_dispatch_active": lambda _: False,
+            "export_earnings_are_uneconomic": lambda earnings, *_: earnings < 0,
+        }
+        for name in (
+            "_persist_solaredge_curtailment_marker",
+            "_solaredge_curtailment_write",
+            "handle_solaredge_curtailment",
+        ):
+            _load_node(_setup_node(name), namespace)
+
+        await namespace["handle_solaredge_curtailment"](
+            feedin_price=-10 if curtailed else 25, import_price=30
+        )
+        coordinator._native_control_allowed.assert_called_once_with(
+            "SolarEdge curtailment"
+        )
+        operation = direct.restore if curtailed else direct.curtail
+        other_operation = direct.curtail if curtailed else direct.restore
+        other_operation.assert_not_awaited()
+        if outcome in {"permission_denied", "not_ready"}:
+            operation.assert_not_awaited()
+            direct.disconnect.assert_not_awaited()
+        else:
+            operation.assert_awaited_once_with()
+            direct.disconnect.assert_awaited_once_with()
+            assert disconnected == [True]
+        if outcome == "not_ready":
+            permission.assert_not_called()
+            assert coordinator.data == {"battery_level": 55}
+        else:
+            permission.assert_called_once_with()
+            expected_outcome = (
+                "rejected" if outcome == "permission_denied" else outcome
+            )
+            assert coordinator.data["last_mutation"]["outcome"] == expected_outcome
+            assert coordinator.data["control_health"] == (
+                "reconciliation_required" if outcome == "unknown" else "ready"
+            )
+            assert coordinator.data["mutation_active"] is False
+        if outcome == "rejected":
+            direct.last_limit_write_was_determinate.assert_called_once_with()
+            assert session.pending_mutation is None
+            assert journal.data["in_progress"] is False
+        if outcome == "unknown":
+            assert coordinator.data["last_mutation"]["possibly_transmitted"] is True
+            assert journal.data["in_progress"] is True
+        assert entry_data["solaredge_curtailment_state"] == (
+            ("normal" if curtailed else "curtailed")
+            if outcome == "confirmed" else original_state
+        )
+        assert bool(store.data.get("solaredge_curtailment_owned")) is (
+            not curtailed if outcome == "confirmed" else curtailed
+        )
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     "difference", [None, "inverter_host", "inverter_port", "inverter_slave_id"]
 )
@@ -733,7 +876,9 @@ def test_solaredge_self_consumption_expiry_releases_only_matching_override(outco
         if isinstance(n, ast.FunctionDef) and n.name == "_get_active_force_state"
     )
     get_active = _load_node(reader, namespace)
-    optimizer = SimpleNamespace(_force_state_getter=lambda: state)
+    optimizer = SimpleNamespace(
+        _force_state_getter=lambda: state, battery_system="solaredge"
+    )
 
     async def scenario():
         await engage(SimpleNamespace(data={}))

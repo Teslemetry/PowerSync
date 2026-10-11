@@ -10684,13 +10684,16 @@ class SolarEdgeEnergyCoordinator(
         return await self._control_result(self._controller.set_backup_reserve(percent, automatic=automatic))
 
     async def run_external_mutation(
-        self, operation, *, automatic: bool = False, write_allowed=None
+        self, operation, *, automatic: bool = False, write_allowed=None, determinate=None
     ) -> bool:
         if not self._native_control_allowed("SolarEdge curtailment"):
             return False
         return await self._control_result(
             self._controller.run_external_mutation(
-                operation, automatic=automatic, write_allowed=write_allowed
+                operation,
+                automatic=automatic,
+                write_allowed=write_allowed,
+                determinate=determinate,
             )
         )
 
