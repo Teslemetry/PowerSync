@@ -1110,6 +1110,25 @@
           "solaredge_dc_curtailment_enabled": "When enabled, PowerSync sets SolarEdge active power to 0% during uneconomic export periods and restores it to 100% when export recovers, independently of battery export curtailment. Monitoring Mode also requires curtailment-control permission."
         },
         "submit": "Connect"
+      },
+      "battery_connection_profile_setup": {
+        "title": "Battery connection method & sensors",
+        "description": "Choose the single route PowerSync should use. Monitoring-only Home Assistant methods open no PowerSync hardware connection and require five fresh core telemetry sensors.",
+        "data": {
+          "battery_connection_profile": "Connection method",
+          "battery_integration_config_entry_id": "Home Assistant integration",
+          "battery_integration_anchor_entity": "Sungrow anchor sensor",
+          "battery_sensor_display_mode": "Additional sensors",
+          "custom_solar_power_entity": "Whole-site solar power sensor (all PV)"
+        },
+        "data_description": {
+          "battery_connection_profile": "Only connection bundles validated for the selected battery are offered.",
+          "battery_integration_config_entry_id": "Select the exact upstream integration entry for this physical installation.",
+          "battery_integration_anchor_entity": "For YAML-based Sungrow setups, select a sensor belonging to the intended inverter.",
+          "battery_sensor_display_mode": "Recommended shows useful battery, solar, grid, energy and status values without duplicating recorder entities.",
+          "custom_solar_power_entity": "Optional. A sensor reporting TOTAL solar production for the whole property: the GoodWe inverter's own PV plus any AC-coupled array such as Enphase microinverters. Leave empty if the GoodWe PV strings are all your solar. If this sensor becomes unavailable, PowerSync ignores solar samples instead of using a partial reading."
+        },
+        "submit": "Next"
       }
     },
     "error": {

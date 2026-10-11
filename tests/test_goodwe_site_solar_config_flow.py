@@ -252,8 +252,37 @@ def _schema_key(result: dict, key: str):
     return None
 
 
+def _validate(schema: dict, user_input: dict) -> dict:
+    """Mimic voluptuous: an omitted key that has a ``default`` is filled with it.
+
+    Home Assistant validates submitted data against the form's schema *before*
+    calling the step, so this is what the step actually receives.  A key with no
+    ``default`` (including one that only carries a ``suggested_value``) stays
+    omitted.
+    """
+    validated = dict(user_input)
+    for marker in schema:
+        if marker.schema not in validated and marker.default is not _MISSING:
+            validated[marker.schema] = marker.default
+    return validated
+
+
 def _submit(obj, step: str, user_input: dict | None):
-    return asyncio.run(getattr(obj, step)(user_input))
+    """Open the form, validate the submission against its schema, then run the step."""
+    if user_input is None:
+        return asyncio.run(getattr(obj, step)(None))
+    form = asyncio.run(getattr(obj, step)(None))
+    assert form["type"] == "form"
+    validated = _validate(form["data_schema"], user_input)
+    return asyncio.run(getattr(obj, step)(validated))
+
+
+def _suggested(form: dict, key: str):
+    """The pre-filled value the frontend shows for ``key`` (None if none)."""
+    marker = _schema_key(form, key)
+    assert marker is not None
+    assert marker.default is _MISSING, "a stored sensor must not be a validation default"
+    return (marker.description or {}).get("suggested_value")
 
 
 # --------------------------------------------------------------------------- #
@@ -275,7 +304,7 @@ def test_direct_options_form_offers_the_field_and_persists_it(flow):
 
     form = _submit(obj, "async_step_goodwe_connection_options", None)
     assert _schema_key(form, KEY) is not None
-    assert _schema_key(form, KEY).default is _MISSING  # nothing stored: no default
+    assert _suggested(form, KEY) is None  # nothing stored: nothing pre-filled
 
     saved = _submit(obj, "async_step_goodwe_connection_options", {**_DIRECT_INPUT, KEY: SITE_SOLAR})
     assert saved["type"] == "create_entry"
@@ -286,7 +315,7 @@ def test_direct_options_form_offers_the_field_and_persists_it(flow):
 
     # Re-open the form as Home Assistant would after the reload: value is retained.
     reopened = _submit(obj, "async_step_goodwe_connection_options", None)
-    assert _schema_key(reopened, KEY).default == SITE_SOLAR
+    assert _suggested(reopened, KEY) == SITE_SOLAR
 
 
 def test_direct_options_clearing_the_field_removes_it_everywhere(flow):
@@ -298,7 +327,7 @@ def test_direct_options_clearing_the_field_removes_it_everywhere(flow):
     assert KEY not in entry.data
     assert KEY not in entry.options
     reopened = _submit(obj, "async_step_goodwe_connection_options", None)
-    assert _schema_key(reopened, KEY).default is _MISSING
+    assert _suggested(reopened, KEY) is None
 
 
 # --------------------------------------------------------------------------- #
@@ -370,7 +399,7 @@ def test_profile_options_form_offers_the_field_and_persists_it(flow):
 
     form = _submit(obj, "async_step_battery_connection_profile", None)
     assert _schema_key(form, KEY) is not None
-    assert _schema_key(form, KEY).default is _MISSING
+    assert _suggested(form, KEY) is None
 
     saved = _submit(obj, "async_step_battery_connection_profile", {**_PROFILE_INPUT, KEY: SITE_SOLAR})
     assert saved["type"] == "create_entry"
@@ -378,7 +407,7 @@ def test_profile_options_form_offers_the_field_and_persists_it(flow):
     assert entry.options[KEY] == SITE_SOLAR
 
     reopened = _submit(obj, "async_step_battery_connection_profile", None)
-    assert _schema_key(reopened, KEY).default == SITE_SOLAR
+    assert _suggested(reopened, KEY) == SITE_SOLAR
 
 
 def test_profile_options_clearing_the_field_is_saved_as_empty(flow):
@@ -389,7 +418,7 @@ def test_profile_options_clearing_the_field_is_saved_as_empty(flow):
 
     assert entry.options[KEY] == ""
     reopened = _submit(obj, "async_step_battery_connection_profile", None)
-    assert _schema_key(reopened, KEY).default is _MISSING  # blank is never a default
+    assert _suggested(reopened, KEY) is None
 
 
 def test_non_goodwe_profile_form_does_not_offer_the_field(flow):
@@ -439,6 +468,9 @@ def test_every_goodwe_form_labels_the_field_as_whole_site_pv(path):
                 steps.append((section, step_id, step))
 
     assert steps, "no GoodWe form strings found"
+    # Initial setup (config flow) must carry the label too, not just the options flow.
+    assert ("config", "battery_connection_profile_setup") in {(sec, sid) for sec, sid, _ in steps}
+    assert ("config", "goodwe_connection") in {(sec, sid) for sec, sid, _ in steps}
     for section, step_id, step in steps:
         label = step["data"].get(KEY, "")
         assert "whole-site" in label.lower() and "all pv" in label.lower(), (section, step_id)

@@ -1979,13 +1979,18 @@ def goodwe_ems_control_options() -> list[SelectOptionDict]:
 def goodwe_site_solar_schema(current: Any = None) -> dict[Any, Any]:
     """Return the optional whole-site solar sensor field for GoodWe forms.
 
-    An EntitySelector rejects ``""``/``None``, and voluptuous validates an
-    Optional default even when the frontend omits the field, so a default is
-    only attached once a real entity id is stored.
+    The stored sensor is shown as a *suggested value*, not a validation
+    default: Home Assistant validates submitted data before the step runs, so a
+    ``default=`` would refill an omitted (cleared) field with the old entity and
+    the sensor could never be removed.  An omitted field therefore means
+    "no whole-site sensor".
     """
     stored = str(current or "").strip()
     key = (
-        vol.Optional(CONF_CUSTOM_SOLAR_POWER_ENTITY, default=stored)
+        vol.Optional(
+            CONF_CUSTOM_SOLAR_POWER_ENTITY,
+            description={"suggested_value": stored},
+        )
         if stored
         else vol.Optional(CONF_CUSTOM_SOLAR_POWER_ENTITY)
     )
