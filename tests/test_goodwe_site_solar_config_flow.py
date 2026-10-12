@@ -331,45 +331,154 @@ def test_direct_options_clearing_the_field_removes_it_everywhere(flow):
 
 
 # --------------------------------------------------------------------------- #
-# Direct connection: initial setup flow
+# Initial setup: profile setup -> GoodWe connection -> the real _create_final_entry
+#
+# The connection-profile setup form is the single, authoritative setup form for
+# the whole-site sensor.  The direct GoodWe connection form that may follow must
+# not repeat it: two selections would compete when _create_final_entry() merges
+# the collected data, and the earlier one used to win (even over a cleared field).
 # --------------------------------------------------------------------------- #
 
+_SETUP_METHODS = [
+    "async_step_battery_connection_profile_setup",
+    "async_step_goodwe_connection",
+    "_route_to_battery_setup",
+    "_create_final_entry",
+]
+
+_PROFILE_SETUP_INPUT = {
+    "battery_connection_profile": "goodwe_direct",
+    "battery_sensor_display_mode": "recommended",
+}
+
+SITE_SOLAR_B = "sensor.other_site_solar_power"
+
+
 def _setup_flow(flow: _Flow):
-    created = {}
-    obj = flow.bind(
-        "PowerSyncConfigFlow" if _has_class(flow, "PowerSyncConfigFlow") else flow._class_of("async_step_goodwe_connection"),
-        ["async_step_goodwe_connection"],
-        {
-            "hass": SimpleNamespace(),
-            "_goodwe_data": {},
-            "async_show_form": lambda **kw: {"type": "form", **kw},
-            "_create_final_entry": lambda: created.setdefault("entry", {"type": "create_entry"}),
-        },
-    )
+    created: dict = {}
+
+    def _create_entry(**kw):
+        created["entry"] = kw
+        return {"type": "create_entry", **kw}
+
+    extras = {
+        "hass": _Hass(),
+        "_selected_battery_system": "goodwe",
+        "_selected_electricity_provider": "amber",
+        "_optimization_provider": "native",
+        "_aemo_only_mode": False,
+        "_custom_tariff_data": {},
+        "_ml_options": {},
+        "_battery_profile_data": {},
+        "_goodwe_data": {},
+        "async_show_form": lambda **kw: {"type": "form", **kw},
+        "async_create_entry": _create_entry,
+    }
+    for name in (
+        "_amber_data", "_teslemetry_data", "_site_data", "_aemo_data", "_agl_data",
+        "_globird_data", "_covau_data", "_flow_power_data", "_octopus_data",
+        "_localvolts_data", "_epex_data",
+    ):
+        extras[name] = {}
+    obj = flow.bind(flow._class_of(_SETUP_METHODS[0]), _SETUP_METHODS, extras)
     return obj, created
 
 
-def _has_class(flow: _Flow, name: str) -> bool:
-    return any(isinstance(n, ast.ClassDef) and n.name == name for n in flow.tree.body)
+def _run_setup(obj, profile_inputs: list[dict], goodwe_input: dict | None = None):
+    """Drive profile setup (re-submitted once per item, as when a user goes back),
+    then the GoodWe connection form it routes to.  Every submission is validated
+    against the schema of the form it was made on, as Home Assistant does.
+
+    Returns (profile form, goodwe connection form, final result).
+    """
+    profile_form = asyncio.run(obj.async_step_battery_connection_profile_setup(None))
+    result = None
+    for user_input in profile_inputs:
+        form = asyncio.run(obj.async_step_battery_connection_profile_setup(None))
+        validated = _validate(form["data_schema"], user_input)
+        result = asyncio.run(obj.async_step_battery_connection_profile_setup(validated))
+    assert result["type"] == "form" and result["step_id"] == "goodwe_connection"
+    connection_form = result
+    validated = _validate(connection_form["data_schema"], goodwe_input or dict(_DIRECT_INPUT))
+    final = asyncio.run(obj.async_step_goodwe_connection(validated))
+    return profile_form, connection_form, final
 
 
-def test_setup_form_offers_the_field_and_stores_it(flow):
-    obj, created = _setup_flow(flow)
-
-    form = _submit(obj, "async_step_goodwe_connection", None)
-    assert _schema_key(form, KEY) is not None
-
-    result = _submit(obj, "async_step_goodwe_connection", {**_DIRECT_INPUT, KEY: SITE_SOLAR})
-    assert result["type"] == "create_entry"
-    assert obj._goodwe_data[KEY] == SITE_SOLAR
-
-
-def test_setup_without_a_site_sensor_stores_nothing(flow):
+def test_setup_profile_form_is_the_only_setup_form_for_the_sensor(flow):
     obj, _created = _setup_flow(flow)
 
-    _submit(obj, "async_step_goodwe_connection", dict(_DIRECT_INPUT))
+    profile_form, connection_form, _final = _run_setup(
+        obj, [{**_PROFILE_SETUP_INPUT, KEY: SITE_SOLAR}]
+    )
 
-    assert KEY not in obj._goodwe_data
+    assert _schema_key(profile_form, KEY) is not None
+    assert _schema_key(connection_form, KEY) is None
+
+
+def test_setup_sensor_chosen_on_the_profile_form_reaches_the_entry(flow):
+    obj, created = _setup_flow(flow)
+
+    _run_setup(obj, [{**_PROFILE_SETUP_INPUT, KEY: SITE_SOLAR}])
+
+    assert created["entry"]["data"][KEY] == SITE_SOLAR
+    assert created["entry"]["data"]["goodwe_host"] == "192.0.2.10"
+
+
+def test_setup_without_a_site_sensor_saves_none(flow):
+    obj, created = _setup_flow(flow)
+
+    _run_setup(obj, [dict(_PROFILE_SETUP_INPUT)])
+
+    assert KEY not in created["entry"]["data"]
+
+
+def test_setup_going_back_and_changing_the_sensor_keeps_the_last_choice(flow):
+    obj, created = _setup_flow(flow)
+
+    _run_setup(
+        obj,
+        [
+            {**_PROFILE_SETUP_INPUT, KEY: SITE_SOLAR},
+            {**_PROFILE_SETUP_INPUT, KEY: SITE_SOLAR_B},
+        ],
+    )
+
+    assert created["entry"]["data"][KEY] == SITE_SOLAR_B
+
+
+def test_setup_going_back_and_clearing_the_sensor_removes_it(flow):
+    obj, created = _setup_flow(flow)
+
+    _run_setup(
+        obj,
+        [
+            {**_PROFILE_SETUP_INPUT, KEY: SITE_SOLAR},
+            dict(_PROFILE_SETUP_INPUT),
+        ],
+    )
+
+    assert KEY not in created["entry"]["data"]
+
+
+def test_setup_connection_form_cannot_override_the_profile_choice(flow):
+    # Even a stale value submitted to the connection form must not displace (or
+    # resurrect) the sensor chosen on the profile form.
+    obj, created = _setup_flow(flow)
+
+    _run_setup(
+        obj,
+        [{**_PROFILE_SETUP_INPUT, KEY: SITE_SOLAR}],
+        goodwe_input={**_DIRECT_INPUT, KEY: SITE_SOLAR_B},
+    )
+    assert created["entry"]["data"][KEY] == SITE_SOLAR
+
+    obj, created = _setup_flow(flow)
+    _run_setup(
+        obj,
+        [dict(_PROFILE_SETUP_INPUT)],
+        goodwe_input={**_DIRECT_INPUT, KEY: SITE_SOLAR_B},
+    )
+    assert KEY not in created["entry"]["data"]
 
 
 # --------------------------------------------------------------------------- #
@@ -436,15 +545,6 @@ def test_non_goodwe_profile_form_does_not_offer_the_field(flow):
 # Profile setup form wiring and strings
 # --------------------------------------------------------------------------- #
 
-def test_profile_setup_form_offers_and_stores_the_field():
-    source = CONFIG_FLOW_PATH.read_text(encoding="utf-8")
-    setup = source.split("async def async_step_battery_connection_profile_setup(", 1)[1]
-    setup = setup.split("\n    def _create_final_entry", 1)[0]
-
-    assert "schema_fields.update(goodwe_site_solar_schema())" in setup
-    assert "self._battery_profile_data[\n                            CONF_CUSTOM_SOLAR_POWER_ENTITY\n                        ] = site_solar" in setup
-
-
 def test_goodwe_connection_keys_include_the_site_sensor_so_switching_clears_it():
     source = CONFIG_FLOW_PATH.read_text(encoding="utf-8")
     block = source.split("BATTERY_SYSTEM_GOODWE: (", 1)[1].split("),", 1)[0]
@@ -468,9 +568,20 @@ def test_every_goodwe_form_labels_the_field_as_whole_site_pv(path):
                 steps.append((section, step_id, step))
 
     assert steps, "no GoodWe form strings found"
-    # Initial setup (config flow) must carry the label too, not just the options flow.
+    # Initial setup (config flow) carries the label on the profile setup form...
     assert ("config", "battery_connection_profile_setup") in {(sec, sid) for sec, sid, _ in steps}
-    assert ("config", "goodwe_connection") in {(sec, sid) for sec, sid, _ in steps}
+    # ...which is the only setup form for the sensor, so the setup copy of the
+    # direct connection form must not label a field it no longer has.
+    setup_connection = strings["config"]["step"]["goodwe_connection"]
+    assert KEY not in setup_connection["data"]
+    assert KEY not in setup_connection["data_description"]
+    steps = [(sec, sid, st) for sec, sid, st in steps if KEY in st["data"]]
+    assert {(sec, sid) for sec, sid, _ in steps} == {
+        ("config", "battery_connection_profile_setup"),
+        ("options", "goodwe_connection_options"),
+        ("options", "battery_connection_profile"),
+        ("options", "battery_connection_profile_setup"),
+    }
     for section, step_id, step in steps:
         label = step["data"].get(KEY, "")
         assert "whole-site" in label.lower() and "all pv" in label.lower(), (section, step_id)
