@@ -139,7 +139,19 @@ def _install_power_sync_stubs() -> None:
     const_module.CONF_DISPLAY_CURRENCY = "display_currency"
     const_module.DISPLAY_CURRENCY_AUTOMATIC = "automatic"
     const_module.DISPLAY_CURRENCIES = ("automatic", "AUD", "EUR", "GBP", "NZD", "SEK")
+    const_module.CONF_EXPORT_BOOST_ENABLED = "export_boost_enabled"
+    const_module.CONF_EXPORT_PRICE_OFFSET = "export_price_offset"
+    const_module.CONF_EXPORT_MIN_PRICE = "export_min_price"
+    const_module.CONF_EXPORT_BOOST_START = "export_boost_start"
+    const_module.CONF_EXPORT_BOOST_END = "export_boost_end"
+    const_module.CONF_EXPORT_BOOST_THRESHOLD = "export_boost_threshold"
+    const_module.DEFAULT_EXPORT_BOOST_START = "17:00"
+    const_module.DEFAULT_EXPORT_BOOST_END = "21:00"
+    const_module.DEFAULT_EXPORT_BOOST_THRESHOLD = 0.0
     const_module.CONF_OPTIMIZATION_AUTO_APPLY_RESERVE = "optimization_auto_apply_reserve"
+    const_module.CONF_OPTIMIZATION_BATTERY_CAPACITY_WH = "optimization_battery_capacity_wh"
+    const_module.CONF_OPTIMIZATION_MAX_CHARGE_W = "optimization_max_charge_w"
+    const_module.CONF_OPTIMIZATION_MAX_DISCHARGE_W = "optimization_max_discharge_w"
     const_module.CONF_OPTIMIZATION_BACKUP_RESERVE = "optimization_backup_reserve"
     const_module.CONF_OPTIMIZATION_EV_INTEGRATION = "optimization_ev_integration"
     const_module.CONF_OPTIMIZATION_LOAD_ENTITY = "optimization_load_entity"
@@ -726,7 +738,10 @@ def _coordinator_with_epex_provider(
     )
     coordinator._last_display_import_prices = None
     coordinator._last_display_export_prices = None
-    coordinator._apply_export_boost = lambda export, import_prices=None: (export, [])
+    coordinator._apply_export_boost = lambda export, import_prices=None: (
+        [max(0.0, price) for price in export],
+        [],
+    )
     coordinator._apply_saving_session_prices = lambda imports, exports: (imports, exports)
     coordinator._apply_chip_mode = lambda exports, *args: exports
     coordinator._apply_demand_charge_penalty = lambda imports: imports
@@ -756,7 +771,10 @@ def _coordinator_with_dynamic_price_provider(
     )
     coordinator._last_display_import_prices = None
     coordinator._last_display_export_prices = None
-    coordinator._apply_export_boost = lambda export, import_prices=None: (export, [])
+    coordinator._apply_export_boost = lambda export, import_prices=None: (
+        [max(0.0, price) for price in export],
+        [],
+    )
     coordinator._apply_saving_session_prices = lambda imports, exports: (imports, exports)
     coordinator._apply_chip_mode = lambda exports, *args: exports
     coordinator._apply_demand_charge_penalty = lambda imports: imports
@@ -1496,6 +1514,57 @@ def test_amber_dynamic_export_forecast_uses_advanced_price_predicted(opt_module)
     assert export_prices[:6] == pytest.approx([1.94] * 6)
     assert export_prices[6:] == pytest.approx([2.44] * 6)
     assert coordinator._last_display_export_prices == pytest.approx(export_prices)
+
+
+def test_amber_negative_export_cannot_become_export_boost_eligibility(
+    opt_module,
+    monkeypatch,
+):
+    """A signed negative Amber export rate must fail the boost threshold."""
+    start = datetime(2026, 5, 3, 8, 30, tzinfo=timezone.utc)
+    forecast = [
+        _dynamic_price_entry(
+            start,
+            27.8,
+            "general",
+            advanced_price={"predicted": 27.8},
+        ),
+        _dynamic_price_entry(
+            start,
+            -0.55,
+            "feedIn",
+            advanced_price={"predicted": 0.55},
+        ),
+    ]
+    coordinator = _coordinator_with_dynamic_price_provider(
+        opt_module,
+        "amber",
+        forecast,
+    )
+    coordinator._entry.options.update(
+        {
+            "export_boost_enabled": True,
+            "export_price_offset": 5.0,
+            "export_boost_start": "08:00",
+            "export_boost_end": "09:00",
+            "export_boost_threshold": 0.0,
+        }
+    )
+    coordinator._apply_export_boost = (
+        opt_module.OptimizationCoordinator._apply_export_boost.__get__(coordinator)
+    )
+    coordinator._saving_session_coordinator = None
+    monkeypatch.setattr(opt_module.dt_util, "now", lambda: start)
+
+    _import_prices, export_prices = asyncio.run(coordinator._get_price_forecast())
+
+    assert export_prices == pytest.approx([0.0] * 12)
+    assert coordinator._last_display_export_prices == pytest.approx([-0.0055] * 6)
+    assert coordinator._last_settlement_export_prices == pytest.approx(
+        [-0.0055] * 12
+    )
+    assert coordinator._last_export_boost_allowed_slots == [False] * 12
+    assert coordinator._battery_export_allowed_slots(12, export_prices) == [False] * 12
 
 
 def test_amber_dynamic_export_forecast_honors_configured_forecast_type(opt_module):

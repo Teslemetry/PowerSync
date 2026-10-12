@@ -4852,6 +4852,28 @@ def test_export_boost_allows_only_configured_window_above_threshold(opt_module):
     assert all(price > 0.12 for price in boosted[6:])
 
 
+def test_negative_signed_export_price_cannot_enter_export_boost(opt_module, monkeypatch):
+    coordinator = _coordinator(
+        opt_module,
+        "amber",
+        export_boost_enabled=True,
+        export_price_offset=5.0,
+        export_boost_start="08:00",
+        export_boost_end="09:00",
+        export_boost_threshold=0.0,
+    )
+    now = datetime(2026, 5, 3, 8, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(opt_module.dt_util, "now", lambda: now)
+
+    boosted, boost_mask = coordinator._apply_export_boost(
+        [-0.0055, -0.0055],
+        [0.278, 0.0416816],
+    )
+
+    assert boosted == [0.0, 0.0]
+    assert boost_mask == [False, False]
+
+
 def test_chip_mode_threshold_uses_real_export_price_after_boost(opt_module):
     coordinator = _coordinator(
         opt_module,
@@ -12311,6 +12333,26 @@ def test_global_export_floor_allows_exact_boundary_price(opt_module):
     asyncio.run(coordinator._execute_optimizer_action(action))
 
     assert battery.force_discharge_calls == [(5, 4200, False, None)]
+
+
+def test_cached_negative_export_is_blocked_without_configured_floor(opt_module):
+    battery = _FakeBattery()
+    coordinator = _execution_coordinator(opt_module, battery, soc=0.80)
+    coordinator.battery_system = "foxess"
+    coordinator._config.min_export_price = 0.0
+    coordinator._last_executed_action = "export"
+    start = datetime(2026, 5, 3, 17, 30, tzinfo=timezone.utc)
+    action = SimpleNamespace(action="export", power_w=4200, timestamp=start)
+    coordinator._current_schedule = SimpleNamespace(actions=[action])
+    coordinator._last_price_timestamps = [start]
+    coordinator._last_settlement_export_prices = [-0.0055]
+
+    asyncio.run(coordinator._execute_optimizer_action(action))
+
+    assert battery.force_discharge_calls == []
+    assert battery.self_consumption_calls == 1
+    assert coordinator._last_executed_planned_action == "export"
+    assert coordinator._last_executed_action == "self_consumption"
 
 
 def test_zerohero_export_price_gate_uses_bonus_value(opt_module):

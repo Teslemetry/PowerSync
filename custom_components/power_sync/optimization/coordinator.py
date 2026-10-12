@@ -10744,35 +10744,39 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         min_export_price = normalize_min_export_price(
             getattr(self._config, "min_export_price", 0.0)
         )
-        if runtime_action in EXPORT_ACTIONS and min_export_price > 0:
-            real_export_prices = (
-                getattr(self, "_last_settlement_export_prices", None)
-                or getattr(self, "_last_export_prices", None)
+        if runtime_action in EXPORT_ACTIONS:
+            settlement_export_prices = getattr(
+                self,
+                "_last_settlement_export_prices",
+                None,
             )
-            real_export_price = (
-                self._current_effective_export_price_for_action(
+            real_export_prices = settlement_export_prices
+            if min_export_price > 0:
+                real_export_prices = (
+                    settlement_export_prices
+                    or getattr(self, "_last_export_prices", None)
+                )
+            if real_export_prices:
+                real_export_price = self._current_effective_export_price_for_action(
                     real_export_prices,
                     action,
                 )
-                if real_export_prices
-                else None
-            )
-            if not export_price_allows_battery_export(
-                real_export_price,
-                min_export_price,
-            ):
-                _LOGGER.info(
-                    "Optimizer: battery export blocked by minimum real export "
-                    "price (price=%s, floor=%.1fc/kWh); restoring self_consumption",
-                    (
-                        f"{real_export_price * 100:.1f}c/kWh"
-                        if real_export_price is not None
-                        else "unavailable"
-                    ),
-                    min_export_price * 100,
-                )
-                runtime_action = "self_consumption"
-                battery_export_price_blocked = True
+                if not export_price_allows_battery_export(
+                    real_export_price,
+                    min_export_price,
+                ):
+                    _LOGGER.info(
+                        "Optimizer: battery export blocked by minimum real export "
+                        "price (price=%s, floor=%.1fc/kWh); restoring self_consumption",
+                        (
+                            f"{real_export_price * 100:.1f}c/kWh"
+                            if real_export_price is not None
+                            else "unavailable"
+                        ),
+                        min_export_price * 100,
+                    )
+                    runtime_action = "self_consumption"
+                    battery_export_price_blocked = True
 
         monitoring_mode = self._monitoring_mode_active()
         solar_export_hold = getattr(self, "_solar_export_hold", None)
@@ -14262,11 +14266,20 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         grid→battery→grid arbitrage that doesn't exist at real export prices.
         Without this, the LP may import from grid to charge the battery for later
         export at the inflated boosted price — a net loss at real prices.
+
+        ``export_prices`` is the signed, unboosted settlement series. The
+        returned prices are clamped for the non-negative LP objective; the
+        eligibility mask remains based on the signed input.
         """
         allowed_slots = [False] * len(export_prices)
+        # The eligibility mask must see the signed, unboosted rate, while the
+        # LP must never receive a negative export revenue.  Keep those two
+        # representations separate so a clamped zero cannot pass a zero-cent
+        # Export Boost threshold.
+        result = [max(0.0, price) for price in export_prices]
         if not self._entry:
             self._last_export_boost_allowed_slots = allowed_slots
-            return export_prices, allowed_slots
+            return result, allowed_slots
 
         from ..const import (
             CONF_EXPORT_BOOST_ENABLED,
@@ -14284,7 +14297,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         data = self._entry.data
         if not opts.get(CONF_EXPORT_BOOST_ENABLED, data.get(CONF_EXPORT_BOOST_ENABLED, False)):
             self._last_export_boost_allowed_slots = allowed_slots
-            return export_prices, allowed_slots
+            return result, allowed_slots
 
         offset = (opts.get(CONF_EXPORT_PRICE_OFFSET, 0) or 0) / 100  # cents → $/kWh
         min_price = (opts.get(CONF_EXPORT_MIN_PRICE, 0) or 0) / 100
@@ -14298,7 +14311,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             eh, em = map(int, boost_end.split(":"))
         except (ValueError, IndexError):
             self._last_export_boost_allowed_slots = allowed_slots
-            return export_prices, allowed_slots
+            return result, allowed_slots
 
         # Anti-arbitrage cap: the boosted export price must not create phantom
         # arbitrage where the LP charges from grid to export at inflated prices.
@@ -14330,7 +14343,6 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         boosted = 0
         capped = 0
 
-        result = list(export_prices)
         allowed_slots = self._export_boost_allowed_slots(len(result), export_prices)
         self._last_export_boost_allowed_slots = allowed_slots
         for t in range(len(result)):
@@ -14344,7 +14356,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 in_window = start_min <= minutes_of_day < end_min
 
             if in_window and allowed_slots[t]:
-                real_price = result[t]
+                real_price = export_prices[t]
                 boosted_price = max(real_price + offset, min_price)
 
                 # Anti-arbitrage cap: only restrict the boost when it would
@@ -16411,7 +16423,13 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             display_export_raw = list(export_prices)
 
                         self._last_settlement_import_prices = list(import_prices)
-                        self._last_settlement_export_prices = list(export_prices)
+                        # Keep the signed, unboosted tariff separate from the
+                        # non-negative LP objective.  Eligibility and the
+                        # execution floor must evaluate the actual settlement
+                        # rate, not an optimizer-only clamp or boost overlay.
+                        self._last_settlement_export_prices = list(
+                            display_export_raw
+                        )
 
                         # Store prices for UI display BEFORE LP adjustments.
                         # Clip to actual forecast length so the app chart doesn't
@@ -16440,8 +16458,13 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         # Apply export boost, saving session overlay, and chip mode to LP prices.
                         # Chip mode uses the real export price as its threshold reference so
                         # Export Boost cannot make a below-threshold export slot look allowed.
-                        chip_reference_export_prices = list(export_prices)
-                        export_prices, _ = self._apply_export_boost(export_prices, import_prices)
+                        chip_reference_export_prices = list(
+                            self._last_settlement_export_prices
+                        )
+                        export_prices, _ = self._apply_export_boost(
+                            self._last_settlement_export_prices,
+                            import_prices,
+                        )
                         import_prices, export_prices = self._apply_saving_session_prices(import_prices, export_prices)
                         export_prices = self._apply_chip_mode(
                             export_prices,
