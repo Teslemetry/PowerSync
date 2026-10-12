@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import sys
 from pathlib import Path
 from types import SimpleNamespace
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 INIT_PATH = ROOT / "custom_components" / "power_sync" / "__init__.py"
@@ -65,6 +67,7 @@ def _load_class(class_name: str):
     namespace = {
         "HomeAssistant": object,
         "ConfigEntry": object,
+        "asyncio": asyncio,
         "dt_util": _FakeDtUtil(),
         "_LOGGER": _FakeLogger(),
         "DOMAIN": DOMAIN,
@@ -102,6 +105,193 @@ def _force_discharge_calls(hass: _FakeHass):
     return [c for c in hass.services.calls if c[1] == SERVICE_FORCE_DISCHARGE]
 
 
+def _generic_spike_manager():
+    manager = object.__new__(_load_class("GenericAEMOSpikeManager"))
+    manager.hass = _FakeHass()
+    manager.entry = SimpleNamespace(entry_id="entry-1", options={"aemo_spike_enabled": True}, data={})
+    manager.region, manager.threshold, manager._battery_type = "NSW1", 3000, "sigenergy"
+    manager._in_spike_mode = False
+    manager._spike_start_time = manager._last_price = manager._last_check = None
+    manager._aemo_client = _FakeAemoClient(True, 5000)
+    return manager
+
+
+def test_generic_saved_disable_restores_active_spike_without_rearming():
+    manager = _generic_spike_manager()
+    async def run():
+        await manager.check_and_handle_spike()
+        manager.entry.options[CONF_AEMO_SPIKE_ENABLED] = False
+        await manager.check_and_handle_spike()
+        await manager.check_and_handle_spike()
+    asyncio.run(run())
+    assert len(_force_discharge_calls(manager.hass)) == 1
+    assert [c[1] for c in manager.hass.services.calls] == [SERVICE_FORCE_DISCHARGE, SERVICE_RESTORE_NORMAL]
+    assert not manager.in_spike_mode
+
+
+def test_generic_disable_during_price_fetch_blocks_discharge():
+    manager = _generic_spike_manager()
+    async def fetch(*args, **kwargs):
+        manager.entry.options[CONF_AEMO_SPIKE_ENABLED] = False
+        return True, 5000, {}
+    manager._aemo_client.check_price_spike = fetch
+    asyncio.run(manager.check_and_handle_spike())
+    assert manager.hass.services.calls == []
+
+
+def test_generic_cleanup_preserves_a_new_manual_command():
+    manager = _generic_spike_manager()
+    manager._in_spike_mode = True
+    manager.hass.data = {DOMAIN: {manager.entry.entry_id: {
+        "force_discharge_state": {"active": True, "source": "user"},
+    }}}
+    asyncio.run(manager.stop())
+    assert manager.hass.services.calls == []
+    assert not manager.in_spike_mode
+
+
+def test_generic_unconfirmed_restore_retains_cleanup_obligation():
+    manager = _generic_spike_manager()
+    manager._in_spike_mode = True
+    manager.hass.data = {DOMAIN: {manager.entry.entry_id: {
+        "force_discharge_state": {"active": True, "source": "aemo_spike"},
+    }}}
+    asyncio.run(manager.stop())
+    assert manager.in_spike_mode
+    assert [c[1] for c in manager.hass.services.calls] == [SERVICE_RESTORE_NORMAL]
+
+
+def _vpp_spike_namespace(monkeypatch, *, enabled=True, monitoring=False, disable_during_fetch=False):
+    source = INIT_PATH.read_text()
+    tree = ast.parse(source)
+    namespace = {
+        "__package__": "power_sync", "DOMAIN": DOMAIN,
+        "CONF_AEMO_SPIKE_ENABLED": CONF_AEMO_SPIKE_ENABLED,
+        "SERVICE_FORCE_DISCHARGE": SERVICE_FORCE_DISCHARGE,
+        "SERVICE_RESTORE_NORMAL": SERVICE_RESTORE_NORMAL,
+        "_LOGGER": _FakeLogger(), "dt_util": _FakeDtUtil(),
+        "aemo_region": "NSW1", "aemo_spike_threshold": 3000,
+        "vpp_aemo_control_lock": asyncio.Lock(),
+        "vpp_spike_state": {"stopped": False, "in_spike_mode": False, "spike_start_time": None},
+        "entry": SimpleNamespace(entry_id="entry-1", options={CONF_AEMO_SPIKE_ENABLED: enabled}, data={}),
+        "force_discharge_state": {"active": False},
+        "_is_monitoring_mode": lambda: monitoring,
+    }
+    hass = _FakeHass()
+    hass.data = {DOMAIN: {"entry-1": {}}}
+    namespace["hass"] = hass
+    fetches = []
+    async def prices():
+        fetches.append(True)
+        if disable_during_fetch:
+            namespace["entry"].options[CONF_AEMO_SPIKE_ENABLED] = False
+        return {"NSW1": {"price": 5000}}
+    async def service(domain, name, data, blocking=True):
+        hass.services.calls.append((domain, name, data))
+        if name == SERVICE_FORCE_DISCHARGE:
+            namespace["force_discharge_state"].update(active=True, source=data.get("source"))
+        else:
+            namespace["force_discharge_state"]["active"] = False
+    hass.services.async_call = service
+    monkeypatch.setitem(sys.modules, "power_sync.aemo_api", SimpleNamespace(
+        AEMOAPIClient=lambda session: SimpleNamespace(get_current_prices=prices),
+    ))
+    monkeypatch.setitem(sys.modules, "homeassistant.helpers.aiohttp_client", SimpleNamespace(
+        async_get_clientsession=lambda hass: None,
+    ))
+    for name in ("_vpp_aemo_commands_allowed", "_restore_vpp_aemo_spike",
+                 "_check_aemo_spike_for_vpp", "check_aemo_spike_for_vpp"):
+        node = next(n for n in ast.walk(tree)
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name)
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "<vpp-spike>", "exec"), namespace)
+    return namespace, fetches
+
+
+@pytest.mark.parametrize("enabled,monitoring,during_fetch", [(False, False, False), (True, True, False), (True, False, True)])
+def test_vpp_saved_disable_or_monitoring_blocks_discharge(monkeypatch, enabled, monitoring, during_fetch):
+    ns, fetches = _vpp_spike_namespace(monkeypatch, enabled=enabled, monitoring=monitoring,
+                                      disable_during_fetch=during_fetch)
+    asyncio.run(ns["check_aemo_spike_for_vpp"](None))
+    assert ns["hass"].services.calls == []
+    assert bool(fetches) == during_fetch
+
+
+def test_vpp_disable_cleans_up_only_its_own_discharge(monkeypatch):
+    ns, _ = _vpp_spike_namespace(monkeypatch)
+    async def run():
+        await ns["check_aemo_spike_for_vpp"](None)
+        assert ns["force_discharge_state"]["source"] == "aemo_spike"
+        ns["entry"].options[CONF_AEMO_SPIKE_ENABLED] = False
+        await ns["check_aemo_spike_for_vpp"](None)
+    asyncio.run(run())
+    assert [c[1] for c in ns["hass"].services.calls] == [SERVICE_FORCE_DISCHARGE, SERVICE_RESTORE_NORMAL]
+    assert not ns["vpp_spike_state"]["in_spike_mode"]
+
+
+def test_vpp_cleanup_preserves_new_manual_command(monkeypatch):
+    ns, _ = _vpp_spike_namespace(monkeypatch, enabled=False)
+    ns["vpp_spike_state"]["in_spike_mode"] = True
+    ns["force_discharge_state"].update(active=True, source="user")
+    asyncio.run(ns["check_aemo_spike_for_vpp"](None))
+    assert ns["hass"].services.calls == []
+    assert ns["force_discharge_state"]["active"]
+
+
+def test_vpp_unconfirmed_restore_is_retried(monkeypatch):
+    ns, _ = _vpp_spike_namespace(monkeypatch, enabled=False)
+    ns["vpp_spike_state"]["in_spike_mode"] = True
+    ns["force_discharge_state"].update(active=True, source="aemo_spike")
+    async def unconfirmed(domain, name, data, blocking=True):
+        ns["hass"].services.calls.append((domain, name, data))
+    ns["hass"].services.async_call = unconfirmed
+    async def run():
+        await ns["check_aemo_spike_for_vpp"](None)
+        await ns["check_aemo_spike_for_vpp"](None)
+    asyncio.run(run())
+    assert ns["vpp_spike_state"]["in_spike_mode"]
+    assert [c[1] for c in ns["hass"].services.calls] == [SERVICE_RESTORE_NORMAL, SERVICE_RESTORE_NORMAL]
+
+
+def test_unload_retires_all_spike_handlers_before_joining_and_restoring():
+    tree = ast.parse(INIT_PATH.read_text())
+    unload = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "async_unload_entry")
+    first = next(i for i, n in enumerate(unload.body) if isinstance(n, ast.Assign)
+                 and any(isinstance(t, ast.Name) and t.id == "spike_managers" for t in n.targets))
+    last = next(i for i, n in enumerate(unload.body) if isinstance(n, ast.If)
+                and isinstance(n.test, ast.NamedExpr) and n.test.target.id == "vpp_restore")
+    wrapper = ast.AsyncFunctionDef(name="shutdown", args=ast.arguments(
+        posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]),
+        body=unload.body[first:last + 1], decorator_list=[])
+    events = []
+    runtime = {"vpp_spike_state": {"in_spike_mode": True, "stopped": False}}
+    class Manager:
+        _stopped = False
+        async def stop(self):
+            assert all(m._stopped for m in managers)
+            assert runtime["vpp_spike_state"]["stopped"]
+            events.append("manager restore")
+    managers = [Manager(), Manager()]
+    runtime.update(aemo_spike_manager=managers[0], generic_aemo_spike_manager=managers[1])
+    for key in ("aemo_spike_cancel", "generic_aemo_spike_cancel", "vpp_aemo_cancel"):
+        runtime[key] = lambda: events.append("cancel timer")
+    async def pending_initial_check():
+        assert all(m._stopped for m in managers)
+        assert runtime["vpp_spike_state"]["stopped"]
+        events.append("joined initial check")
+    async def restore():
+        assert runtime["vpp_aemo_control_lock"].locked()
+        events.append("vpp restore")
+    namespace = {"entry_data": runtime, "asyncio": asyncio, "_LOGGER": _FakeLogger()}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[wrapper], type_ignores=[])), "<spike-unload>", "exec"), namespace)
+    async def run():
+        runtime["vpp_aemo_control_lock"] = asyncio.Lock()
+        runtime["vpp_aemo_restore"] = restore
+        runtime["vpp_aemo_initial_task"] = asyncio.create_task(pending_initial_check())
+        await namespace["shutdown"]()
+    asyncio.run(run())
+    assert events == ["cancel timer"] * 3 + ["joined initial check", "manager restore", "manager restore", "vpp restore"]
+
+
 def test_generic_aemo_spike_re_arms_force_discharge_while_still_spiking():
     """OB-33: repeated ticks while a spike persists must keep re-issuing
     force_discharge, not just log "still in spike mode" (which lets the
@@ -111,7 +301,7 @@ def test_generic_aemo_spike_re_arms_force_discharge_while_still_spiking():
 
     manager = object.__new__(GenericAEMOSpikeManager)
     manager.hass = _FakeHass()
-    manager.entry = SimpleNamespace()
+    manager.entry = SimpleNamespace(entry_id="entry-1", options={"aemo_spike_enabled": True}, data={})
     manager.region = "QLD1"
     manager.threshold = 300.0
     manager._battery_type = "sigenergy"
@@ -146,7 +336,7 @@ def test_generic_aemo_spike_does_not_rearm_once_spike_ends():
 
     manager = object.__new__(GenericAEMOSpikeManager)
     manager.hass = _FakeHass()
-    manager.entry = SimpleNamespace()
+    manager.entry = SimpleNamespace(entry_id="entry-1", options={"aemo_spike_enabled": True}, data={})
     manager.region = "QLD1"
     manager.threshold = 300.0
     manager._battery_type = "sigenergy"

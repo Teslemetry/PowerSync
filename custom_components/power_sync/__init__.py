@@ -3647,6 +3647,17 @@ class SyncCoordinator:
             return not self._initial_sync_done
 
 
+async def _aemo_spike_restore_required(hass, entry) -> bool:
+    """A disabled feature can still owe restoration of an earlier Tesla event."""
+    try:
+        stored = await Store(hass, 1, f"{DOMAIN}.aemo_spike_event.{entry.entry_id}").async_load()
+        return bool(stored and stored.get("in_event"))
+    except Exception as err:
+        _LOGGER.warning("Could not read pending AEMO spike restoration: %s", err)
+        # Construct a cleanup-only manager so recovery is retried, never export.
+        return True
+
+
 class AEMOSpikeManager:
     """
     Manages AEMO price spike detection and Tesla tariff modifications.
@@ -3771,8 +3782,10 @@ class AEMOSpikeManager:
         try:
             stored = await store.async_load()
         except Exception as e:
-            _LOGGER.debug("No persisted AEMO spike event state to restore: %s", e)
+            self._recovery_unreadable = True
+            _LOGGER.warning("Cannot read AEMO spike recovery state; blocking new spike exports: %s", e)
             return
+        self._recovery_unreadable = False
         if not stored or not stored.get("in_event"):
             return
         _LOGGER.warning(
@@ -3782,10 +3795,52 @@ class AEMOSpikeManager:
         self._saved_tariff = stored.get("saved_tariff")
         self._saved_operation_mode = stored.get("saved_operation_mode")
         self._in_spike_mode = True
+        self._restore_pending = True
         await self._exit_spike_mode(0.0)
 
     async def check_and_handle_spike(self) -> None:
         """Check AEMO prices and handle spike mode transitions."""
+
+        async with self._control_lock():
+            await self._check_and_handle_spike()
+
+    def _control_lock(self):
+        """Serialize price checks and shutdown, including lightweight fixtures."""
+        if getattr(self, "_spike_control_lock", None) is None:
+            self._spike_control_lock = asyncio.Lock()
+        return self._spike_control_lock
+
+    def _monitoring(self) -> bool:
+        return bool(self.entry.options.get(
+            "monitoring_mode", self.entry.data.get("monitoring_mode", False)
+        ))
+
+    def _spike_commands_allowed(self) -> bool:
+        """Read the live option at each command boundary, never a setup copy."""
+        return (
+            not getattr(self, "_stopped", False)
+            and not getattr(self, "_recovery_unreadable", False)
+            and self.entry.options.get(
+                "aemo_spike_enabled", self.entry.data.get("aemo_spike_enabled", False)
+            ) is True
+            and not self._monitoring()
+        )
+
+    async def stop(self) -> None:
+        """Retire in-flight checks before restoring any event we own."""
+        self._stopped = True
+        async with self._control_lock():
+            if self._in_spike_mode:
+                await self._exit_spike_mode(0.0)
+
+    async def _check_and_handle_spike(self) -> None:
+        if getattr(self, "_recovery_unreadable", False):
+            await self.restore_or_exit()
+            return
+        if not self._spike_commands_allowed() or getattr(self, "_restore_pending", False):
+            if self._in_spike_mode:
+                await self._exit_spike_mode(0.0)
+            return
 
         self._last_check = dt_util.utcnow()
 
@@ -3793,6 +3848,11 @@ class AEMOSpikeManager:
         is_spike, current_price, price_data = await self._aemo_client.check_price_spike(
             self.region, self.threshold, was_active=self._in_spike_mode
         )
+
+        if not self._spike_commands_allowed():
+            if self._in_spike_mode:
+                await self._exit_spike_mode(0.0)
+            return
 
         if current_price is not None:
             self._last_price = current_price
@@ -3804,6 +3864,8 @@ class AEMOSpikeManager:
         # SPIKE DETECTED - Enter spike mode
         if is_spike and not self._in_spike_mode:
             await self._enter_spike_mode(current_price)
+            if not self._spike_commands_allowed() and self._in_spike_mode:
+                await self._exit_spike_mode(0.0)
 
         # NO SPIKE - Exit spike mode if currently in it
         elif not is_spike and self._in_spike_mode:
@@ -3819,6 +3881,9 @@ class AEMOSpikeManager:
 
     async def _enter_spike_mode(self, current_price: float) -> None:
         """Enter spike mode: save tariff, switch to autonomous, upload spike tariff."""
+
+        if not self._spike_commands_allowed():
+            return
 
         entry_runtime = (
             getattr(self.hass, "data", {})
@@ -3928,7 +3993,25 @@ class AEMOSpikeManager:
                         else:
                             _LOGGER.warning("No tariff found in site_info either - restore may not work")
 
+            # Persist the restore obligation before the first mutation. A
+            # reload/disable during a request must not strand a spike tariff.
+            if not self._spike_commands_allowed():
+                if not self._in_spike_mode:
+                    self._saved_tariff = None
+                    self._saved_operation_mode = None
+                return
+            if not self._saved_tariff or self._saved_operation_mode not in (
+                "autonomous", "self_consumption", "backup",
+            ):
+                _LOGGER.warning("Cannot enter AEMO spike mode without a restorable tariff and operation mode")
+                return
+            self._in_spike_mode = True
+            self._restore_pending = True
+            await self._persist_event_state()
+
             # Step 3: Switch to autonomous mode for best export behavior
+            if not self._spike_commands_allowed():
+                return
             if self._saved_operation_mode != "autonomous":
                 _LOGGER.info("Switching to autonomous mode for optimal export...")
                 async with session.post(
@@ -3941,8 +4024,12 @@ class AEMOSpikeManager:
                         _LOGGER.info("Switched to autonomous mode")
                     else:
                         _LOGGER.warning("Could not switch operation mode: %s", response.status)
+                        await self._exit_spike_mode(0.0)
+                        return
 
             # Step 4: Create and upload spike tariff
+            if not self._spike_commands_allowed():
+                return
             spike_tariff = self._create_spike_tariff(current_price)
             success = await send_tariff_to_tesla(
                 self.hass,
@@ -3955,6 +4042,7 @@ class AEMOSpikeManager:
 
             if success:
                 self._in_spike_mode = True
+                self._restore_pending = False
                 self._spike_start_time = dt_util.utcnow()
                 await self._persist_event_state()
                 _LOGGER.warning(
@@ -3963,12 +4051,19 @@ class AEMOSpikeManager:
                 )
             else:
                 _LOGGER.error("Failed to upload spike tariff")
+                await self._exit_spike_mode(0.0)
 
         except Exception as e:
             _LOGGER.error("Error entering spike mode: %s", e, exc_info=True)
+            if self._in_spike_mode:
+                await self._exit_spike_mode(0.0)
 
     async def _exit_spike_mode(self, current_price: float) -> None:
         """Exit spike mode: restore saved tariff and operation mode."""
+        self._restore_pending = True
+        if self._monitoring():
+            # Keep the persisted obligation for a later authorised restore.
+            return
         _LOGGER.info(
             "Price normalized: $%.2f/MWh < $%.0f/MWh threshold - exiting spike mode",
             current_price,
@@ -4000,8 +4095,8 @@ class AEMOSpikeManager:
                     _LOGGER.info("Switched to self_consumption mode")
 
             # Step 2: Restore saved tariff
-            restore_ok = True
             restore_tariff = _select_restorable_tesla_tariff(self._saved_tariff)
+            restore_ok = bool(restore_tariff)
             if restore_tariff:
                 _LOGGER.info("Restoring saved tariff...")
                 success = await send_tariff_to_tesla(
@@ -4025,24 +4120,26 @@ class AEMOSpikeManager:
             else:
                 _LOGGER.warning("No saved tariff to restore")
 
-            # Step 3: Wait for Tesla to process the tariff
-            await asyncio.sleep(5)
-
-            # Step 4: Restore original operation mode
-            restore_mode = self._saved_operation_mode or "autonomous"
-            _LOGGER.info("Restoring operation mode to: %s", restore_mode)
-            async with session.post(
-                f"{api_base}/api/1/energy_sites/{self.site_id}/operation",
-                headers=headers,
-                json={"default_real_mode": restore_mode},
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as response:
-                if response.status == 200:
-                    _LOGGER.info("Restored operation mode to %s", restore_mode)
+            # Do not re-enable autonomous export while the spike tariff is
+            # still live. A failed tariff restore retains the retry obligation.
+            if restore_ok:
+                await asyncio.sleep(5)
+                restore_mode = self._saved_operation_mode or "autonomous"
+                _LOGGER.info("Restoring operation mode to: %s", restore_mode)
+                async with session.post(
+                    f"{api_base}/api/1/energy_sites/{self.site_id}/operation",
+                    headers=headers,
+                    json={"default_real_mode": restore_mode},
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as response:
+                    restore_ok = response.status == 200
+                    if restore_ok:
+                        _LOGGER.info("Restored operation mode to %s", restore_mode)
 
             if restore_ok:
                 # Clear spike state
                 self._in_spike_mode = False
+                self._restore_pending = False
                 self._spike_start_time = None
                 # OB-41: also clear the saved baseline. Otherwise a genuine
                 # tariff change the user makes between two events would be
@@ -4152,7 +4249,9 @@ class AEMOSpikeManager:
     def get_status(self) -> dict:
         """Get current spike manager status."""
         return {
-            "enabled": True,
+            "enabled": self.entry.options.get(
+                "aemo_spike_enabled", self.entry.data.get("aemo_spike_enabled", False)
+            ) is True,
             "region": self.region,
             "threshold": self.threshold,
             "in_spike_mode": self._in_spike_mode,
@@ -4239,12 +4338,51 @@ class GenericAEMOSpikeManager:
     async def check_and_handle_spike(self) -> None:
         """Check AEMO prices and handle spike mode transitions."""
 
+        async with self._control_lock():
+            await self._check_and_handle_spike()
+
+    def _control_lock(self):
+        if getattr(self, "_spike_control_lock", None) is None:
+            self._spike_control_lock = asyncio.Lock()
+        return self._spike_control_lock
+
+    def _monitoring(self) -> bool:
+        return bool(self.entry.options.get(
+            "monitoring_mode", self.entry.data.get("monitoring_mode", False)
+        ))
+
+    def _spike_commands_allowed(self) -> bool:
+        return (
+            not getattr(self, "_stopped", False)
+            and self.entry.options.get(
+                "aemo_spike_enabled", self.entry.data.get("aemo_spike_enabled", False)
+            ) is True
+            and not self._monitoring()
+        )
+
+    async def stop(self) -> None:
+        self._stopped = True
+        async with self._control_lock():
+            if self._in_spike_mode:
+                await self._exit_spike_mode(0.0)
+
+    async def _check_and_handle_spike(self) -> None:
+        if not self._spike_commands_allowed():
+            if self._in_spike_mode:
+                await self._exit_spike_mode(0.0)
+            return
+
         self._last_check = dt_util.utcnow()
 
         # Check for spike
         is_spike, current_price, price_data = await self._aemo_client.check_price_spike(
             self.region, self.threshold, was_active=self._in_spike_mode
         )
+
+        if not self._spike_commands_allowed():
+            if self._in_spike_mode:
+                await self._exit_spike_mode(0.0)
+            return
 
         if current_price is not None:
             self._last_price = current_price
@@ -4256,6 +4394,8 @@ class GenericAEMOSpikeManager:
         # SPIKE DETECTED - Enter spike mode
         if is_spike and not self._in_spike_mode:
             await self._enter_spike_mode(current_price)
+            if not self._spike_commands_allowed() and self._in_spike_mode:
+                await self._exit_spike_mode(0.0)
 
         # NO SPIKE - Exit spike mode if currently in it
         elif not is_spike and self._in_spike_mode:
@@ -4271,7 +4411,7 @@ class GenericAEMOSpikeManager:
             )
             try:
                 await self.hass.services.async_call(
-                    DOMAIN, SERVICE_FORCE_DISCHARGE, {}, blocking=True
+                    DOMAIN, SERVICE_FORCE_DISCHARGE, {"source": "aemo_spike"}, blocking=True
                 )
             except Exception as e:
                 _LOGGER.error(
@@ -4281,6 +4421,9 @@ class GenericAEMOSpikeManager:
 
     async def _enter_spike_mode(self, current_price: float) -> None:
         """Enter spike mode: force discharge via service call and notify user."""
+
+        if not self._spike_commands_allowed():
+            return
 
         _LOGGER.warning(
             "%s SPIKE DETECTED: $%.2f/MWh >= $%.0f/MWh threshold - starting force discharge",
@@ -4292,8 +4435,15 @@ class GenericAEMOSpikeManager:
         try:
             # Force discharge via battery-agnostic service call
             await self.hass.services.async_call(
-                DOMAIN, SERVICE_FORCE_DISCHARGE, {}, blocking=True
+                DOMAIN, SERVICE_FORCE_DISCHARGE, {"source": "aemo_spike"}, blocking=True
             )
+
+            runtime = getattr(self.hass, "data", {}).get(DOMAIN, {}).get(self.entry.entry_id, {})
+            force_state = runtime.get("force_discharge_state")
+            if force_state is not None and (
+                not force_state.get("active") or force_state.get("source") != "aemo_spike"
+            ):
+                return
 
             self._in_spike_mode = True
             self._spike_start_time = dt_util.utcnow()
@@ -4320,6 +4470,17 @@ class GenericAEMOSpikeManager:
     async def _exit_spike_mode(self, current_price: float) -> None:
         """Exit spike mode: restore normal operation via service call and notify user."""
 
+        if self._monitoring():
+            return
+        runtime = getattr(self.hass, "data", {}).get(DOMAIN, {}).get(self.entry.entry_id, {})
+        force_state = runtime.get("force_discharge_state")
+        if force_state is not None and (
+            not force_state.get("active") or force_state.get("source") != "aemo_spike"
+        ):
+            # A later manual/optimizer command is not ours to restore.
+            self._in_spike_mode = False
+            return
+
         _LOGGER.info(
             "%s: Price normalized: $%.2f/MWh < $%.0f/MWh threshold - restoring normal operation",
             self._battery_type,
@@ -4336,8 +4497,11 @@ class GenericAEMOSpikeManager:
 
             # Restore normal operation via battery-agnostic service call
             await self.hass.services.async_call(
-                DOMAIN, SERVICE_RESTORE_NORMAL, {}, blocking=True
+                DOMAIN, SERVICE_RESTORE_NORMAL, {"source": "aemo_spike"}, blocking=True
             )
+            if force_state is not None and force_state.get("active"):
+                # Restore may have been accepted while verification is pending.
+                return
 
             _LOGGER.info("%s: Normal operation restored after spike", self._battery_type)
 
@@ -4365,7 +4529,9 @@ class GenericAEMOSpikeManager:
     def get_status(self) -> dict:
         """Get current spike manager status."""
         return {
-            "enabled": True,
+            "enabled": self.entry.options.get(
+                "aemo_spike_enabled", self.entry.data.get("aemo_spike_enabled", False)
+            ) is True,
             "region": self.region,
             "threshold": self.threshold,
             "in_spike_mode": self._in_spike_mode,
@@ -10812,7 +10978,7 @@ class AEMOSpikeView(HomeAssistantView):
                 domain_data = self._hass.data.get(DOMAIN, {})
                 entry_data = domain_data.get(entry.entry_id, {})
                 if new_options != dict(entry.options):
-                    entry_data["_skip_reload"] = True
+                    entry_data.pop("_skip_reload", None)
                 self._hass.config_entries.async_update_entry(entry, options=new_options)
 
                 _LOGGER.info(
@@ -10820,13 +10986,10 @@ class AEMOSpikeView(HomeAssistantView):
                     "enabled" if new_enabled else "disabled",
                 )
 
-                # Note: The spike manager will be created/destroyed on next HA reload
-                # For immediate effect, user should reload the integration
-
                 return web.json_response({
                     "success": True,
                     "enabled": new_enabled,
-                    "message": "Settings updated. Reload PowerSync integration to apply changes.",
+                    "message": "Settings updated. PowerSync will reload to apply changes.",
                 })
 
             # Handle AEMO region update
@@ -10842,7 +11005,7 @@ class AEMOSpikeView(HomeAssistantView):
                 domain_data = self._hass.data.get(DOMAIN, {})
                 entry_data = domain_data.get(entry.entry_id, {})
                 if new_options != dict(entry.options):
-                    entry_data["_skip_reload"] = True
+                    entry_data.pop("_skip_reload", None)
                 self._hass.config_entries.async_update_entry(entry, options=new_options)
 
                 _LOGGER.info("AEMO region updated to %s", new_region)
@@ -10850,7 +11013,7 @@ class AEMOSpikeView(HomeAssistantView):
                 return web.json_response({
                     "success": True,
                     "region": new_region,
-                    "message": "Region updated. Reload PowerSync integration to apply changes.",
+                    "message": "Region updated. PowerSync will reload to apply changes.",
                 })
 
             return web.json_response({
@@ -12050,6 +12213,16 @@ class ProviderConfigView(HomeAssistantView):
                     "demand_charge_billing_day",
                 }.intersection(data)
             )
+            aemo_spike_changed = any(
+                key in data and new_options.get(key) != entry.options.get(
+                    key, entry.data.get(key, default)
+                )
+                for key, default in (
+                    (CONF_AEMO_SPIKE_ENABLED, False),
+                    (CONF_AEMO_REGION, None),
+                    (CONF_AEMO_SPIKE_THRESHOLD, 3000.0),
+                )
+            )
 
             if entry.options.get(
                 CONF_SUNGROW_CONNECTION_TYPE,
@@ -12144,8 +12317,11 @@ class ProviderConfigView(HomeAssistantView):
                 and not happy_hour_end_changed
                 and not flow_power_plan_changed
                 and not demand_charge_changed
+                and not aemo_spike_changed
             ):
                 entry_data["_skip_reload"] = True
+            elif aemo_spike_changed:
+                entry_data.pop("_skip_reload", None)
             try:
                 self._hass.config_entries.async_update_entry(entry, options=new_options)
             finally:
@@ -23151,7 +23327,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     # Tesla AEMO Spike Manager (tariff-based) — only for Tesla
-    if aemo_spike_enabled and not ml_optimization_enabled and has_tesla_site and not is_sigenergy and not is_sungrow and not is_foxess and not is_goodwe and not is_alphaess and not is_esy_sunhome and not is_solax and not is_saj_h2 and not is_fronius_reserva and not is_neovolt and not is_solaredge and not is_anker_solix:
+    if has_tesla_site and not is_sigenergy and not is_sungrow and not is_foxess and not is_goodwe and not is_alphaess and not is_esy_sunhome and not is_solax and not is_saj_h2 and not is_fronius_reserva and not is_neovolt and not is_solaredge and not is_anker_solix and (
+        (aemo_spike_enabled and not ml_optimization_enabled)
+        or await _aemo_spike_restore_required(hass, entry)
+    ):
         aemo_region = entry.options.get(
             CONF_AEMO_REGION,
             entry.data.get(CONF_AEMO_REGION)
@@ -23161,27 +23340,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             entry.data.get(CONF_AEMO_SPIKE_THRESHOLD, 3000.0)
         )
 
-        if aemo_region:
-            aemo_spike_manager = AEMOSpikeManager(
-                hass=hass,
-                entry=entry,
-                region=aemo_region,
-                threshold=aemo_threshold,
-                site_id=entry.data[CONF_TESLA_ENERGY_SITE_ID],
-                api_token=tesla_api_token,
-                api_provider=tesla_api_provider,
-                token_getter=token_getter,
-            )
-            _LOGGER.info(
-                "AEMO Spike Manager initialized: region=%s, threshold=$%.0f/MWh",
-                aemo_region,
-                aemo_threshold,
-            )
-            # OB-41: a persisted spike event from before a reload/restart
-            # must not be silently forgotten — restore-or-exit conservatively.
-            await aemo_spike_manager.restore_or_exit()
-        else:
-            _LOGGER.warning("AEMO spike detection enabled but no region configured")
+        aemo_cleanup_only = not (aemo_spike_enabled and not ml_optimization_enabled and aemo_region)
+        if not aemo_region:
+            _LOGGER.warning("No AEMO region configured; only pending spike recovery is permitted")
+        aemo_spike_manager = AEMOSpikeManager(
+            hass=hass,
+            entry=entry,
+            region=aemo_region,
+            threshold=aemo_threshold,
+            site_id=entry.data[CONF_TESLA_ENERGY_SITE_ID],
+            api_token=tesla_api_token,
+            api_provider=tesla_api_provider,
+            token_getter=token_getter,
+        )
+        aemo_spike_manager._stopped = aemo_cleanup_only
+        _LOGGER.info(
+            "AEMO Spike Manager initialized: region=%s, threshold=$%.0f/MWh",
+            aemo_region,
+            aemo_threshold,
+        )
+        # Recover an owed tariff even when the feature is disabled or the
+        # optimizer has taken ownership. Cleanup-only handlers cannot export.
+        await aemo_spike_manager.restore_or_exit()
 
     # Generic AEMO Spike Manager (service-call-based) for non-Tesla systems
     if aemo_spike_enabled and not ml_optimization_enabled and (is_sigenergy or is_sungrow or is_foxess or is_esy_sunhome or is_solax or is_saj_h2 or is_fronius_reserva or is_neovolt or is_solaredge or is_goodwe or is_alphaess):
@@ -44217,17 +44397,56 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "in_spike_mode": False,
                     "spike_start_time": None,
                     "last_price": None,
+                    "stopped": False,
                 }
+                vpp_aemo_control_lock = asyncio.Lock()
+
+                def _vpp_aemo_commands_allowed():
+                    return (
+                        not vpp_spike_state["stopped"]
+                        and entry.options.get(
+                            CONF_AEMO_SPIKE_ENABLED,
+                            entry.data.get(CONF_AEMO_SPIKE_ENABLED, False),
+                        ) is True
+                        and not _is_monitoring_mode()
+                    )
+
+                async def _restore_vpp_aemo_spike():
+                    if not vpp_spike_state["in_spike_mode"] or _is_monitoring_mode():
+                        return
+                    if (
+                        force_discharge_state.get("active")
+                        and force_discharge_state.get("source") == "aemo_spike"
+                    ):
+                        await hass.services.async_call(
+                            DOMAIN, SERVICE_RESTORE_NORMAL,
+                            {"source": "aemo_spike"}, blocking=True,
+                        )
+                        if force_discharge_state.get("active"):
+                            raise RuntimeError("AEMO spike restore remains pending")
+                    vpp_spike_state["in_spike_mode"] = False
+                    vpp_spike_state["spike_start_time"] = None
 
                 async def check_aemo_spike_for_vpp(now):
                     """Check AEMO prices and respond to spikes (Globird VPP)."""
+                    async with vpp_aemo_control_lock:
+                        await _check_aemo_spike_for_vpp(now)
+
+                async def _check_aemo_spike_for_vpp(now):
                     try:
+                        if not _vpp_aemo_commands_allowed():
+                            await _restore_vpp_aemo_spike()
+                            return
                         from .aemo_api import AEMOAPIClient
                         from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
                         session = async_get_clientsession(hass)
                         client = AEMOAPIClient(session)
                         prices = await client.get_current_prices()
+
+                        if not _vpp_aemo_commands_allowed():
+                            await _restore_vpp_aemo_spike()
+                            return
 
                         if not prices:
                             _LOGGER.debug("VPP: Could not fetch AEMO prices")
@@ -44250,14 +44469,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                                 # Use the force discharge service (30 min for VPP events)
                                 await hass.services.async_call(
                                     DOMAIN, SERVICE_FORCE_DISCHARGE,
-                                    {"duration": 30},
+                                    {"duration": 30, "source": "aemo_spike"},
                                     blocking=True,
                                 )
 
                                 # Check if discharge was activated
-                                if force_discharge_state.get("active"):
+                                if force_discharge_state.get("active") and force_discharge_state.get("source") == "aemo_spike":
                                     vpp_spike_state["in_spike_mode"] = True
                                     vpp_spike_state["spike_start_time"] = dt_util.utcnow()
+                                    if not _vpp_aemo_commands_allowed():
+                                        await _restore_vpp_aemo_spike()
+                                        return
                                     _LOGGER.warning(
                                         "🔌 VPP SPIKE MODE ACTIVE: Battery force discharging at $%.0f/MWh",
                                         region_price
@@ -44284,17 +44506,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                                 region_price, aemo_spike_threshold
                             )
                             try:
-                                await hass.services.async_call(
-                                    DOMAIN, SERVICE_RESTORE_NORMAL,
-                                    {},
-                                    blocking=True,
-                                )
-
-                                vpp_spike_state["in_spike_mode"] = False
                                 spike_duration = None
                                 if vpp_spike_state["spike_start_time"]:
                                     spike_duration = (dt_util.utcnow() - vpp_spike_state["spike_start_time"]).total_seconds() / 60
-                                vpp_spike_state["spike_start_time"] = None
+                                await _restore_vpp_aemo_spike()
                                 _LOGGER.info(
                                     "🔌 VPP: Normal operation restored (spike duration: %.1f min)",
                                     spike_duration or 0
@@ -44334,6 +44549,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
                 # Store spike state for status endpoint
                 hass.data[DOMAIN][entry.entry_id]["vpp_spike_state"] = vpp_spike_state
+                hass.data[DOMAIN][entry.entry_id]["vpp_aemo_control_lock"] = vpp_aemo_control_lock
+                hass.data[DOMAIN][entry.entry_id]["vpp_aemo_restore"] = _restore_vpp_aemo_spike
 
                 # Check every minute at :45 seconds (offset from other checks)
                 vpp_aemo_cancel = async_track_utc_time_change(
@@ -46011,6 +46228,34 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Tear down TOU sync hooks (AEMO dispatch subscriber + dispatch-trigger
     # coordinator + cron fallback + optional Octopus cron)
     entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+
+    # Retire spike checks before the first await. A timer cancellation alone
+    # cannot fence a callback already waiting for AEMO or Tesla.
+    spike_managers = [
+        manager for key in ("aemo_spike_manager", "generic_aemo_spike_manager")
+        if (manager := entry_data.get(key)) is not None
+    ]
+    for manager in spike_managers:
+        manager._stopped = True
+    if vpp_state := entry_data.get("vpp_spike_state"):
+        vpp_state["stopped"] = True
+    for key in ("aemo_spike_cancel", "generic_aemo_spike_cancel", "vpp_aemo_cancel"):
+        if cancel := entry_data.pop(key, None):
+            cancel()
+    if initial_task := entry_data.pop("vpp_aemo_initial_task", None):
+        # Let a started service call finish, then clean up under the same lock.
+        await asyncio.gather(initial_task, return_exceptions=True)
+    for manager in spike_managers:
+        try:
+            await manager.stop()
+        except Exception as err:
+            _LOGGER.warning("AEMO spike cleanup on unload failed: %s", err)
+    if vpp_restore := entry_data.get("vpp_aemo_restore"):
+        try:
+            async with entry_data["vpp_aemo_control_lock"]:
+                await vpp_restore()
+        except Exception as err:
+            _LOGGER.warning("VPP spike cleanup on unload failed: %s", err)
 
     # Fence detached explanation work before unload/reload can replace the
     # entry. It has no optimizer or hardware side effects, but must not cache

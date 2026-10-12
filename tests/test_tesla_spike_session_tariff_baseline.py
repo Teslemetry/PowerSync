@@ -20,6 +20,8 @@ import copy
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 INIT_PATH = ROOT / "custom_components" / "power_sync" / "__init__.py"
 
@@ -98,6 +100,20 @@ class _FakeResponse:
         return self._payload
 
 
+class _BlockingJsonResponse(_FakeResponse):
+    """Response whose body can be held while stop/option changes race it."""
+
+    def __init__(self, status, payload, started, release):
+        super().__init__(status, payload)
+        self.started = started
+        self.release = release
+
+    async def json(self):
+        self.started.set()
+        await self.release.wait()
+        return await super().json()
+
+
 class _FakeCtx:
     def __init__(self, response):
         self._response = response
@@ -109,13 +125,42 @@ class _FakeCtx:
         return False
 
 
+class _BlockingCtx(_FakeCtx):
+    """Hold a fake command response until the test changes live state."""
+
+    def __init__(self, response, started, release):
+        super().__init__(response)
+        self.started = started
+        self.release = release
+
+    async def __aenter__(self):
+        self.started.set()
+        await self.release.wait()
+        return await super().__aenter__()
+
+
 class _FakeSession:
     """Fake aiohttp session: GET routed by URL substring, POST always OK."""
 
-    def __init__(self, *, tariff_rate_response, site_info_response, post_status=200):
+    def __init__(
+        self,
+        *,
+        tariff_rate_response,
+        site_info_response,
+        post_status=200,
+        post_statuses=None,
+        post_started=None,
+        post_release=None,
+        events=None,
+    ):
         self._tariff_rate_response = tariff_rate_response
         self._site_info_response = site_info_response
         self.post_status = post_status
+        self.post_statuses = list(post_statuses) if post_statuses is not None else None
+        self.post_started = post_started
+        self.post_release = post_release
+        self._post_block_used = False
+        self.events = events
         self.get_calls: list[str] = []
         self.post_calls: list[tuple[str, dict]] = []
 
@@ -129,12 +174,28 @@ class _FakeSession:
 
     def post(self, url, headers=None, json=None, timeout=None):
         self.post_calls.append((url, json))
-        return _FakeCtx(_FakeResponse(self.post_status, {}))
+        if self.events is not None:
+            self.events.append(("post", url, json))
+        if self.post_statuses is not None:
+            status = self.post_statuses.pop(0)
+        else:
+            status = self.post_status
+        response = _FakeResponse(status, {})
+        if (
+            self.post_started is not None
+            and self.post_release is not None
+            and not self._post_block_used
+        ):
+            self._post_block_used = True
+            return _BlockingCtx(response, self.post_started, self.post_release)
+        return _FakeCtx(response)
 
 
-def _build_namespace(session, upload_calls, send_result=True):
+def _build_namespace(session, upload_calls, send_result=True, send_results=None):
     async def _fake_send_tariff_to_tesla(hass, site_id, tariff, token, provider, fleet_base_url=None):
         upload_calls.append(tariff)
+        if send_results is not None:
+            return send_results.pop(0)
         return send_result
 
     def _fake_get_tesla_api_base_url(provider, fleet_base_url):
@@ -155,6 +216,8 @@ def _build_namespace(session, upload_calls, send_result=True):
         async def sleep(_seconds):
             return None
 
+        Lock = asyncio.Lock
+
     namespace = {
         "HomeAssistant": object,
         "ConfigEntry": object,
@@ -169,6 +232,9 @@ def _build_namespace(session, upload_calls, send_result=True):
         "send_tariff_to_tesla": _fake_send_tariff_to_tesla,
         "TESLA_PROVIDER_TESLEMETRY": "teslemetry",
         "CONF_FLEET_API_BASE_URL": "fleet_api_base_url",
+        "CONF_AEMO_SPIKE_ENABLED": "aemo_spike_enabled",
+        "CONF_MONITORING_MODE": "monitoring_mode",
+        "DOMAIN": "power_sync",
     }
     exec(compile(_TARIFF_HELPERS_SOURCE, "<tariff_helpers>", "exec"), namespace)
     return namespace
@@ -177,6 +243,22 @@ def _build_namespace(session, upload_calls, send_result=True):
 def _load_class(class_name: str, namespace: dict):
     exec(compile(_class_source(class_name), f"<{class_name}>", "exec"), namespace)
     return namespace[class_name]
+
+
+class _FakeAemoClient:
+    def __init__(self, result=(True, 5000.0, None), *, started=None, release=None):
+        self.result = result
+        self.started = started
+        self.release = release
+        self.calls = 0
+
+    async def check_price_spike(self, region, threshold, *, was_active):
+        self.calls += 1
+        if self.started is not None:
+            self.started.set()
+        if self.release is not None:
+            await self.release.wait()
+        return self.result
 
 
 GENUINE_TARIFF = {
@@ -228,8 +310,12 @@ def test_is_powersync_force_tariff_rejects_managers_own_codes():
 def _make_aemo_manager(namespace, saved_tariff):
     manager_cls = _load_class("AEMOSpikeManager", namespace)
     manager = object.__new__(manager_cls)
-    manager.hass = SimpleNamespace()
-    manager.entry = SimpleNamespace(data={})
+    manager.hass = SimpleNamespace(data={"power_sync": {"entry-1": {}}})
+    manager.entry = SimpleNamespace(
+        data={},
+        options={"aemo_spike_enabled": True, "monitoring_mode": False},
+        entry_id="entry-1",
+    )
     manager.region = "NSW1"
     manager.threshold = 300.0
     manager.site_id = "site-1"
@@ -242,6 +328,11 @@ def _make_aemo_manager(namespace, saved_tariff):
     manager._saved_operation_mode = None
     manager._last_price = None
     manager._last_check = None
+    manager._stopped = False
+    manager._restore_pending = False
+    manager._recovery_unreadable = False
+    manager._spike_control_lock = None
+    manager._operation_lock = None
     return manager
 
 
@@ -293,6 +384,442 @@ def test_aemo_spike_manager_captures_genuine_tariff_on_first_entry():
     assert len(upload_calls) == 1
 
 
+def test_aemo_spike_manager_disabled_blocks_check_and_entry_and_reports_status():
+    session = _FakeSession(
+        tariff_rate_response=_FakeResponse(200, {"response": {"tariff_content_v2": GENUINE_TARIFF}}),
+        site_info_response=_FakeResponse(200, {"response": {"default_real_mode": "self_consumption"}}),
+    )
+    upload_calls: list = []
+    namespace = _build_namespace(session, upload_calls)
+    manager = _make_aemo_manager(namespace, saved_tariff=None)
+    manager.entry.options["aemo_spike_enabled"] = False
+    manager._aemo_client = _FakeAemoClient()
+
+    asyncio.run(manager.check_and_handle_spike())
+    asyncio.run(manager._enter_spike_mode(5000.0))
+
+    assert manager._aemo_client.calls == 0
+    assert session.post_calls == []
+    assert upload_calls == []
+    assert manager.get_status()["enabled"] is False
+
+
+def test_aemo_spike_manager_disabled_during_price_fetch_makes_no_write():
+    price_started = asyncio.Event()
+    price_release = asyncio.Event()
+    client = _FakeAemoClient(started=price_started, release=price_release)
+    session = _FakeSession(
+        tariff_rate_response=_FakeResponse(200, {"response": {}}),
+        site_info_response=_FakeResponse(200, {"response": {}}),
+    )
+    upload_calls: list = []
+    namespace = _build_namespace(session, upload_calls)
+    manager = _make_aemo_manager(namespace, saved_tariff=None)
+    manager._aemo_client = client
+
+    async def scenario():
+        check_task = asyncio.create_task(manager.check_and_handle_spike())
+        await price_started.wait()
+        manager.entry.options["aemo_spike_enabled"] = False
+        price_release.set()
+        await check_task
+
+    asyncio.run(scenario())
+
+    assert client.calls == 1
+    assert session.post_calls == []
+    assert upload_calls == []
+    assert manager._in_spike_mode is False
+
+
+@pytest.mark.parametrize("blocked_endpoint", ["tariff_rate", "site_info"])
+def test_aemo_spike_manager_disabled_during_baseline_fetch_makes_no_write(blocked_endpoint):
+    baseline_started = asyncio.Event()
+    baseline_release = asyncio.Event()
+    blocked_response = _BlockingJsonResponse(
+        200,
+        {"response": {"tariff_content_v2": GENUINE_TARIFF, "default_real_mode": "self_consumption"}},
+        baseline_started,
+        baseline_release,
+    )
+    if blocked_endpoint == "tariff_rate":
+        tariff_rate_response = blocked_response
+        site_info_response = _FakeResponse(200, {"response": {"default_real_mode": "self_consumption"}})
+    else:
+        tariff_rate_response = _FakeResponse(
+            200, {"response": {"tariff_content_v2": GENUINE_TARIFF}}
+        )
+        site_info_response = blocked_response
+
+    session = _FakeSession(
+        tariff_rate_response=tariff_rate_response,
+        site_info_response=site_info_response,
+    )
+    upload_calls: list = []
+    namespace = _build_namespace(session, upload_calls)
+    manager = _make_aemo_manager(namespace, saved_tariff=None)
+
+    async def scenario():
+        enter_task = asyncio.create_task(manager._enter_spike_mode(5000.0))
+        await baseline_started.wait()
+        manager.entry.options["aemo_spike_enabled"] = False
+        baseline_release.set()
+        await enter_task
+
+    asyncio.run(scenario())
+
+    assert session.post_calls == []
+    assert upload_calls == []
+    assert manager._in_spike_mode is False
+
+
+def test_aemo_spike_manager_disabled_active_restores_without_price_fetch():
+    session = _exit_session(send_result=True)
+    upload_calls: list = []
+    namespace = _build_namespace(session, upload_calls, send_result=True)
+    manager = _make_aemo_manager(namespace, saved_tariff=dict(GENUINE_TARIFF))
+    manager.entry.options["aemo_spike_enabled"] = False
+    manager._saved_operation_mode = "self_consumption"
+    manager._in_spike_mode = True
+    manager._spike_start_time = "2026-07-10T12:00:00Z"
+    manager._aemo_client = _FakeAemoClient()
+
+    asyncio.run(manager.check_and_handle_spike())
+
+    assert manager._aemo_client.calls == 0
+    assert upload_calls == [GENUINE_TARIFF]
+    assert len(session.post_calls) == 2
+    assert manager._in_spike_mode is False
+
+
+def test_aemo_spike_manager_failed_restore_stays_active_and_retries_when_disabled():
+    session = _exit_session(send_result=True)
+    upload_calls: list = []
+    namespace = _build_namespace(
+        session,
+        upload_calls,
+        send_results=[False, True],
+    )
+    manager = _make_aemo_manager(namespace, saved_tariff=dict(GENUINE_TARIFF))
+    manager.entry.options["aemo_spike_enabled"] = False
+    manager._saved_operation_mode = "self_consumption"
+    manager._in_spike_mode = True
+    manager._spike_start_time = "2026-07-10T12:00:00Z"
+    manager._aemo_client = _FakeAemoClient()
+
+    asyncio.run(manager.check_and_handle_spike())
+    assert manager._in_spike_mode is True
+    assert len(upload_calls) == 1
+
+    asyncio.run(manager.check_and_handle_spike())
+    assert manager._in_spike_mode is False
+    assert len(upload_calls) == 2
+    assert manager._aemo_client.calls == 0
+
+
+def test_aemo_spike_manager_stop_during_baseline_fetch_prevents_new_write():
+    baseline_started = asyncio.Event()
+    baseline_release = asyncio.Event()
+    session = _FakeSession(
+        tariff_rate_response=_BlockingJsonResponse(
+            200,
+            {"response": {"tariff_content_v2": GENUINE_TARIFF}},
+            baseline_started,
+            baseline_release,
+        ),
+        site_info_response=_FakeResponse(200, {"response": {"default_real_mode": "self_consumption"}}),
+    )
+    upload_calls: list = []
+    namespace = _build_namespace(session, upload_calls)
+    manager = _make_aemo_manager(namespace, saved_tariff=None)
+    manager._aemo_client = _FakeAemoClient()
+
+    async def scenario():
+        check_task = asyncio.create_task(manager.check_and_handle_spike())
+        await baseline_started.wait()
+
+        stop_task = asyncio.create_task(manager.stop())
+        for _ in range(100):
+            if manager._stopped:
+                break
+            await asyncio.sleep(0)
+        assert manager._stopped is True
+
+        baseline_release.set()
+        await check_task
+        await stop_task
+
+    asyncio.run(scenario())
+
+    assert session.post_calls == []
+    assert upload_calls == []
+    assert manager._in_spike_mode is False
+
+
+def test_aemo_spike_manager_persists_obligation_before_partial_operation_and_restores():
+    operation_started = asyncio.Event()
+    operation_release = asyncio.Event()
+    events: list = []
+    session = _FakeSession(
+        tariff_rate_response=_FakeResponse(
+            200, {"response": {"tariff_content_v2": GENUINE_TARIFF}}
+        ),
+        site_info_response=_FakeResponse(
+            200, {"response": {"default_real_mode": "self_consumption"}}
+        ),
+        post_started=operation_started,
+        post_release=operation_release,
+        events=events,
+    )
+    upload_calls: list = []
+    namespace = _build_namespace(session, upload_calls)
+    manager = _make_aemo_manager(namespace, saved_tariff=None)
+    manager._aemo_client = _FakeAemoClient()
+    manager._store = _FakeStore(events=events)
+
+    async def scenario():
+        check_task = asyncio.create_task(manager.check_and_handle_spike())
+        await operation_started.wait()
+
+        first_post = next(i for i, event in enumerate(events) if event[0] == "post")
+        first_save = next(i for i, event in enumerate(events) if event[0] == "save")
+        assert first_save < first_post
+        assert events[first_save][1]["in_event"] is True
+
+        manager.entry.options["aemo_spike_enabled"] = False
+        operation_release.set()
+        await check_task
+
+    asyncio.run(scenario())
+
+    assert manager._in_spike_mode is False
+    assert manager._restore_pending is False
+    assert upload_calls == [GENUINE_TARIFF]
+    assert len(session.post_calls) == 3
+
+
+def test_aemo_spike_manager_failed_tariff_restore_does_not_restore_autonomous_mode():
+    session = _FakeSession(
+        tariff_rate_response=_FakeResponse(200, {"response": {}}),
+        site_info_response=_FakeResponse(200, {"response": {}}),
+        post_status=200,
+    )
+    upload_calls: list = []
+    namespace = _build_namespace(session, upload_calls, send_results=[False])
+    manager = _make_aemo_manager(namespace, saved_tariff=dict(GENUINE_TARIFF))
+    manager._saved_operation_mode = "autonomous"
+    manager._in_spike_mode = True
+    manager._spike_start_time = "2026-07-10T12:00:00Z"
+
+    asyncio.run(manager._exit_spike_mode(50.0))
+
+    assert upload_calls == [GENUINE_TARIFF]
+    assert len(session.post_calls) == 1
+    assert session.post_calls[0][1] == {"default_real_mode": "self_consumption"}
+    assert manager._in_spike_mode is True
+    assert manager._restore_pending is True
+
+
+def test_aemo_spike_manager_rejected_operation_keeps_cleanup_pending_without_spike_tariff():
+    """A rejected autonomous-mode request must clean up safely and retain
+    the obligation when restoring the genuine tariff also fails."""
+    session = _FakeSession(
+        tariff_rate_response=_FakeResponse(
+            200, {"response": {"tariff_content_v2": GENUINE_TARIFF}}
+        ),
+        site_info_response=_FakeResponse(
+            200, {"response": {"default_real_mode": "self_consumption"}}
+        ),
+        post_statuses=[500, 200],
+    )
+    upload_calls: list = []
+    namespace = _build_namespace(session, upload_calls, send_results=[False])
+    manager = _make_aemo_manager(namespace, saved_tariff=None)
+
+    asyncio.run(manager._enter_spike_mode(5000.0))
+
+    assert all(tariff.get("code") != "AEMO-SPIKE" for tariff in upload_calls)
+    assert upload_calls == [GENUINE_TARIFF]
+    assert len(session.post_calls) == 2
+    assert session.post_calls[0][1] == {"default_real_mode": "autonomous"}
+    assert session.post_calls[1][1] == {"default_real_mode": "self_consumption"}
+    assert manager._in_spike_mode is True
+    assert manager._restore_pending is True
+
+
+def test_aemo_spike_manager_failed_operation_restore_retries_above_active_spot_price():
+    session = _FakeSession(
+        tariff_rate_response=_FakeResponse(200, {"response": {}}),
+        site_info_response=_FakeResponse(200, {"response": {}}),
+        post_statuses=[200, 500, 200, 200],
+    )
+    upload_calls: list = []
+    namespace = _build_namespace(
+        session,
+        upload_calls,
+        send_results=[True, True],
+    )
+    manager = _make_aemo_manager(namespace, saved_tariff=dict(GENUINE_TARIFF))
+    manager._saved_operation_mode = "self_consumption"
+    manager._in_spike_mode = True
+    manager._restore_pending = True
+    manager._spike_start_time = "2026-07-10T12:00:00Z"
+    manager._aemo_client = _FakeAemoClient(result=(True, 5000.0, None))
+
+    asyncio.run(manager.check_and_handle_spike())
+
+    assert manager._in_spike_mode is True
+    assert manager._restore_pending is True
+    assert len(session.post_calls) == 2
+    assert len(upload_calls) == 1
+    assert manager._aemo_client.calls == 0
+
+    asyncio.run(manager.check_and_handle_spike())
+
+    assert manager._in_spike_mode is False
+    assert manager._restore_pending is False
+    assert len(session.post_calls) == 4
+    assert len(upload_calls) == 2
+    assert manager._aemo_client.calls == 0
+
+
+@pytest.mark.parametrize(
+    "baseline_payload",
+    [
+        {"response": {"default_real_mode": "self_consumption"}},
+        {
+            "response": {
+                "tariff_content_v2": LIVE_AEMO_SPIKE_TARIFF,
+                "default_real_mode": "self_consumption",
+            }
+        },
+    ],
+)
+def test_aemo_spike_manager_refuses_unknown_or_non_restorable_baseline(baseline_payload):
+    session = _FakeSession(
+        tariff_rate_response=_FakeResponse(200, baseline_payload),
+        site_info_response=_FakeResponse(200, baseline_payload),
+    )
+    upload_calls: list = []
+    namespace = _build_namespace(session, upload_calls)
+    manager = _make_aemo_manager(namespace, saved_tariff=None)
+
+    asyncio.run(manager._enter_spike_mode(5000.0))
+
+    assert manager._saved_tariff is None
+    assert manager._in_spike_mode is False
+    assert manager._restore_pending is False
+    assert session.post_calls == []
+    assert upload_calls == []
+
+
+@pytest.mark.parametrize("option_value", [False, "false"])
+def test_aemo_spike_manager_options_false_overrides_data_true_strictly(option_value):
+    session = _FakeSession(
+        tariff_rate_response=_FakeResponse(200, {"response": {}}),
+        site_info_response=_FakeResponse(200, {"response": {}}),
+    )
+    upload_calls: list = []
+    namespace = _build_namespace(session, upload_calls)
+    manager = _make_aemo_manager(namespace, saved_tariff=None)
+    manager.entry.data["aemo_spike_enabled"] = True
+    manager.entry.options["aemo_spike_enabled"] = option_value
+    manager._aemo_client = _FakeAemoClient()
+
+    asyncio.run(manager.check_and_handle_spike())
+    asyncio.run(manager._enter_spike_mode(5000.0))
+
+    assert manager._aemo_client.calls == 0
+    assert manager.get_status()["enabled"] is False
+    assert session.post_calls == []
+    assert upload_calls == []
+
+
+def test_aemo_spike_manager_monitoring_blocks_new_commands():
+    session = _FakeSession(
+        tariff_rate_response=_FakeResponse(200, {"response": {}}),
+        site_info_response=_FakeResponse(200, {"response": {}}),
+    )
+    upload_calls: list = []
+    namespace = _build_namespace(session, upload_calls)
+    manager = _make_aemo_manager(namespace, saved_tariff=None)
+    manager.entry.options["monitoring_mode"] = True
+    manager._aemo_client = _FakeAemoClient()
+
+    asyncio.run(manager.check_and_handle_spike())
+    asyncio.run(manager._enter_spike_mode(5000.0))
+
+    assert manager._aemo_client.calls == 0
+    assert manager.get_status()["enabled"] is True
+    assert manager._spike_commands_allowed() is False
+    assert session.post_calls == []
+    assert upload_calls == []
+
+
+def test_aemo_spike_manager_monitoring_preserves_pending_recovery_until_allowed():
+    session = _FakeSession(
+        tariff_rate_response=_FakeResponse(200, {"response": {}}),
+        site_info_response=_FakeResponse(200, {"response": {}}),
+    )
+    upload_calls: list = []
+    namespace = _build_namespace(session, upload_calls)
+    manager = _make_aemo_manager(namespace, saved_tariff=dict(GENUINE_TARIFF))
+    manager.entry.options["monitoring_mode"] = True
+    manager._saved_operation_mode = "self_consumption"
+    manager._in_spike_mode = True
+    manager._restore_pending = True
+    manager._spike_start_time = "2026-07-10T12:00:00Z"
+    manager._aemo_client = _FakeAemoClient(result=(True, 5000.0, None))
+
+    asyncio.run(manager.check_and_handle_spike())
+
+    assert manager._aemo_client.calls == 0
+    assert manager._in_spike_mode is True
+    assert manager._restore_pending is True
+    assert session.post_calls == []
+    assert upload_calls == []
+
+    manager.entry.options["monitoring_mode"] = False
+    asyncio.run(manager.check_and_handle_spike())
+
+    assert manager._aemo_client.calls == 0
+    assert manager._in_spike_mode is False
+    assert manager._restore_pending is False
+    assert upload_calls == [GENUINE_TARIFF]
+
+
+def test_aemo_spike_manager_monitoring_marks_active_cleanup_pending_for_later_retry():
+    session = _FakeSession(
+        tariff_rate_response=_FakeResponse(200, {"response": {}}),
+        site_info_response=_FakeResponse(200, {"response": {}}),
+    )
+    upload_calls: list = []
+    namespace = _build_namespace(session, upload_calls)
+    manager = _make_aemo_manager(namespace, saved_tariff=dict(GENUINE_TARIFF))
+    manager.entry.options["monitoring_mode"] = True
+    manager._saved_operation_mode = "self_consumption"
+    manager._in_spike_mode = True
+    manager._restore_pending = False
+    manager._spike_start_time = "2026-07-10T12:00:00Z"
+    manager._aemo_client = _FakeAemoClient(result=(True, 5000.0, None))
+
+    asyncio.run(manager.check_and_handle_spike())
+
+    assert manager._aemo_client.calls == 0
+    assert manager._in_spike_mode is True
+    assert manager._restore_pending is True
+    assert session.post_calls == []
+    assert upload_calls == []
+
+    manager.entry.options["monitoring_mode"] = False
+    asyncio.run(manager.check_and_handle_spike())
+
+    assert manager._aemo_client.calls == 0
+    assert manager._in_spike_mode is False
+    assert manager._restore_pending is False
+    assert upload_calls == [GENUINE_TARIFF]
+
+
 # ---------------------------------------------------------------------------
 # SavingSessionTariffManager: identical shape, mirrored.
 # ---------------------------------------------------------------------------
@@ -300,8 +827,8 @@ def test_aemo_spike_manager_captures_genuine_tariff_on_first_entry():
 def _make_session_manager(namespace, saved_tariff):
     manager_cls = _load_class("SavingSessionTariffManager", namespace)
     manager = object.__new__(manager_cls)
-    manager.hass = SimpleNamespace()
-    manager.entry = SimpleNamespace(data={})
+    manager.hass = SimpleNamespace(data={"power_sync": {"entry-1": {}}})
+    manager.entry = SimpleNamespace(data={}, entry_id="entry-1")
     manager._session_coordinator = None
     manager.site_id = "site-1"
     manager._api_token = "token-123"
@@ -551,9 +1078,9 @@ def test_saving_session_manager_clears_state_after_successful_restore():
     assert manager._active_session_code is None
 
 
-def test_aemo_spike_manager_clears_state_when_no_saved_tariff_to_restore():
-    """Not a send_tariff_to_tesla failure — there was never anything to
-    restore, so exit must still complete and clear state."""
+def test_aemo_spike_manager_keeps_event_when_no_saved_tariff_to_restore():
+    """A missing baseline must retain the restore obligation and avoid
+    restoring autonomous mode while the spike tariff may still be live."""
     session = _exit_session(send_result=True)
     upload_calls: list = []
     namespace = _build_namespace(session, upload_calls, send_result=True)
@@ -563,9 +1090,12 @@ def test_aemo_spike_manager_clears_state_when_no_saved_tariff_to_restore():
 
     asyncio.run(manager._exit_spike_mode(50.0))
 
-    assert manager._in_spike_mode is False
-    assert manager._spike_start_time is None
+    assert manager._in_spike_mode is True
+    assert manager._restore_pending is True
+    assert manager._spike_start_time == "2026-07-10T12:00:00Z"
     assert upload_calls == []
+    assert len(session.post_calls) == 1
+    assert session.post_calls[0][1] == {"default_real_mode": "self_consumption"}
 
 
 # ---------------------------------------------------------------------------
@@ -578,15 +1108,23 @@ def test_aemo_spike_manager_clears_state_when_no_saved_tariff_to_restore():
 class _FakeStore:
     """Stands in for homeassistant.helpers.storage.Store."""
 
-    def __init__(self, initial=None):
+    def __init__(self, initial=None, events=None, load_error=None):
         self._data = initial
+        self.events = events
+        self.load_error = load_error
+        self.load_calls = 0
         self.save_calls: list = []
 
     async def async_load(self):
+        self.load_calls += 1
+        if self.load_error is not None:
+            raise self.load_error
         return self._data
 
     async def async_save(self, data):
         self.save_calls.append(data)
+        if self.events is not None:
+            self.events.append(("save", data))
         self._data = data
 
 
@@ -731,6 +1269,50 @@ def test_aemo_spike_manager_restore_or_exit_retries_on_failed_restore():
     asyncio.run(manager.restore_or_exit())
 
     assert manager._in_spike_mode is True
+
+
+def test_aemo_spike_manager_restore_or_exit_keeps_non_restorable_persisted_event():
+    """A persisted PowerSync tariff is not a user baseline to restore from;
+    retain the event obligation and avoid restoring the old mode."""
+    session = _exit_session(send_result=True)
+    upload_calls: list = []
+    namespace = _build_namespace(session, upload_calls, send_result=True)
+    store = _FakeStore(initial={
+        "in_event": True,
+        "saved_tariff": LIVE_AEMO_SPIKE_TARIFF,
+        "saved_operation_mode": "autonomous",
+    })
+    manager = _make_aemo_manager(namespace, saved_tariff=None)
+    manager._store = store
+
+    asyncio.run(manager.restore_or_exit())
+
+    assert upload_calls == []
+    assert len(session.post_calls) == 1
+    assert session.post_calls[0][1] == {"default_real_mode": "self_consumption"}
+    assert manager._in_spike_mode is True
+    assert manager._restore_pending is True
+    assert store._data["in_event"] is True
+
+
+def test_aemo_spike_manager_unreadable_store_retries_without_price_or_new_writes():
+    store = _FakeStore(load_error=RuntimeError("storage unavailable"))
+    session = _exit_session(send_result=True)
+    upload_calls: list = []
+    namespace = _build_namespace(session, upload_calls, send_result=True)
+    manager = _make_aemo_manager(namespace, saved_tariff=None)
+    manager._store = store
+    manager._aemo_client = _FakeAemoClient(result=(True, 5000.0, None))
+
+    asyncio.run(manager.restore_or_exit())
+    asyncio.run(manager.check_and_handle_spike())
+    asyncio.run(manager.check_and_handle_spike())
+
+    assert manager._recovery_unreadable is True
+    assert store.load_calls == 3
+    assert manager._aemo_client.calls == 0
+    assert session.post_calls == []
+    assert upload_calls == []
 
 
 def test_aemo_spike_manager_restore_or_exit_noop_when_nothing_persisted():

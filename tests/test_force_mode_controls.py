@@ -4904,20 +4904,8 @@ def _skip_reload_vs_update_entry_depth_deltas(
     return deltas
 
 
-def test_aemo_spike_view_post_skip_reload_gated_on_persisted_change():
-    tree = ast.parse(INIT_PATH.read_text())
-    method = _find_class_method(tree, "AEMOSpikeView", "post")
-    parents = _build_parents(tree)
-
-    deltas = _skip_reload_vs_update_entry_depth_deltas(method, parents)
-
-    assert len(deltas) == 2, "expected one _skip_reload write per branch (enabled, region)"
-    assert all(delta > 0 for delta in deltas), (
-        "AEMOSpikeView.post sets _skip_reload unconditionally — a no-op "
-        "resubmit strands the flag and swallows the next genuine reload (OB-39)"
-    )
-
-
+# AEMO setting saves now use the normal reload path; their behaviour is
+# exercised through the real POST and listener in test_provider_config_auto_sync.
 def test_provider_config_view_post_skip_reload_gated_on_persisted_change():
     tree = ast.parse(INIT_PATH.read_text())
     method = _find_class_method(tree, "ProviderConfigView", "post")

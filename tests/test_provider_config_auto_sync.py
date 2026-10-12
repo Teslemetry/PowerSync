@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 import textwrap
+import pytest
 
 
 INIT_PATH = (
@@ -109,6 +110,65 @@ def test_octopus_provider_config_returns_persisted_auto_sync_false():
     assert response.payload["success"] is True
     assert response.payload["electricity_provider"] == "octopus"
     assert response.payload["config"]["auto_sync"] is False
+
+
+def _settings_post(class_name):
+    source = INIT_PATH.read_text()
+    module = ast.parse(source)
+    cls = next(n for n in module.body if isinstance(n, ast.ClassDef) and n.name == class_name)
+    method = next(n for n in cls.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "post")
+    listener = next(n for n in module.body if isinstance(n, ast.AsyncFunctionDef)
+                    and n.name == "_async_options_update_listener")
+    async def parse_request(request):
+        return await request.json()
+    logger = SimpleNamespace(info=lambda *a, **k: None, error=lambda *a, **k: None)
+    namespace = {
+        **_handler_globals(), "_LOGGER": logger, "HomeAssistant": object, "ConfigEntry": object,
+        "web": SimpleNamespace(Request=object, Response=object,
+            json_response=lambda payload, status=200: SimpleNamespace(payload=payload, status=status)),
+        "resolve_flow_power_happy_hour_end": lambda value: value or "19:30",
+        "_parse_json_request": parse_request,
+    }
+    exec(textwrap.dedent(ast.get_source_segment(source, method)), namespace)
+    exec(ast.get_source_segment(source, listener), namespace)
+    return namespace["post"], namespace["_async_options_update_listener"]
+
+
+@pytest.mark.parametrize("class_name,payload", [
+    ("ProviderConfigView", {"aemo_spike_enabled": False}),
+    ("ProviderConfigView", {"aemo_region": "QLD1"}),
+    ("ProviderConfigView", {"aemo_spike_threshold": 5000}),
+    ("AEMOSpikeView", {"enabled": False}),
+    ("AEMOSpikeView", {"region": "QLD1"}),
+])
+def test_spike_settings_save_reloads_existing_handler(class_name, payload):
+    entry = SimpleNamespace(entry_id="entry-1", data={}, options={
+        "electricity_provider": "globird", "aemo_spike_enabled": True,
+        "aemo_region": "NSW1", "aemo_spike_threshold": 3000,
+    })
+    runtime = {"_skip_reload": True}
+    reloads = []
+    def update_entry(entry, *, options):
+        entry.options = options
+    async def reload(entry_id):
+        reloads.append(entry_id)
+    async def request_json():
+        return payload
+    hass = SimpleNamespace(data={"power_sync": {entry.entry_id: runtime}}, config_entries=SimpleNamespace(
+        async_entries=lambda domain: [entry], async_update_entry=update_entry, async_reload=reload,
+    ))
+    post, listener = _settings_post(class_name)
+    async def run():
+        response = await post(SimpleNamespace(_hass=hass), SimpleNamespace(json=request_json))
+        assert response.status == 200, response.payload
+        assert response.payload["success"]
+        await listener(hass, entry)
+    asyncio.run(run())
+    assert reloads == [entry.entry_id]
+    assert "_skip_reload" not in runtime
+    for key, value in payload.items():
+        saved_key = {"enabled": "aemo_spike_enabled", "region": "aemo_region"}.get(key, key)
+        assert entry.options[saved_key] == value
 
 
 def test_provider_config_demand_charge_updates_use_the_reload_lifecycle():

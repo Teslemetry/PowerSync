@@ -154,13 +154,14 @@ def _make_recorder_class():
 
         def __init__(self, **kwargs):
             self.kwargs = kwargs
+            self.restored = False
             type(self).created.append(self)
 
         async def restore_or_exit(self):
             """OB-41: async_setup_entry calls this right after construction
             to restore-or-exit a persisted event found on a reload; this
             stand-in has no real store, so it's a no-op."""
-            pass
+            self.restored = True
 
     return _Recorder
 
@@ -220,6 +221,9 @@ def _run_aemo_block(ns: dict):
     ns = dict(ns)
     ns["AEMOSpikeManager"] = aemo_spike_manager_cls
     ns["GenericAEMOSpikeManager"] = generic_aemo_spike_manager_cls
+    async def no_pending_restore(hass, entry):
+        return False
+    ns.setdefault("_aemo_spike_restore_required", no_pending_restore)
 
     src = (
         "async def _run():\n"
@@ -280,6 +284,31 @@ def test_generic_aemo_spike_manager_gated_when_optimizer_active():
         "GenericAEMOSpikeManager must not double-control the battery "
         "alongside the LP optimizer"
     )
+
+
+def test_disabled_tesla_spike_setup_only_recovers_a_persisted_event():
+    ns = _base_namespace(has_tesla_site=True, aemo_spike_enabled=False)
+    tesla_cls, _ = _run_aemo_block(_with_optimizer(ns, enabled=False))
+    assert tesla_cls.created == []
+
+    async def pending_restore(hass, entry):
+        return True
+    ns["_aemo_spike_restore_required"] = pending_restore
+    tesla_cls, _ = _run_aemo_block(_with_optimizer(ns, enabled=False))
+    manager, = tesla_cls.created
+    assert manager.restored
+    assert manager._stopped
+
+
+def test_optimizer_startup_recovers_old_spike_without_a_second_export_controller():
+    async def pending_restore(hass, entry):
+        return True
+    ns = _base_namespace(has_tesla_site=True)
+    ns["_aemo_spike_restore_required"] = pending_restore
+    tesla_cls, _ = _run_aemo_block(_with_optimizer(ns, enabled=True))
+    manager, = tesla_cls.created
+    assert manager.restored
+    assert manager._stopped
 
 
 def test_tesla_saving_session_manager_gated_when_optimizer_active():
