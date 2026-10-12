@@ -735,11 +735,11 @@ class TEDAPIv1rTransport:
         return {
             "part_number": response.device_id.part_number or None,
             "serial_number": response.device_id.serial_number or None,
-            "din": response.din.value or None,
-            "firmware_version": response.firmare_version.version or None,
+            "din": response.din or None,
+            "firmware_version": response.firmware_version.version or None,
             "firmware_githash": (
-                response.firmare_version.githash.hex()
-                if response.firmare_version.githash
+                response.firmware_version.githash.hex()
+                if response.firmware_version.githash
                 else None
             ),
             "device_type": _enum_suffix(

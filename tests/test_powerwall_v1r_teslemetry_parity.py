@@ -243,9 +243,9 @@ async def test_common_api_diagnostics_are_read_only_and_credential_free():
             response = reply.common.get_system_info_response
             response.device_id.part_number = "1234567-00-A"
             response.device_id.serial_number = "TG123456789"
-            response.din.value = "DIN--1"
-            response.firmare_version.version = "24.44.0"
-            response.firmare_version.githash = b"\xaa\xbb"
+            response.din = "DIN--1"
+            response.firmware_version.version = "24.44.0"
+            response.firmware_version.githash = b"\xaa\xbb"
             response.device_type = device_pb2.DEVICE_TYPE_SITECONTROLLER
         elif request_name == "get_networking_status_request":
             wifi = reply.common.get_networking_status_response.wifi
