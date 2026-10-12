@@ -70,6 +70,9 @@ from .solar_provenance import derive_solar_forecast_provenance
 from .solar_export import SolarExportHoldController, resolve_solar_export_adapter
 from .ev_coordinator import EVCoordinator, EVConfig, EVChargingMode
 from ..const import (
+    CONF_OPTIMIZATION_BATTERY_CAPACITY_WH,
+    CONF_OPTIMIZATION_MAX_CHARGE_W,
+    CONF_OPTIMIZATION_MAX_DISCHARGE_W,
     CONF_GENERIC_CHARGER_POWER_ENTITY,
     DEFAULT_OPTIMIZATION_INTERVAL,
     DEFAULT_OPTIMIZATION_MIN_EXPORT_PRICE,
@@ -255,6 +258,11 @@ _BATTERY_SPEC_FIELDS = (
     "max_charge_w",
     "max_discharge_w",
 )
+_BATTERY_SPEC_PERSISTED_KEYS = {
+    "battery_capacity_wh": CONF_OPTIMIZATION_BATTERY_CAPACITY_WH,
+    "max_charge_w": CONF_OPTIMIZATION_MAX_CHARGE_W,
+    "max_discharge_w": CONF_OPTIMIZATION_MAX_DISCHARGE_W,
+}
 
 
 def _positive_battery_spec_value(value: Any) -> int | None:
@@ -291,11 +299,14 @@ def _entry_battery_spec_value(entry: Any, field: str) -> Any:
     """Read a persisted battery setting, preferring options over legacy data."""
     if entry is None:
         return None
+    persisted_key = _BATTERY_SPEC_PERSISTED_KEYS.get(field)
+    if persisted_key is None:
+        return None
     options = getattr(entry, "options", {}) or {}
-    if field in options:
-        return options.get(field)
+    if persisted_key in options:
+        return options.get(persisted_key)
     data = getattr(entry, "data", {}) or {}
-    return data.get(field)
+    return data.get(persisted_key)
 
 
 def battery_specs_source_by_field(entry: Any | None) -> dict[str, str]:
