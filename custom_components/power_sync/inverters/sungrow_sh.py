@@ -1347,11 +1347,13 @@ class SungrowSHController(InverterController):
             max_charge_power = await self._read_register(self.REG_MAX_CHARGE_POWER, 1)
             if max_charge_power and self._valid_u16(max_charge_power[0]):
                 data["charge_rate_limit_kw"] = round(max_charge_power[0] * 10 / 1000, 2)
+                data["charge_rate_limit_source"] = "configured_power"
             else:
                 max_charge_current = await self._read_input_register(self.REG_BMS_MAX_CHARGE_CURRENT, 1)
                 if max_charge_current and self._valid_u16(max_charge_current[0]):
                     amps = max_charge_current[0]
                     data["charge_rate_limit_kw"] = round(amps * self._battery_voltage / 1000, 2)
+                    data["charge_rate_limit_source"] = "bms_current"
 
             max_discharge_power = await self._read_register(self.REG_MAX_DISCHARGE_POWER, 1)
             if max_discharge_power and self._valid_u16(max_discharge_power[0]):
@@ -1365,7 +1367,10 @@ class SungrowSHController(InverterController):
                     data["discharge_rate_limit_kw"] = round(amps * self._battery_voltage / 1000, 2)
                     data["discharge_rate_limit_source"] = "bms_current"
 
-            data["rate_limit_writable"] = self._rate_limit_writable or False
+            # None means untested; False means a write was explicitly rejected.
+            # Preserve the distinction so reversible holds can fail closed after
+            # a demonstrated register-write failure.
+            data["rate_limit_writable"] = self._rate_limit_writable
 
             # Read export limit
             export_limit = await self._read_register(self.REG_EXPORT_LIMIT_SETTING, 1)

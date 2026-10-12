@@ -212,6 +212,34 @@ def test_disable_stops_executor_without_restore_writes_under_monitoring(opt_modu
     asyncio.run(_run())
 
 
+def test_disable_defers_solar_export_hold_cleanup_under_monitoring(opt_module):
+    async def _run():
+        coordinator = _disable_coordinator(
+            opt_module,
+            last_executed_action=None,
+            pre_idle_reserve=None,
+            ev_active=False,
+        )
+        coordinator._enabled = False
+        coordinator._monitoring_mode_active = lambda: True
+        clear_calls = []
+
+        async def clear(reason):
+            clear_calls.append(reason)
+            return True
+
+        coordinator._solar_export_hold = SimpleNamespace(
+            active=True,
+            clear=clear,
+        )
+
+        await coordinator.disable()
+
+        assert clear_calls == []
+
+    asyncio.run(_run())
+
+
 def test_monitoring_handoff_drains_write_then_restores_control_and_reserve(opt_module):
     """False-to-true handoff drains writes and performs one complete cleanup."""
     sys.modules["power_sync.const"].SERVICE_RESTORE_NORMAL = "restore_normal"
@@ -226,12 +254,22 @@ def test_monitoring_handoff_drains_write_then_restores_control_and_reserve(opt_m
             reserve_calls.append((battery, context, bypass_monitoring))
             return True
 
+        hold_calls = []
+
+        async def clear_hold(reason):
+            hold_calls.append(reason)
+            return True
+
         battery = object()
         coordinator = SimpleNamespace(
             _execute_lock=execute_lock,
             _pre_idle_backup_reserve=78,
             battery_controller=battery,
             _restore_pre_idle_backup_reserve=restore_pre_idle,
+            _solar_export_hold=SimpleNamespace(
+                active=True,
+                clear=clear_hold,
+            ),
         )
         entry_data = {
             "optimization_coordinator": coordinator,
@@ -265,6 +303,7 @@ def test_monitoring_handoff_drains_write_then_restores_control_and_reserve(opt_m
             "source": "manual",
             "_force_restore": True,
         }
+        assert hold_calls == ["monitoring_handoff"]
         assert reserve_calls == [(battery, "monitoring enabled", True)]
         monitoring.finish_monitoring_handoff(hass, entry)
         assert "_monitoring_handoff_active" not in entry_data

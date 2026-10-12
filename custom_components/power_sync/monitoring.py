@@ -37,6 +37,13 @@ async def async_prepare_monitoring_handoff(hass: Any, entry: Any) -> None:
     }
 
     try:
+        solar_export_hold = getattr(coordinator, "_solar_export_hold", None)
+        if solar_export_hold and solar_export_hold.active:
+            if not await solar_export_hold.clear("monitoring_handoff"):
+                raise RuntimeError(
+                    "solar-export hold cleanup failed during monitoring handoff"
+                )
+
         solaredge = entry_data.get("solaredge_coordinator")
         if solaredge is not None and solaredge.control_health != "ready":
             # Monitoring must remain available when device writes are unsafe.

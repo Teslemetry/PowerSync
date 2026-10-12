@@ -530,6 +530,7 @@ def test_battery_data_prefers_mkaiser_telemetry_registers_without_write_probe():
     assert data["inverter_temperature"] == 31.2
     assert data["meter_power"] == 1500
     assert data["charge_rate_limit_kw"] == 12.0
+    assert data["charge_rate_limit_source"] == "configured_power"
     assert data["discharge_rate_limit_kw"] == 15.0
     assert data["discharge_rate_limit_source"] == "configured_power"
     assert "bms_max_discharge_current_a" not in data
@@ -572,6 +573,8 @@ def test_battery_data_marks_zero_bms_discharge_capability():
     data = asyncio.run(run_read())
 
     assert data["battery_soc"] == 4.9
+    assert data["charge_rate_limit_kw"] == 23.0
+    assert data["charge_rate_limit_source"] == "bms_current"
     assert data["bms_max_discharge_current_a"] == 0
     assert data["discharge_rate_limit_kw"] == 0.0
     assert data["discharge_rate_limit_source"] == "bms_current"

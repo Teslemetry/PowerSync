@@ -266,20 +266,24 @@ class SolarExportChargeHoldAdapter:
         return limit_w / 1000.0 if limit_w is not None else None
 
     def _has_observable_limit(self) -> bool:
+        def _sungrow_limit_is_safe(data: dict[str, Any]) -> bool:
+            return (
+                data.get("charge_rate_limit_source") == "configured_power"
+                and data.get("rate_limit_writable") is not False
+                and _finite_positive(data.get("charge_rate_limit_kw")) is not None
+            )
+
         if self.system == "sigenergy":
             controller = getattr(self.coordinator, "_controller", None)
             return callable(getattr(controller, "get_charge_rate_limit_kw", None))
         if self.system == "sungrow" and hasattr(self.coordinator, "_coord1"):
             return all(
-                _finite_positive((getattr(child, "data", None) or {}).get(
-                    "charge_rate_limit_kw"
-                ))
-                is not None
+                _sungrow_limit_is_safe(getattr(child, "data", None) or {})
                 for child in (self.coordinator._coord1, self.coordinator._coord2)
             )
         data = getattr(self.coordinator, "data", None) or {}
         if self.system == "sungrow":
-            return _finite_positive(data.get("charge_rate_limit_kw")) is not None
+            return _sungrow_limit_is_safe(data)
         if self.system == "foxess":
             if self.key == "foxess.cloud.max_charge_current.v1":
                 return callable(

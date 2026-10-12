@@ -7027,7 +7027,9 @@ class SungrowEnergyCoordinator(DataUpdateCoordinator):
                 "max_soc": data.get("max_soc"),
                 "backup_reserve": data.get("backup_reserve"),
                 "charge_rate_limit_kw": data.get("charge_rate_limit_kw"),
+                "charge_rate_limit_source": data.get("charge_rate_limit_source"),
                 "discharge_rate_limit_kw": data.get("discharge_rate_limit_kw"),
+                "rate_limit_writable": data.get("rate_limit_writable"),
                 "bms_max_discharge_current_a": data.get(
                     "bms_max_discharge_current_a"
                 ),
@@ -8215,7 +8217,9 @@ class DualSungrowCoordinator(DataUpdateCoordinator):
             "max_soc": d1.get("max_soc"),
             "backup_reserve": d1.get("backup_reserve"),
             "charge_rate_limit_kw": d1.get("charge_rate_limit_kw"),
+            "charge_rate_limit_source": d1.get("charge_rate_limit_source"),
             "discharge_rate_limit_kw": d1.get("discharge_rate_limit_kw"),
+            "rate_limit_writable": d1.get("rate_limit_writable"),
             "export_limit_w": d1.get("export_limit_w"),
             "export_limit_enabled": d1.get("export_limit_enabled"),
             "battery_max_charge_power_w": charge_limit_w,

@@ -176,7 +176,11 @@ def test_positive_control_planes_publish_versioned_adapter_identity():
         ),
         "sungrow": (
             SimpleNamespace(
-                data={"charge_rate_limit_kw": 5.0, "export_limit_w": 5000},
+                data={
+                    "charge_rate_limit_kw": 5.0,
+                    "charge_rate_limit_source": "configured_power",
+                    "export_limit_w": 5000,
+                },
                 set_charge_rate_limit=lambda value: None,
             ),
             "sungrow.modbus.charge_limit.v1",
@@ -202,6 +206,25 @@ def test_positive_control_planes_publish_versioned_adapter_identity():
         assert capability.supported
         assert capability.adapter == adapter_key
         assert capability.targets == 1
+
+
+def test_sungrow_hold_requires_authoritative_charge_limit_and_write_health():
+    coordinator = SimpleNamespace(
+        data={
+            "charge_rate_limit_kw": 5.0,
+            "charge_rate_limit_source": "bms_current",
+            "export_limit_w": 5000,
+        },
+        set_charge_rate_limit=lambda value: None,
+    )
+    adapter = resolve_solar_export_adapter("sungrow", coordinator)
+
+    assert not adapter.capability().supported
+    assert adapter.capability().reason == "charge_limit_readback_unavailable"
+
+    coordinator.data["charge_rate_limit_source"] = "configured_power"
+    coordinator.data["rate_limit_writable"] = False
+    assert not adapter.capability().supported
 
 
 def test_foxess_control_planes_are_distinct_and_fail_closed_without_readback():

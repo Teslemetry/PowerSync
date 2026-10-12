@@ -972,6 +972,16 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
         )
 
+    async def _async_reconcile_solar_export_hold_startup(self) -> bool:
+        """Reconcile a persisted solar-export hold only when writes are allowed."""
+        if self._monitoring_mode_active():
+            _LOGGER.info(
+                "Optimizer startup: monitoring mode active — deferring "
+                "persisted solar-export hold reconciliation"
+            )
+            return True
+        return await self._solar_export_hold.async_reconcile_startup()
+
     async def _call_optimizer_energy_control(
         self, method_name: str, *args: Any
     ) -> Any:
@@ -4656,8 +4666,10 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         _LOGGER.info("Setting up optimization coordinator (built-in LP)")
 
         # A zero-charge hold is persistent hardware state. Clear anything left
-        # by a restart before a new solve or command can take ownership.
-        if not await self._solar_export_hold.async_reconcile_startup():
+        # by a restart before a new solve or command can take ownership. An
+        # already-active monitoring entry must remain write-free; an explicit
+        # false-to-true handoff drains this state before persistence instead.
+        if not await self._async_reconcile_solar_export_hold_startup():
             _LOGGER.error(
                 "Profit Max: stale solar-export hold could not be cleared; "
                 "solar-export scheduling will remain disabled"
@@ -5692,9 +5704,18 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def disable(self) -> None:
         """Disable optimization."""
+        monitoring_mode = self._monitoring_mode_active()
         solar_export_hold = getattr(self, "_solar_export_hold", None)
         if solar_export_hold and solar_export_hold.active:
-            if not await solar_export_hold.clear("optimizer_disable"):
+            # Recheck immediately before the write: a monitoring transition can
+            # arrive after the initial lifecycle snapshot.
+            monitoring_mode = self._monitoring_mode_active()
+            if monitoring_mode:
+                _LOGGER.info(
+                    "Optimizer shutdown: monitoring mode active — deferring "
+                    "solar-export hold cleanup"
+                )
+            elif not await solar_export_hold.clear("optimizer_disable"):
                 _LOGGER.error(
                     "Profit Max: solar-export hold restore failed during disable; "
                     "persisted cleanup will retry on startup"
@@ -5702,7 +5723,6 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not self._enabled:
             return
 
-        monitoring_mode = self._monitoring_mode_active()
         # Safety: restore any pending pre-IDLE backup_reserve before shutting
         # down. Gated on the pending reserve itself, not on
         # _last_executed_action == "idle" — Tesla's scheduled EV-preserve
@@ -10754,17 +10774,24 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 runtime_action = "self_consumption"
                 battery_export_price_blocked = True
 
+        monitoring_mode = self._monitoring_mode_active()
         solar_export_hold = getattr(self, "_solar_export_hold", None)
         solar_export_cleanup_failed = False
         if (
             solar_export_hold
             and solar_export_hold.active
-            and (
-                runtime_action != "solar_export"
-                or self._monitoring_mode_active()
-            )
+            and runtime_action != "solar_export"
+            and not monitoring_mode
         ):
-            if not await solar_export_hold.clear(
+            # Recheck immediately before the write: the action calculation may
+            # have yielded while monitoring mode was being enabled.
+            if self._monitoring_mode_active():
+                monitoring_mode = True
+                _LOGGER.info(
+                    "Profit Max: monitoring mode became active — deferring "
+                    "solar-export hold cleanup"
+                )
+            elif not await solar_export_hold.clear(
                 f"transition_to_{runtime_action or 'unknown'}"
             ):
                 _LOGGER.error(
@@ -10773,6 +10800,11 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 runtime_action = "self_consumption"
                 solar_export_cleanup_failed = True
+        elif solar_export_hold and solar_export_hold.active and monitoring_mode:
+            _LOGGER.info(
+                "Profit Max: monitoring mode active — deferring "
+                "solar-export hold cleanup"
+            )
 
         # Monitoring mode — log what would happen but don't execute
         if self._monitoring_mode_active():

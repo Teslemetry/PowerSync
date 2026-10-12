@@ -5252,6 +5252,44 @@ def test_transition_clears_solar_export_hold_before_next_action(opt_module):
     assert coordinator._last_executed_action == "self_consumption"
 
 
+def test_monitoring_mode_defers_solar_export_hold_cleanup(opt_module):
+    """Monitoring must retain persisted hold ownership without writing."""
+    battery = _FakeBattery()
+    coordinator = _execution_coordinator(opt_module, battery, soc=0.50)
+    coordinator._entry.options["monitoring_mode"] = True
+    hold = _FakeSolarExportHold()
+    hold.active = True
+    coordinator._solar_export_hold = hold
+
+    action = SimpleNamespace(
+        action="self_consumption",
+        power_w=0,
+        timestamp=datetime(2026, 7, 30, 7, 35, tzinfo=timezone.utc),
+    )
+
+    asyncio.run(coordinator._execute_optimizer_action(action))
+
+    assert hold.cleared == []
+    assert battery.self_consumption_calls == 0
+
+
+def test_monitoring_mode_defers_startup_solar_export_hold_reconciliation(opt_module):
+    """Startup must not load and clear persisted hold state while monitoring."""
+    coordinator = _execution_coordinator(opt_module, _FakeBattery(), soc=0.50)
+    coordinator._entry.options["monitoring_mode"] = True
+    calls = []
+
+    class _Hold:
+        async def async_reconcile_startup(self):
+            calls.append(True)
+            return True
+
+    coordinator._solar_export_hold = _Hold()
+
+    assert asyncio.run(coordinator._async_reconcile_solar_export_hold_startup())
+    assert calls == []
+
+
 def test_tesla_self_consumption_restores_stale_grid_charge(opt_module):
     """A confirmed mode/reserve cannot hide continued force-charge flow."""
     battery = _FakeBattery(
