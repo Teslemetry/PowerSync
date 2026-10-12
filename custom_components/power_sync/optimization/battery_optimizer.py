@@ -2578,6 +2578,26 @@ class BatteryOptimizer:
             idx = end
         return True
 
+    def _schedule_meets_effective_deadline(
+        self,
+        schedule: OptimizationSchedule,
+        lp_stats: dict[str, Any],
+    ) -> bool:
+        """Return whether emitted actions still reach the LP deadline floor."""
+        target = lp_stats.get("pre_window_effective_target")
+        deadline = self.pre_window_slot
+        actions = schedule.actions or []
+        if target is None or deadline is None or deadline <= 0:
+            return True
+        if deadline > len(actions):
+            return False
+        try:
+            projected_soc = float(actions[deadline - 1].soc)
+            target_soc = float(target)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        return projected_soc >= target_soc - 0.0001
+
     def _solve_lp(
         self,
         n: int,
@@ -2736,6 +2756,20 @@ class BatteryOptimizer:
                                 "mode_projection_infeasible_projected_highs"
                             ),
                         }
+                        if not self._schedule_meets_effective_deadline(
+                            last_result.schedule,
+                            last_result.lp_stats,
+                        ):
+                            last_result.feasible = False
+                            last_result.lp_stats.update(
+                                {
+                                    "fallback_reason": (
+                                        "mode_projection_infeasible_executable_deadline"
+                                    ),
+                                    "deadline_unmet_after_mode_projection": True,
+                                }
+                            )
+                            last_result.reserve_recommendation = {}
                         return last_result
                     return result
 
@@ -2803,6 +2837,20 @@ class BatteryOptimizer:
                 "mode_converged": False,
                 "fallback_reason": "mode_non_convergence_projected_highs",
             }
+            if not self._schedule_meets_effective_deadline(
+                last_result.schedule,
+                last_result.lp_stats,
+            ):
+                last_result.feasible = False
+                last_result.lp_stats.update(
+                    {
+                        "fallback_reason": (
+                            "mode_non_convergence_executable_deadline"
+                        ),
+                        "deadline_unmet_after_mode_projection": True,
+                    }
+                )
+                last_result.reserve_recommendation = {}
             return last_result
         finally:
             if _soc_below_reserve:
@@ -5563,6 +5611,11 @@ class BatteryOptimizer:
             "message": getattr(result, "message", ""),
             "battery_export_constraints": battery_export_constraints,
         }
+        if pre_window_effective_target is not None:
+            lp_stats["pre_window_effective_target"] = round(
+                pre_window_effective_target,
+                8,
+            )
 
         if not result.success:
             # A later command-mode projection is provisional.  Its fallback
@@ -8587,7 +8640,14 @@ class BatteryOptimizer:
 
             reported_charge_w = charge_kw * 1000
             reported_discharge_w = discharge_kw * 1000
-            if free_import_slot and action == "charge":
+            if action == "idle":
+                # IDLE is a hold command. A sub-threshold LP charge can be
+                # rounded into this mode when grid import is close to the
+                # home's net load; retaining it here would publish SOC and
+                # grid flows for energy the emitted command cannot provide.
+                reported_charge_w = 0.0
+                reported_discharge_w = 0.0
+            elif free_import_slot and action == "charge":
                 reported_charge_w = power_w
                 reported_discharge_w = 0.0
             elif action in ("discharge", "export"):
@@ -8661,6 +8721,24 @@ class BatteryOptimizer:
                     reported_charge_w = natural_charge_kw * 1000
                     reported_discharge_w = 0.0
                     power_w = natural_charge_kw * 1000
+
+            if action in ("export", "solar_export"):
+                # Export modes never charge the battery, but they retain the
+                # battery discharge selected by the LP and its reserve cap.
+                reported_charge_w = 0.0
+
+            if action == "self_consumption" and reported_charge_w > 0:
+                # Self-consumption may charge only from native solar surplus;
+                # any grid portion belongs to the explicit charge action.
+                native_solar_surplus_w = max(0.0, solar[t] - load[t]) * 1000.0
+                if charge_blocked:
+                    native_solar_surplus_w = 0.0
+                reported_charge_w = min(
+                    reported_charge_w,
+                    native_solar_surplus_w,
+                )
+                if reported_discharge_w <= 0:
+                    power_w = reported_charge_w
 
             if action == "charge" and reported_charge_w > 0:
                 preserve_free_charge_command = (

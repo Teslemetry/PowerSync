@@ -164,6 +164,145 @@ def test_cost_neutral_five_minute_deadline_can_top_up_before_target(
     assert result.schedule.actions[-1].soc >= 0.995
 
 
+@pytest.mark.parametrize("cost_neutral_enabled", [True, False])
+def test_subthreshold_deadline_grid_top_up_is_not_reported_as_idle_charge(
+    optimizer_module,
+    cost_neutral_enabled,
+):
+    """An executable idle fallback must not retain suppressed grid energy."""
+    if not optimizer_module.HIGHS_AVAILABLE:
+        pytest.skip("requires HiGHS LP solver")
+
+    n = 12
+    soc = 0.995 - 0.0946 * 0.92 * (n / 12) / 24.18
+    optimizer = optimizer_module.BatteryOptimizer(
+        capacity_wh=24_180,
+        max_charge_w=12_600,
+        max_discharge_w=14_400,
+        max_grid_import_w=1_595,
+        max_grid_export_w=5_000,
+        efficiency=0.92,
+        backup_reserve=0.05,
+        hardware_reserve=0.05,
+        interval_minutes=5,
+        horizon_hours=n / 12,
+        terminal_weight=0.0,
+    )
+    optimizer.pre_window_slot = n
+    optimizer.pre_window_soc_target = 1.0
+    start = datetime(2026, 10, 13, 15, 0, tzinfo=timezone(timedelta(hours=10)))
+    result = optimizer.optimize(
+        import_prices=[0.1291225] * n,
+        export_prices=[0.0873771] * n,
+        solar_forecast=[0.0] * n,
+        load_forecast=[1.5] * n,
+        current_soc=soc,
+        allow_battery_export=[True] * n,
+        allow_grid_charge=True,
+        cost_neutral_earnings_cap=(3.7987 if cost_neutral_enabled else None),
+        cost_neutral_slots=[cost_neutral_enabled] * n,
+        schedule_timestamps=[
+            start + timedelta(minutes=5 * index) for index in range(n)
+        ],
+    )
+
+    assert result.solver_used == "highs"
+    assert result.feasible is False
+    assert (
+        result.lp_stats["fallback_reason"]
+        == "mode_projection_infeasible_executable_deadline"
+    )
+    assert result.lp_stats["deadline_unmet_after_mode_projection"] is True
+    assert all(action.action == "idle" for action in result.schedule.actions)
+    assert all(action.battery_charge_w == 0.0 for action in result.schedule.actions)
+    assert all(action.battery_discharge_w == 0.0 for action in result.schedule.actions)
+    assert all(value == 1_500.0 for value in result.grid_import_w)
+    assert result.schedule.actions[-1].soc == pytest.approx(soc, abs=0.0001)
+
+
+@pytest.mark.parametrize(
+    ("charge_w", "expected_action", "expected_reported_charge_w"),
+    [
+        (99.9, "self_consumption", 0.0),
+        (100.0, "self_consumption", 0.0),
+        (100.1, "charge", 100.1),
+    ],
+)
+def test_action_threshold_keeps_emitted_grid_flow_executable(
+    optimizer_module,
+    charge_w,
+    expected_action,
+    expected_reported_charge_w,
+):
+    """The 100 W action threshold must not create hidden grid charging."""
+    optimizer = optimizer_module.BatteryOptimizer(
+        capacity_wh=10_000,
+        max_charge_w=5_000,
+        max_discharge_w=5_000,
+        efficiency=0.92,
+        backup_reserve=0.0,
+        hardware_reserve=0.0,
+        interval_minutes=5,
+        horizon_hours=1 / 12,
+        terminal_weight=0.0,
+    )
+    timestamp = datetime(2026, 10, 13, 15, 0, tzinfo=timezone.utc)
+    schedule = optimizer._build_schedule(
+        1,
+        [charge_w / 1000],
+        [0.0],
+        [charge_w / 1000],
+        [0.0],
+        [0.0],
+        [0.0],
+        0.5,
+        [0.20],
+        [0.10],
+        schedule_timestamps=[timestamp],
+    )
+
+    action = schedule.actions[0]
+    assert action.action == expected_action
+    assert action.battery_charge_w == pytest.approx(expected_reported_charge_w)
+    assert action.battery_discharge_w == 0.0
+
+
+def test_subthreshold_self_consumption_charge_keeps_native_solar_only(
+    optimizer_module,
+):
+    """Non-charge actions may retain native PV, never the suppressed grid part."""
+    optimizer = optimizer_module.BatteryOptimizer(
+        capacity_wh=10_000,
+        max_charge_w=5_000,
+        max_discharge_w=5_000,
+        efficiency=0.92,
+        backup_reserve=0.0,
+        hardware_reserve=0.0,
+        interval_minutes=5,
+        horizon_hours=1 / 12,
+        terminal_weight=0.0,
+    )
+    timestamp = datetime(2026, 10, 13, 15, 0, tzinfo=timezone.utc)
+    schedule = optimizer._build_schedule(
+        1,
+        [0.0],
+        [0.0],
+        [0.095],
+        [0.0],
+        [0.5],
+        [0.0],
+        0.5,
+        [0.20],
+        [0.10],
+        schedule_timestamps=[timestamp],
+    )
+
+    action = schedule.actions[0]
+    assert action.action == "self_consumption"
+    assert action.battery_charge_w == pytest.approx(500.0)
+    assert action.soc > 0.5
+
+
 def test_cost_neutral_deadline_preserves_native_solar_before_ceiling(
     optimizer_module,
 ):
