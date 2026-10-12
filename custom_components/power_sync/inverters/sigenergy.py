@@ -1450,10 +1450,8 @@ class SigenergyController(InverterController):
                         battery_discharge_kw,
                     )
 
-            # The two Sigenergy discharge modes behave differently across sites:
-            # PV-first preserves solar but may not pull from the battery; ESS-first
-            # pulls from storage but can suppress PV. Pick the least invasive mode
-            # that can plausibly satisfy the requested export target.
+            # Preserve available solar for manual and optimizer discharge alike.
+            # ESS-first can suppress PV even below the PCC export ceiling.
             mode = self.REMOTE_EMS_MODE_DISCHARGE_PV
             mode_name = "DISCHARGE_PV"
             attrs: dict = {}
@@ -1502,7 +1500,7 @@ class SigenergyController(InverterController):
                     requested_battery_kw,
                     effective_kw,
                 )
-            elif solar_kw is not None and solar_kw < effective_kw * 0.8:
+            elif solar_kw is not None and solar_kw <= 0:
                 mode = self.REMOTE_EMS_MODE_DISCHARGE_ESS
                 mode_name = "DISCHARGE_ESS"
             _LOGGER.info(

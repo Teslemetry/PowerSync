@@ -622,13 +622,22 @@ def test_force_discharge_caps_ess_without_reducing_grid_export_ceiling(sigenergy
             controller._from_unsigned32(3000),
         ),
         (controller.REG_REMOTE_EMS_ENABLE, [1]),
-        (controller.REG_REMOTE_EMS_CONTROL_MODE, [controller.REMOTE_EMS_MODE_DISCHARGE_ESS]),
+        (controller.REG_REMOTE_EMS_CONTROL_MODE, [controller.REMOTE_EMS_MODE_DISCHARGE_PV]),
     ]
 
 
-def test_force_discharge_uses_ess_first_mode_when_target_needs_battery(sigenergy_module):
-    controller = sigenergy_module.SigenergyController(host="127.0.0.1")
-    _stub_force_discharge_reads(controller)
+@pytest.mark.parametrize(
+    "pv_kw,third_party_pv_kw",
+    [(1.72, 0.0), (0.0, 1.72), (2.0, 0.5)],
+)
+def test_manual_force_discharge_preserves_pv_below_export_ceiling(
+    sigenergy_module, pv_kw, third_party_pv_kw,
+):
+    """Ticket #410: manual export must not sacrifice available solar."""
+    controller = sigenergy_module.SigenergyController(
+        host="127.0.0.1", max_export_limit_kw=5.0,
+    )
+    _stub_force_discharge_reads(controller, rated_discharge_w=14400)
     writes: list[tuple[int, list[int]]] = []
 
     async def connect():
@@ -637,8 +646,8 @@ def test_force_discharge_uses_ess_first_mode_when_target_needs_battery(sigenergy
     async def get_status():
         return types.SimpleNamespace(
             attributes={
-                "pv_power_kw": 2.0,
-                "third_party_pv_power_kw": 0.5,
+                "pv_power_kw": pv_kw,
+                "third_party_pv_power_kw": third_party_pv_kw,
             }
         )
 
@@ -650,16 +659,16 @@ def test_force_discharge_uses_ess_first_mode_when_target_needs_battery(sigenergy
     controller.get_status = get_status
     controller._write_holding_registers = write
 
-    assert asyncio.run(controller.force_discharge(power_kw=5.0))
+    assert asyncio.run(controller.force_discharge(power_kw=14.4))
 
     assert writes == [
         (controller.REG_GRID_EXPORT_LIMIT, controller._from_unsigned32(5000)),
         (
             controller.REG_ESS_MAX_DISCHARGE_LIMIT,
-            controller._from_unsigned32(19200),
+            controller._from_unsigned32(14400),
         ),
         (controller.REG_REMOTE_EMS_ENABLE, [1]),
-        (controller.REG_REMOTE_EMS_CONTROL_MODE, [controller.REMOTE_EMS_MODE_DISCHARGE_ESS]),
+        (controller.REG_REMOTE_EMS_CONTROL_MODE, [controller.REMOTE_EMS_MODE_DISCHARGE_PV]),
     ]
 
 
@@ -736,7 +745,10 @@ def test_force_discharge_mode_selection_uses_configured_export_cap(sigenergy_mod
     ]
 
 
-def test_force_discharge_uses_available_ess_cap_for_modes_five_and_six(sigenergy_module):
+@pytest.mark.parametrize("pv_kw,mode", [(0.7, 5), (0.0, 6)])
+def test_force_discharge_uses_available_ess_cap_for_modes_five_and_six(
+    sigenergy_module, pv_kw, mode,
+):
     controller = sigenergy_module.SigenergyController(host="127.0.0.1")
     _stub_force_discharge_reads(controller)
     writes: list[tuple[int, list[int]]] = []
@@ -747,7 +759,7 @@ def test_force_discharge_uses_available_ess_cap_for_modes_five_and_six(sigenergy
     async def get_status():
         return types.SimpleNamespace(
             attributes={
-                "pv_power_kw": 0.7,
+                "pv_power_kw": pv_kw,
                 "grid_power_kw": -4.4,
                 "battery_power_kw": -5.0,
             }
@@ -770,7 +782,7 @@ def test_force_discharge_uses_available_ess_cap_for_modes_five_and_six(sigenergy
             controller._from_unsigned32(19200),
         ),
         (controller.REG_REMOTE_EMS_ENABLE, [1]),
-        (controller.REG_REMOTE_EMS_CONTROL_MODE, [controller.REMOTE_EMS_MODE_DISCHARGE_ESS]),
+        (controller.REG_REMOTE_EMS_CONTROL_MODE, [mode]),
     ]
 
 
