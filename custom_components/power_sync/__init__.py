@@ -36378,6 +36378,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # Log call context for debugging (helps identify if called by automation)
         context = call.context
         source = _control_call_source(call)
+        expected_tesla_restore_generation = call.data.get(
+            "_tesla_restore_generation"
+        )
+        if (
+            expected_tesla_restore_generation is not None
+            and expected_tesla_restore_generation != _command_generation[0]
+        ):
+            _LOGGER.info(
+                "Tesla restore_normal retry skipped; superseded by a newer "
+                "force command (expected generation %s, current %s)",
+                expected_tesla_restore_generation,
+                _command_generation[0],
+            )
+            return
         solaredge_restore_coordinator = (
             hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("solaredge_coordinator")
         )
@@ -36538,6 +36552,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             )
             retry_at = dt_util.utcnow() + timedelta(seconds=60)
             next_retry = restore_retry_count + 1
+            retry_command_generation = _command_generation[0]
 
             async def _retry_tesla_restore(_now):
                 if not (
@@ -36546,6 +36561,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 ):
                     _LOGGER.debug(
                         "Tesla restore retry skipped; force state is no longer active"
+                    )
+                    return
+                if _command_generation[0] != retry_command_generation:
+                    _LOGGER.info(
+                        "Tesla restore retry skipped; superseded by a newer "
+                        "force command"
                     )
                     return
                 _LOGGER.warning(
@@ -36562,6 +36583,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         "_skip_backup_reserve_restore": (
                             skip_backup_reserve_restore
                         ),
+                        "_tesla_restore_generation": retry_command_generation,
                     },
                     blocking=True,
                 )

@@ -3470,6 +3470,107 @@ def test_tesla_restore_failure_keeps_force_state_for_retry():
     assert 'force_charge_state["active"] = False' not in dynamic_restore
 
 
+def _run_tesla_restore_retry_generation_case(
+    *,
+    initial_generation: int,
+    callback_generation: int,
+) -> tuple[list[tuple[tuple, dict, int]], list]:
+    """Execute the real extracted Tesla retry helper with recording fakes."""
+    source = INIT_PATH.read_text()
+    tree = ast.parse(source)
+    function_source = ast.get_source_segment(
+        source, _find_function(tree, "_schedule_tesla_restore_retry")
+    )
+    assert function_source is not None
+
+    calls: list[tuple[tuple, dict, int]] = []
+    callbacks = []
+    command_generation = [initial_generation]
+    force_charge_state = {"active": True}
+    force_discharge_state = {"active": False}
+
+    class _Services:
+        async def async_call(self, *args, **kwargs):
+            calls.append((args, kwargs, command_generation[0]))
+
+    def _track(_hass, callback, _when):
+        callbacks.append(callback)
+        return lambda: None
+
+    namespace = {
+        "restore_retry_count": 0,
+        "restore_was_force_charging": True,
+        "force_charge_state": force_charge_state,
+        "force_discharge_state": force_discharge_state,
+        "_command_generation": command_generation,
+        "dt_util": SimpleNamespace(
+            utcnow=lambda: datetime(2026, 10, 12, tzinfo=timezone.utc)
+        ),
+        "timedelta": timedelta,
+        "hass": SimpleNamespace(services=_Services()),
+        "DOMAIN": "power_sync",
+        "SERVICE_RESTORE_NORMAL": "restore_normal",
+        "skip_backup_reserve_restore": False,
+        "async_track_point_in_utc_time": _track,
+        "_LOGGER": SimpleNamespace(
+            warning=lambda *args, **kwargs: None,
+            error=lambda *args, **kwargs: None,
+            debug=lambda *args, **kwargs: None,
+            info=lambda *args, **kwargs: None,
+        ),
+    }
+    exec(textwrap.dedent(function_source), namespace)
+
+    assert namespace["_schedule_tesla_restore_retry"]("test")
+
+    async def _run_callback():
+        callback_task = asyncio.create_task(callbacks[0](None))
+        command_generation[0] = callback_generation
+        await callback_task
+
+    asyncio.run(_run_callback())
+    return calls, callbacks
+
+
+def test_queued_tesla_restore_retry_is_fenced_by_command_generation():
+    calls, callbacks = _run_tesla_restore_retry_generation_case(
+        initial_generation=41,
+        callback_generation=42,
+    )
+
+    assert len(callbacks) == 1
+    assert calls == []
+
+
+def test_tesla_restore_retry_dispatches_for_the_captured_generation():
+    calls, _callbacks = _run_tesla_restore_retry_generation_case(
+        initial_generation=41,
+        callback_generation=41,
+    )
+
+    assert len(calls) == 1
+    _args, _kwargs, observed_generation = calls[0]
+    assert observed_generation == 41
+    assert calls[0][0][2]["_tesla_restore_generation"] == 41
+
+
+def test_tesla_restore_service_checks_generation_before_cancelling_timers():
+    source = INIT_PATH.read_text()
+    function_source = ast.get_source_segment(
+        source, _find_function(ast.parse(source), "handle_restore_normal")
+    )
+    assert function_source is not None
+
+    guard = function_source.index("expected_tesla_restore_generation = call.data.get")
+    timer_cancellation = function_source.index(
+        '_cancel_all_force_timers("restore_normal")'
+    )
+
+    assert guard < timer_cancellation
+    assert '"_tesla_restore_generation"' in function_source
+    assert "expected_tesla_restore_generation != _command_generation[0]" in function_source
+
+
 def test_tesla_force_charge_partial_apply_arms_immediate_cleanup():
     source = INIT_PATH.read_text()
     tree = ast.parse(source)
