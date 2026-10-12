@@ -890,6 +890,7 @@ from .const import (
     CONF_OPTIMIZATION_SPREAD_IMPORT_ENABLED,
     CONF_OPTIMIZATION_DISABLE_IDLE,
     CONF_OPTIMIZATION_BATTERY_EFFICIENCY_LEARNING,
+    CONF_AMBER_FORECAST_CONFIDENCE_ENABLED,
     CONF_PROFIT_MAX_ENABLED,
     CONF_COST_NEUTRAL_ENABLED,
     CONF_CHARGE_BY_TIME_ENABLED,
@@ -44318,6 +44319,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             add_away_mode = hass.data[DOMAIN][entry.entry_id].pop("switch_add_away_mode", None)
             if add_away_mode:
                 add_away_mode(optimization_coordinator)
+            add_amber_confidence = hass.data[DOMAIN][entry.entry_id].pop("switch_add_amber_forecast_confidence", None)
+            if add_amber_confidence:
+                add_amber_confidence(optimization_coordinator)
             add_profit_max = hass.data[DOMAIN][entry.entry_id].pop("switch_add_profit_max", None)
             if add_profit_max:
                 add_profit_max(optimization_coordinator)
@@ -45103,6 +45107,12 @@ class OptimizationSettingsView(HomeAssistantView):
                         config_entry.data.get(CONF_COST_NEUTRAL_ENABLED, False),
                     )
                 ),
+                "amber_forecast_confidence_enabled": bool(
+                    config_entry and config_entry.options.get(
+                        CONF_AMBER_FORECAST_CONFIDENCE_ENABLED,
+                        config_entry.data.get(CONF_AMBER_FORECAST_CONFIDENCE_ENABLED, False),
+                    ) is True
+                ),
                 "cost_neutral_enabled": bool(
                     config_entry
                     and config_entry.options.get(
@@ -45325,6 +45335,7 @@ class OptimizationSettingsView(HomeAssistantView):
             "cost_function": opt_coordinator._cost_function.value,
             "ev_integration": opt_coordinator._ev_integration_enabled,
             "planned_ev_load_entity": opt_coordinator._planned_ev_load_entity_id,
+            "amber_forecast_confidence_enabled": opt_coordinator.amber_forecast_confidence_enabled,
             "profit_max_enabled": opt_coordinator.profit_max_mode,
             "cost_neutral_enabled": opt_coordinator.cost_neutral_enabled,
             "charge_by_time_enabled": opt_coordinator.charge_by_time_enabled,
@@ -45509,6 +45520,8 @@ class OptimizationSettingsView(HomeAssistantView):
                         }
                     )
 
+            if "amber_forecast_confidence_enabled" in settings and not isinstance(settings["amber_forecast_confidence_enabled"], bool):
+                return web.json_response({"success": False, "error": "amber_forecast_confidence_enabled must be a boolean"}, status=400)
             if (
                 settings.get("profit_max_enabled") is True
                 and settings.get("cost_neutral_enabled") is True
@@ -45701,6 +45714,11 @@ class OptimizationSettingsView(HomeAssistantView):
                 new_data[CONF_OPTIMIZATION_PLANNED_EV_LOAD_ENTITY] = entity_id
                 new_options[CONF_OPTIMIZATION_PLANNED_EV_LOAD_ENTITY] = entity_id
                 changes.append(f"Set planned EV load entity to {entity_id or 'cleared'}")
+
+            if "amber_forecast_confidence_enabled" in settings:
+                new_data[CONF_AMBER_FORECAST_CONFIDENCE_ENABLED] = settings["amber_forecast_confidence_enabled"]
+                new_options[CONF_AMBER_FORECAST_CONFIDENCE_ENABLED] = settings["amber_forecast_confidence_enabled"]
+                changes.append(f"Set Amber Forecast Confidence to {settings['amber_forecast_confidence_enabled']}")
 
             if "profit_max_enabled" in settings:
                 new_options[CONF_PROFIT_MAX_ENABLED] = bool(settings["profit_max_enabled"])

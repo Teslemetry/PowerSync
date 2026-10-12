@@ -1191,3 +1191,28 @@ def test_multiday_constraints_use_billable_rates_not_lp_export_boost(
     assert result.lp_stats["cost_neutral_planned_earnings_by_day"][
         "2026-08-02"
     ] == pytest.approx(0.2)
+
+
+def test_amber_confidence_changes_decision_value_but_cost_neutral_uses_raw_earnings(optimizer_module):
+    policy = importlib.import_module('power_sync.optimization.price_forecast_confidence')
+    timestamps = _timestamps(5)
+    raw = [10.0, 0.05, 24.0, 0.05, 0.05]
+    intervals = [policy.AmberPriceInterval(t, t + 1, ts, 'CurrentInterval' if t == 0 else 'ForecastInterval') for t, ts in enumerate(timestamps)]
+    weighted, _ = policy.weight_amber_export_forecast(raw, intervals, timestamps[0])
+    optimizer = optimizer_module.BatteryOptimizer(capacity_wh=10000, max_charge_w=5000, max_discharge_w=5000,
+        backup_reserve=0.2, hardware_reserve=0.2, efficiency=1.0,
+        interval_minutes=60, horizon_hours=5, terminal_weight=0)
+    day = '2026-08-01'
+    plan = optimizer_module.CostNeutralPlan(day_ids=[day]*5, earnings_caps_by_day={day: 20},
+        forecast_import_costs_by_day={day: 0}, fixed_cost_allowances_by_day={day: 20}, current_day=day,
+        settlement_import_prices=[0.3]*5, settlement_export_prices=raw)
+    result = optimizer.optimize(import_prices=[0.3]*5, export_prices=weighted,
+        solar_forecast=[0]*5, load_forecast=[0]*5, current_soc=0.7,
+        allow_grid_charge=False, allow_battery_export=True,
+        cost_neutral_plan=plan, schedule_timestamps=timestamps)
+    assert result.feasible
+    actual_earnings = sum(w/1000*p for w, p in zip(result.battery_to_grid_w, raw))
+    assert actual_earnings == pytest.approx(20, abs=0.05)
+    assert result.battery_to_grid_w[0] == pytest.approx(2000, abs=5)
+    assert max(result.battery_to_grid_w[1:]) < 5
+    assert plan.settlement_export_prices == raw

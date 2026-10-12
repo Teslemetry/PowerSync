@@ -566,6 +566,7 @@ from .const import (
     CONF_OPTIMIZATION_MIN_EXPORT_PRICE,
     CONF_OPTIMIZATION_GRID_CHARGE_SOC_CAP,
     CONF_OPTIMIZATION_GRID_CHARGE_BLACKOUT_WINDOWS,
+    CONF_AMBER_FORECAST_CONFIDENCE_ENABLED,
     CONF_PROFIT_MAX_ENABLED,
     CONF_COST_NEUTRAL_ENABLED,
     CONF_CHARGE_BY_TIME_ENABLED,
@@ -3868,6 +3869,7 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     CONF_OPTIMIZATION_BATTERY_EFFICIENCY_LEARNING: (
                         battery_efficiency_learning_enabled
                     ),
+                    CONF_AMBER_FORECAST_CONFIDENCE_ENABLED: user_input.get(CONF_AMBER_FORECAST_CONFIDENCE_ENABLED, False) is True,
                     CONF_PROFIT_MAX_ENABLED: bool(
                         user_input.get(CONF_PROFIT_MAX_ENABLED, False)
                         and not user_input.get(CONF_COST_NEUTRAL_ENABLED, False)
@@ -4171,6 +4173,9 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 )
             ),
         })
+
+        if self._selected_electricity_provider == "amber":
+            schema_fields[vol.Optional(CONF_AMBER_FORECAST_CONFIDENCE_ENABLED, default=False)] = BooleanSelector()
 
         return self.async_show_form(
             step_id="ml_options",
@@ -12086,6 +12091,10 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                                 "invalid_grid_charge_blackout_windows"
                         },
                     )
+                amber_forecast_confidence_enabled = user_input.get(
+                    CONF_AMBER_FORECAST_CONFIDENCE_ENABLED,
+                    self._get_option(CONF_AMBER_FORECAST_CONFIDENCE_ENABLED, False),
+                ) is True
                 profit_max_enabled = bool(
                     user_input.get(CONF_PROFIT_MAX_ENABLED, False)
                 )
@@ -12218,6 +12227,8 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                 new_options[CONF_OPTIMIZATION_EV_INTEGRATION] = ev_integration_enabled
                 new_data[CONF_OPTIMIZATION_PLANNED_EV_LOAD_ENTITY] = planned_ev_load_entity
                 new_options[CONF_OPTIMIZATION_PLANNED_EV_LOAD_ENTITY] = planned_ev_load_entity
+                new_data[CONF_AMBER_FORECAST_CONFIDENCE_ENABLED] = amber_forecast_confidence_enabled
+                new_options[CONF_AMBER_FORECAST_CONFIDENCE_ENABLED] = amber_forecast_confidence_enabled
                 new_data[CONF_PROFIT_MAX_ENABLED] = profit_max_enabled
                 new_options[CONF_PROFIT_MAX_ENABLED] = profit_max_enabled
                 new_data[CONF_COST_NEUTRAL_ENABLED] = cost_neutral_enabled
@@ -12405,6 +12416,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                     "allow_grid_charge": allow_grid_charge,
                     "grid_charge_blackout_windows": grid_charge_blackout_windows,
                     "cost_function": COST_FUNCTION_COST,
+                    "amber_forecast_confidence_enabled": amber_forecast_confidence_enabled,
                     "profit_max_enabled": profit_max_enabled,
                     "cost_neutral_enabled": cost_neutral_enabled,
                     "daily_supply_charge": daily_supply_charge,
@@ -12454,6 +12466,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                         "grid_charge_blackout_windows": (
                             CONF_OPTIMIZATION_GRID_CHARGE_BLACKOUT_WINDOWS
                         ),
+                        "amber_forecast_confidence_enabled": CONF_AMBER_FORECAST_CONFIDENCE_ENABLED,
                         "profit_max_enabled": CONF_PROFIT_MAX_ENABLED,
                         "cost_neutral_enabled": CONF_COST_NEUTRAL_ENABLED,
                         "daily_supply_charge": CONF_DAILY_SUPPLY_CHARGE,
@@ -12709,6 +12722,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                 self.config_entry.data.get(CONF_OPTIMIZATION_PLANNED_EV_LOAD_ENTITY),
             )
         )
+        current_amber_forecast_confidence = self._get_option(CONF_AMBER_FORECAST_CONFIDENCE_ENABLED, False) is True
         current_profit_max_enabled = self._get_option(
             CONF_PROFIT_MAX_ENABLED,
             self.config_entry.data.get(CONF_PROFIT_MAX_ENABLED, False),
@@ -12828,6 +12842,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
             CONF_OPTIMIZATION_GRID_CHARGE_BLACKOUT_WINDOWS: json.dumps(
                 current_grid_charge_blackout_windows
             ),
+            CONF_AMBER_FORECAST_CONFIDENCE_ENABLED: current_amber_forecast_confidence,
             CONF_PROFIT_MAX_ENABLED: bool(current_profit_max_enabled),
             CONF_COST_NEUTRAL_ENABLED: bool(current_cost_neutral_enabled),
             CONF_DAILY_SUPPLY_CHARGE: current_daily_supply_charge,
@@ -13137,6 +13152,9 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
             }
         )
 
+        if self._get_option(CONF_ELECTRICITY_PROVIDER, "amber") == "amber":
+            schema_fields[vol.Optional(CONF_AMBER_FORECAST_CONFIDENCE_ENABLED, default=current_amber_forecast_confidence)] = BooleanSelector()
+
         section_fields = {
             "core_goals": {
                 CONF_OPTIMIZATION_PROVIDER,
@@ -13154,6 +13172,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                 CONF_HARDWARE_BACKUP_RESERVE,
             },
             "battery_forecast_inputs": {
+                CONF_AMBER_FORECAST_CONFIDENCE_ENABLED,
                 CONF_OPTIMIZATION_BATTERY_CAPACITY_WH,
                 CONF_OPTIMIZATION_MAX_CHARGE_W,
                 CONF_OPTIMIZATION_MAX_DISCHARGE_W,

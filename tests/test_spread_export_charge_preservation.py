@@ -609,3 +609,16 @@ def test_bridge_does_not_replace_fixed_manual_self_consumption_slot(opt_module):
     assert bridged.actions[1].action == "self_consumption"
     assert bridged.actions[1].control_source == "manual"
     assert bridged.actions[1].battery_discharge_w == pytest.approx(0.0)
+
+
+def test_spread_export_respects_different_confidence_values_across_source_intervals(opt_module):
+    coordinator = _coordinator(opt_module, "amber")
+    coordinator._config.max_discharge_w = 10000
+    coordinator._config.battery_capacity_wh = 10000
+    start = datetime(2026, 5, 3, 2, 0, tzinfo=timezone.utc)
+    actions = [opt_module.ScheduleAction(timestamp=start + timedelta(minutes=5*t), action="export", power_w=p, soc=0.9-t*0.05, battery_charge_w=0, battery_discharge_w=p) for t, p in enumerate([6000, 2000, 1000, 1000])]
+    schedule = opt_module.OptimizationSchedule(actions=actions, predicted_cost=0, predicted_savings=0, last_updated=start)
+    # Same scalar inside each source interval, distinct values between them.
+    spread = coordinator._spread_export_schedule(schedule, True, export_reserve_floor=0.2, export_prices=[10, 10, 5, 5])
+    assert [a.power_w for a in spread.actions] == pytest.approx([4000, 4000, 1000, 1000], abs=0.1)
+    assert sum(a.power_w for a in spread.actions) == pytest.approx(sum(a.power_w for a in actions), abs=0.1)

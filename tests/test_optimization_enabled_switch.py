@@ -364,3 +364,52 @@ def test_max_grid_import_setting_is_exposed_through_api_and_coordinator():
     assert "CONF_OPTIMIZATION_GRID_CHARGE_SOC_CAP" in init_source
     assert "CONF_OPTIMIZATION_MAX_GRID_IMPORT_W" in coordinator_source
     assert "CONF_OPTIMIZATION_MAX_GRID_EXPORT_W" in coordinator_source
+
+
+def test_amber_confidence_switch_saves_and_replans_only_when_optimizer_enabled():
+    import ast
+    import asyncio
+    from types import SimpleNamespace
+    from typing import Any
+    source = ast.parse(SWITCH_PATH.read_text())
+    cls = next(n for n in source.body if isinstance(n, ast.ClassDef) and n.name == 'AmberForecastConfidenceSwitch')
+    replan = next(n for n in source.body if isinstance(n, ast.AsyncFunctionDef) and n.name == '_reoptimize_if_enabled')
+    class Entity:
+        def async_write_ha_state(self):
+            pass
+    class Coordinator:
+        amber_forecast_confidence_enabled = False
+        enabled = False
+        replans = 0
+        def set_amber_forecast_confidence_enabled(self, value):
+            changed = self.amber_forecast_confidence_enabled != value
+            self.amber_forecast_confidence_enabled = value
+            return changed
+        async def force_reoptimize(self):
+            self.replans += 1
+    ns = dict(SwitchEntity=Entity, HomeAssistant=Any, ConfigEntry=Any, Any=Any,
+        EntityCategory=SimpleNamespace(CONFIG='config'), DOMAIN='power_sync',
+        callback=lambda f: f, SWITCH_TYPE_AMBER_FORECAST_CONFIDENCE='amber_forecast_confidence',
+        __name__='power_sync.switch', __package__='power_sync')
+    exec(compile(ast.Module(body=[replan, cls], type_ignores=[]), str(SWITCH_PATH), 'exec'), ns)
+    # The constructor imports its canonical const; avoid importing HA.
+    import sys
+    import types
+    package = types.ModuleType('power_sync')
+    package.__path__ = [str(CONST_PATH.parent)]
+    const = types.ModuleType('power_sync.const')
+    const.CONF_AMBER_FORECAST_CONFIDENCE_ENABLED = 'amber_forecast_confidence_enabled'
+    from unittest.mock import patch
+    with patch.dict(sys.modules, {'power_sync': package, 'power_sync.const': const}):
+        coordinator = Coordinator()
+        entry = SimpleNamespace(entry_id='one', options={}, data={})
+        switch = ns['AmberForecastConfidenceSwitch'](SimpleNamespace(), entry, coordinator)
+        asyncio.run(switch.async_turn_on())
+        assert switch.is_on is True
+        assert coordinator.replans == 0
+        coordinator.enabled = True
+        asyncio.run(switch.async_turn_off())
+        assert switch.is_on is False
+        assert coordinator.replans == 1
+        asyncio.run(switch.async_turn_off())
+        assert coordinator.replans == 1

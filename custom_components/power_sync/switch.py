@@ -50,6 +50,7 @@ from .const import (
     SWITCH_TYPE_FORCE_CHARGE,
     SWITCH_TYPE_MONITORING_MODE,
     SWITCH_TYPE_AWAY_MODE,
+    SWITCH_TYPE_AMBER_FORECAST_CONFIDENCE,
     SWITCH_TYPE_PROFIT_MAX_MODE,
     SWITCH_TYPE_COST_NEUTRAL,
     SWITCH_TYPE_CHARGE_BY_TIME,
@@ -329,6 +330,12 @@ async def async_setup_entry(
     hass.data.setdefault(DOMAIN, {}).setdefault(entry.entry_id, {})[
         "switch_add_away_mode"
     ] = _add_away_mode_switch
+
+    def _add_amber_forecast_confidence_switch(coordinator: Any) -> None:
+        if coordinator._electricity_provider() == "amber":
+            async_add_entities([AmberForecastConfidenceSwitch(hass=hass, entry=entry, coordinator=coordinator)])
+
+    hass.data[DOMAIN][entry.entry_id]["switch_add_amber_forecast_confidence"] = _add_amber_forecast_confidence_switch
 
     def _add_profit_max_switch(coordinator: Any) -> None:
         async_add_entities([ProfitMaxModeSwitch(hass=hass, entry=entry, coordinator=coordinator)])
@@ -1302,6 +1309,68 @@ class AwayModeSwitch(SwitchEntity):
         _LOGGER.info("Away mode DISABLED — load forecaster using recent history")
         self._attr_is_on = False
         self._coordinator.set_away_mode(False)
+        self.async_write_ha_state()
+
+
+class AmberForecastConfidenceSwitch(SwitchEntity):
+    """Opt-in valuation of uncertain future Amber export spikes."""
+
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, coordinator: Any) -> None:
+        """Initialize the switch."""
+        self.hass = hass
+        self._entry = entry
+        self._coordinator = coordinator
+        self._attr_unique_id = f"{entry.entry_id}_{SWITCH_TYPE_AMBER_FORECAST_CONFIDENCE}"
+        self._attr_suggested_object_id = f"power_sync_{SWITCH_TYPE_AMBER_FORECAST_CONFIDENCE}"
+        self._attr_name = "Amber Forecast Confidence"
+        self._attr_icon = "mdi:cash-plus"
+        from .const import CONF_AMBER_FORECAST_CONFIDENCE_ENABLED
+        enabled = entry.options.get(
+            CONF_AMBER_FORECAST_CONFIDENCE_ENABLED,
+            entry.data.get(CONF_AMBER_FORECAST_CONFIDENCE_ENABLED, False),
+        )
+        self._attr_is_on = bool(enabled)
+
+    async def async_added_to_hass(self) -> None:
+        """Register for optimizer setting changes made outside this switch."""
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass,
+                f"{DOMAIN}_{self._entry.entry_id}_amber_forecast_confidence",
+                self._handle_amber_forecast_confidence_update,
+            )
+        )
+
+    @callback
+    def _handle_amber_forecast_confidence_update(self, enabled: bool) -> None:
+        """Update the HA switch state after API-driven changes."""
+        self._attr_is_on = bool(enabled)
+        self.async_write_ha_state()
+
+    @property
+    def device_info(self):
+        return family_device_info(self._entry.entry_id, SENSOR_FAMILY_LP_OPTIMIZER)
+
+    @property
+    def is_on(self) -> bool:
+        """Return True if Amber export forecast weighting is active."""
+        return self._coordinator.amber_forecast_confidence_enabled
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Enable Amber export forecast weighting."""
+        self._attr_is_on = True
+        changed = self._coordinator.set_amber_forecast_confidence_enabled(True)
+        await _reoptimize_if_enabled(self._coordinator, changed)
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Disable Amber export forecast weighting."""
+        self._attr_is_on = False
+        changed = self._coordinator.set_amber_forecast_confidence_enabled(False)
+        await _reoptimize_if_enabled(self._coordinator, changed)
         self.async_write_ha_state()
 
 

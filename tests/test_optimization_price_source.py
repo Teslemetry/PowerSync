@@ -113,6 +113,7 @@ def _install_power_sync_stubs() -> None:
     const_module.DOMAIN = "power_sync"
     const_module.TESLA_LOCAL_CONTROL_MAX_AGE_SECONDS = 30
     const_module.CONF_AMBER_FORECAST_TYPE = "amber_forecast_type"
+    const_module.CONF_AMBER_FORECAST_CONFIDENCE_ENABLED = "amber_forecast_confidence_enabled"
     const_module.CONF_ELECTRICITY_PROVIDER = "electricity_provider"
     const_module.CONF_FLOW_POWER_BASE_RATE = "flow_power_base_rate"
     const_module.CONF_FLOW_POWER_EXPORT_RATE = "flow_power_export_rate"
@@ -738,8 +739,8 @@ def _coordinator_with_epex_provider(
     )
     coordinator._last_display_import_prices = None
     coordinator._last_display_export_prices = None
-    coordinator._apply_export_boost = lambda export, import_prices=None: (
-        [max(0.0, price) for price in export],
+    coordinator._apply_export_boost = lambda export, import_prices=None, *, objective_export_prices=None: (
+        [max(0.0, price) for price in (export if objective_export_prices is None else objective_export_prices)],
         [],
     )
     coordinator._apply_saving_session_prices = lambda imports, exports: (imports, exports)
@@ -771,8 +772,8 @@ def _coordinator_with_dynamic_price_provider(
     )
     coordinator._last_display_import_prices = None
     coordinator._last_display_export_prices = None
-    coordinator._apply_export_boost = lambda export, import_prices=None: (
-        [max(0.0, price) for price in export],
+    coordinator._apply_export_boost = lambda export, import_prices=None, *, objective_export_prices=None: (
+        [max(0.0, price) for price in (export if objective_export_prices is None else objective_export_prices)],
         [],
     )
     coordinator._apply_saving_session_prices = lambda imports, exports: (imports, exports)
@@ -3189,3 +3190,149 @@ def test_solve_captures_the_acquisition_reference_through_the_priced_mask(
     assert "_provider_priced_reference_prices()" in source
     # and the stale-mask clear that makes the capture safe across solves
     assert "self._last_priced_import_mask = None" in source
+
+
+@pytest.mark.parametrize("profit_max", [False, True])
+def test_amber_confidence_weights_source_intervals_before_overlays_and_gap_fill(opt_module, monkeypatch, profit_max):
+    now = datetime(2026, 5, 3, 8, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(opt_module.dt_util, "now", lambda: now)
+    current = [
+        _dynamic_price_entry(now, 30, "general", interval_type="CurrentInterval", advanced_price={"predicted": 30}),
+        _dynamic_price_entry(now, 1000, "feedIn", interval_type="CurrentInterval", advanced_price={"predicted": -1000}),
+    ]
+    forecast = []
+    for hours, cents in [(0.5, 5), (1.0, 5), (2.0, 2400)]:
+        ts = now + timedelta(hours=hours)
+        forecast += [_dynamic_price_entry(ts, 30, "general", advanced_price={"predicted": 30}),
+                     _dynamic_price_entry(ts, cents, "feedIn", advanced_price={"predicted": -cents})]
+    coordinator = _coordinator_with_dynamic_price_provider(opt_module, "amber", forecast, current, horizon_hours=4)
+    coordinator._config.amber_forecast_confidence_enabled = True
+    coordinator._config.profit_max_enabled = profit_max
+    before_boost = []
+    coordinator._apply_export_boost = lambda exports, imports, *, objective_export_prices: (before_boost.extend(objective_export_prices) or [p + 2 for p in objective_export_prices], [])
+    coordinator._apply_confidence_decay = lambda imports, exports, **kwargs: ([p * 0.5 for p in imports], [p * 0.5 for p in exports])
+    imports, exports = asyncio.run(coordinator._get_price_forecast())
+    expected = 0.15 + (24 - 0.15) * 2 ** (-2 / 1.5)
+    assert before_boost[:6] == [10.0] * 6
+    assert before_boost[24:] == pytest.approx([expected] * 24)
+    assert exports[24:] == pytest.approx([expected + 2] * 24)
+    assert imports == pytest.approx([0.15] * 48)
+    assert coordinator._last_display_export_prices[24:30] == [24] * 6
+    assert coordinator._last_settlement_export_prices[24:] == [24] * 24
+    assert coordinator._last_optimizer_price_valid_slots[18:24] == [False] * 6
+    assert coordinator._pending_amber_forecast_confidence["used"] is True
+    coordinator._commit_price_forecast_cache(imports, exports)
+    accepted = dict(coordinator._last_amber_forecast_confidence)
+    coordinator._pending_amber_forecast_confidence = {"used": False}
+    assert coordinator._last_amber_forecast_confidence == accepted
+
+
+def test_confidence_weighted_boost_keeps_signed_settlement_eligibility(opt_module, monkeypatch):
+    now = datetime(2026, 5, 3, 8, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(opt_module.dt_util, "now", lambda: now)
+    coordinator = _coordinator_with_dynamic_price_provider(opt_module, "amber", [])
+    coordinator._entry.options.update({
+        "export_boost_enabled": True,
+        "export_price_offset": 5.0,
+        "export_boost_start": "08:00",
+        "export_boost_end": "09:00",
+        "export_boost_threshold": 15.0,
+    })
+    settlement = [-0.01, 0.24]
+    weighted = [0.0, 0.12]
+    values, allowed = opt_module.OptimizationCoordinator._apply_export_boost(
+        coordinator, settlement, [0.30, 0.30], objective_export_prices=weighted,
+    )
+    # A forecast discounted below the threshold remains eligible by its real
+    # rate, but receives the boost on its weighted valuation. A negative rate
+    # remains ineligible even though the objective is clamped to zero.
+    assert allowed == [False, True]
+    assert values == pytest.approx([0.0, 0.17])
+    assert settlement == [-0.01, 0.24]
+    assert weighted == [0.0, 0.12]
+
+
+def test_amber_confidence_off_is_identical_to_absent_option_and_other_providers(opt_module, monkeypatch):
+    now = datetime(2026, 5, 3, 8, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(opt_module.dt_util, "now", lambda: now)
+    forecast = []
+    for hours, cents in [(0, 5), (0.5, 5), (1, 2400)]:
+        forecast += [_dynamic_price_entry(now + timedelta(hours=hours), 30, "general", advanced_price={"predicted": 30}),
+                     _dynamic_price_entry(now + timedelta(hours=hours), cents, "feedIn", advanced_price={"predicted": -cents})]
+    coordinator = _coordinator_with_dynamic_price_provider(opt_module, "amber", forecast, horizon_hours=2)
+    coordinator._apply_confidence_decay = lambda imports, exports, **kw: (imports, [p * 0.7 for p in exports])
+    absent = asyncio.run(coordinator._get_price_forecast())
+    coordinator._config.amber_forecast_confidence_enabled = False
+    assert asyncio.run(coordinator._get_price_forecast()) == absent
+    coordinator._entry.options["electricity_provider"] = "localvolts"
+    other_off = asyncio.run(coordinator._get_price_forecast())
+    coordinator._config.amber_forecast_confidence_enabled = True
+    assert asyncio.run(coordinator._get_price_forecast()) == other_off
+    assert coordinator._pending_amber_forecast_confidence["reason"] == "provider_not_amber"
+
+
+def test_amber_confidence_missing_metadata_uses_legacy_decay(opt_module, monkeypatch):
+    now = datetime(2026, 5, 3, 8, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(opt_module.dt_util, "now", lambda: now)
+    forecast = [_dynamic_price_entry(now, 30, "general", advanced_price={"predicted": 30}),
+                _dynamic_price_entry(now, 2400, "feedIn", advanced_price={"predicted": -2400})]
+    coordinator = _coordinator_with_dynamic_price_provider(opt_module, "amber", forecast)
+    coordinator._config.amber_forecast_confidence_enabled = True
+    coordinator._apply_confidence_decay = lambda imports, exports, **kw: (imports, [p * 0.5 for p in exports])
+    _, exports = asyncio.run(coordinator._get_price_forecast())
+    assert exports == [12] * 12
+    assert coordinator._pending_amber_forecast_confidence["used"] is False
+
+
+@pytest.mark.parametrize("forecast_type,price", [("low", 12.0), ("predicted", 24.0), ("high", 30.0)])
+def test_amber_confidence_retains_selected_forecast_source(opt_module, monkeypatch, forecast_type, price):
+    now = datetime(2026, 5, 3, 8, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(opt_module.dt_util, "now", lambda: now)
+    forecast = []
+    for hours, values in [(0, {"low": -5, "predicted": -5, "high": -5}),
+                          (0.5, {"low": -5, "predicted": -5, "high": -5}),
+                          (2, {"low": -1200, "predicted": -2400, "high": -3000})]:
+        ts = now + timedelta(hours=hours)
+        forecast += [_dynamic_price_entry(ts, 30, "general", advanced_price={"low": 30, "predicted": 30, "high": 30}),
+                     _dynamic_price_entry(ts, 5, "feedIn", advanced_price=values)]
+    coordinator = _coordinator_with_dynamic_price_provider(opt_module, "amber", forecast, amber_forecast_type=forecast_type, horizon_hours=3)
+    coordinator._config.amber_forecast_confidence_enabled = True
+    _, exports = asyncio.run(coordinator._get_price_forecast())
+    assert exports[24:30] == pytest.approx([0.15 + (price - 0.15) * 2 ** (-2 / 1.5)] * 6)
+    assert coordinator._last_display_export_prices[24:30] == [price] * 6
+
+
+def test_amber_confidence_settings_persist_true_false_and_replan_without_changing_goals(opt_module, monkeypatch):
+    dispatcher = types.ModuleType("homeassistant.helpers.dispatcher")
+    signals = []
+    dispatcher.async_dispatcher_send = lambda *args: signals.append(args[1:])
+    monkeypatch.setitem(sys.modules, "homeassistant.helpers.dispatcher", dispatcher)
+    entry = SimpleNamespace(entry_id="entry-1", data={}, options={})
+    def persist(target, data=None, options=None):
+        if data is not None:
+            target.data = data
+        if options is not None:
+            target.options = options
+    hass = SimpleNamespace(data={}, config_entries=SimpleNamespace(async_update_entry=persist))
+    coordinator = opt_module.OptimizationCoordinator(hass=hass, entry_id="entry-1", battery_system="tesla", battery_controller=SimpleNamespace(), entry=entry)
+    coordinator._enabled = True
+    coordinator._config.profit_max_enabled = True
+    scheduled = []
+    coordinator._schedule_settings_reoptimization = lambda: scheduled.append(True)
+    coordinator.get_api_data = lambda: {"amber_forecast_confidence_enabled": coordinator.amber_forecast_confidence_enabled}
+    coordinator.async_set_updated_data = lambda data: None
+    assert coordinator.amber_forecast_confidence_enabled is False
+    for value in (True, False):
+        result = asyncio.run(coordinator.set_settings({"amber_forecast_confidence_enabled": value}))
+        assert result["success"] is True
+        assert entry.data["amber_forecast_confidence_enabled"] is value
+        assert entry.options["amber_forecast_confidence_enabled"] is value
+        assert coordinator.amber_forecast_confidence_enabled is value
+        assert coordinator._config.profit_max_enabled is True
+    assert len(scheduled) == 2
+    assert signals == [("power_sync_entry-1_amber_forecast_confidence", True), ("power_sync_entry-1_amber_forecast_confidence", False)]
+    assert coordinator.set_amber_forecast_confidence_enabled(False) is False
+    before = dict(entry.options)
+    result = asyncio.run(coordinator.set_settings({"amber_forecast_confidence_enabled": "false"}))
+    assert result["success"] is False
+    assert entry.options == before

@@ -65,6 +65,7 @@ from .price_level_projection import (
     PriceLevelProjection,
     build_price_level_projection,
 )
+from .price_forecast_confidence import AmberPriceInterval, weight_amber_export_forecast
 from .solar_forecast_learning import SolarForecastLearner
 from .solar_provenance import derive_solar_forecast_provenance
 from .solar_export import SolarExportHoldController, resolve_solar_export_adapter
@@ -435,6 +436,7 @@ class OptimizationConfig:
     interval_minutes: int = FIXED_OPTIMIZATION_INTERVAL_MINUTES
     horizon_hours: int = 48
     cost_function: str = "cost"
+    amber_forecast_confidence_enabled: bool = False
     profit_max_enabled: bool = False
     cost_neutral_enabled: bool = False
     charge_by_time_enabled: bool = False
@@ -720,6 +722,8 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # bonuses. Cost Neutral uses these to value each local settlement day.
         self._last_settlement_import_prices: list[float] | None = None
         self._last_settlement_export_prices: list[float] | None = None
+        self._last_amber_forecast_confidence: dict = {}
+        self._pending_amber_forecast_confidence: dict | None = None
         self._last_grid_charge_cap_import_prices: list[float] | None = None  # $/kWh hard cap reference
         self._last_export_boost_allowed_slots: list[bool] = []
         self._last_battery_export_allowed_slots: list[bool] = []
@@ -1598,6 +1602,33 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.hass.data.setdefault(DOMAIN, {}).setdefault(self.entry_id, {})["_skip_reload"] = True
             self.hass.config_entries.async_update_entry(self._entry, options=new_options)
         return True
+
+    @property
+    def amber_forecast_confidence_enabled(self) -> bool:
+        """Return the saved opt-in, independently of optimizer goals."""
+        return bool(getattr(self._config, "amber_forecast_confidence_enabled", False))
+
+    def set_amber_forecast_confidence_enabled(self, enabled: bool) -> bool:
+        """Persist and publish the Amber pricing preference."""
+        if not isinstance(enabled, bool):
+            raise ValueError("amber_forecast_confidence_enabled must be a boolean")
+        changed = self.amber_forecast_confidence_enabled != enabled
+        self._config.amber_forecast_confidence_enabled = enabled
+        if self._entry:
+            from ..const import CONF_AMBER_FORECAST_CONFIDENCE_ENABLED, DOMAIN
+            new_data = dict(self._entry.data)
+            new_options = dict(self._entry.options)
+            new_data[CONF_AMBER_FORECAST_CONFIDENCE_ENABLED] = enabled
+            new_options[CONF_AMBER_FORECAST_CONFIDENCE_ENABLED] = enabled
+            if new_data != dict(self._entry.data) or new_options != dict(self._entry.options):
+                self.hass.data.setdefault(DOMAIN, {}).setdefault(self.entry_id, {})["_skip_reload"] = True
+                self.hass.config_entries.async_update_entry(self._entry, data=new_data, options=new_options)
+        if changed and self.hass and self.entry_id:
+            from homeassistant.helpers.dispatcher import async_dispatcher_send
+            from ..const import DOMAIN
+            async_dispatcher_send(self.hass, f"{DOMAIN}_{self.entry_id}_amber_forecast_confidence", enabled)
+            _LOGGER.info("Amber Forecast Confidence %s", "ENABLED" if enabled else "DISABLED")
+        return changed
 
     def set_profit_max_mode(self, enabled: bool) -> bool:
         """Enable or disable profit maximisation mode."""
@@ -4196,6 +4227,10 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if pending_timestamps is not None:
             self._last_price_timestamps = pending_timestamps
         self._pending_price_timestamps = None
+        self._last_amber_forecast_confidence = dict(
+            getattr(self, "_pending_amber_forecast_confidence", None) or {}
+        )
+        self._pending_amber_forecast_confidence = None
 
     def _zerohero_window_slots(self, n: int) -> list[bool]:
         """Return optimizer slots inside the configured ZeroHero window."""
@@ -4740,6 +4775,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         if self._entry:
             from ..const import (
+                CONF_AMBER_FORECAST_CONFIDENCE_ENABLED,
                 CONF_OPTIMIZATION_ALLOW_GRID_CHARGE,
                 CONF_OPTIMIZATION_GRID_CHARGE_BLACKOUT_WINDOWS,
                 CONF_OPTIMIZATION_BATTERY_EFFICIENCY_LEARNING,
@@ -4814,6 +4850,12 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if self._should_disable_idle_schedule():
                 _LOGGER.info("No Idle mode: ENABLED")
 
+            self._config.amber_forecast_confidence_enabled = (
+                self._entry.options.get(
+                    CONF_AMBER_FORECAST_CONFIDENCE_ENABLED,
+                    self._entry.data.get(CONF_AMBER_FORECAST_CONFIDENCE_ENABLED, False),
+                ) is True
+            )
             profit_max = self._entry.options.get(
                 CONF_PROFIT_MAX_ENABLED,
                 self._entry.data.get(CONF_PROFIT_MAX_ENABLED, False),
@@ -6772,6 +6814,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._optimization_lock.acquire()
         try:
             self._pending_price_timestamps = None
+            self._pending_amber_forecast_confidence = None
 
             # Retry battery auto-detection if still on defaults
             # (site_info may not have been available during initial setup)
@@ -8113,6 +8156,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return False
         finally:
             self._pending_price_timestamps = None
+            self._pending_amber_forecast_confidence = None
             self._optimization_lock.release()
 
     async def _execute_current_action_and_publish(
@@ -14255,6 +14299,8 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self,
         export_prices: list[float],
         import_prices: list[float] | None = None,
+        *,
+        objective_export_prices: list[float] | None = None,
     ) -> tuple[list[float], list[bool]]:
         """Apply export boost to LP export prices during configured window.
 
@@ -14269,14 +14315,26 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         ``export_prices`` is the signed, unboosted settlement series. The
         returned prices are clamped for the non-negative LP objective; the
-        eligibility mask remains based on the signed input.
+        eligibility mask remains based on the signed input. An optional
+        confidence-weighted objective is used for valuation only; boost
+        eligibility and the anti-arbitrage check still use settlement rates.
         """
+        if (
+            objective_export_prices is not None
+            and len(objective_export_prices) != len(export_prices)
+        ):
+            raise ValueError("Export objective and settlement series must align")
+        objective_prices = (
+            export_prices
+            if objective_export_prices is None
+            else objective_export_prices
+        )
         allowed_slots = [False] * len(export_prices)
         # The eligibility mask must see the signed, unboosted rate, while the
         # LP must never receive a negative export revenue.  Keep those two
         # representations separate so a clamped zero cannot pass a zero-cent
         # Export Boost threshold.
-        result = [max(0.0, price) for price in export_prices]
+        result = [max(0.0, price) for price in objective_prices]
         if not self._entry:
             self._last_export_boost_allowed_slots = allowed_slots
             return result, allowed_slots
@@ -14357,7 +14415,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             if in_window and allowed_slots[t]:
                 real_price = export_prices[t]
-                boosted_price = max(real_price + offset, min_price)
+                boosted_price = max(objective_prices[t] + offset, min_price)
 
                 # Anti-arbitrage cap: only restrict the boost when it would
                 # create PHANTOM arbitrage that doesn't exist at real prices.
@@ -15944,6 +16002,15 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         For dynamic providers (Amber, Flow Power): reads from price_coordinator.
         For static TOU providers (GloBird, etc.): generates from tariff_schedule.
         """
+        self._pending_amber_forecast_confidence = {
+            "enabled": self.amber_forecast_confidence_enabled,
+            "used": False,
+            "reason": (
+                "disabled" if not self.amber_forecast_confidence_enabled
+                else "missing_price_source" if self._electricity_provider() == "amber"
+                else "provider_not_amber"
+            ),
+        }
         if self._electricity_provider() == "covau":
             return self._covau_price_forecast()
 
@@ -16315,6 +16382,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     export_slots: list[float | None] = [None] * n_steps
                     display_export_slots: list[float | None] = [None] * n_steps
                     export_write_cursor = 0
+                    amber_export_intervals: list[AmberPriceInterval] = []
                     for e in feed_in:
                         dur = e.get("duration", 30)
                         slot_bounds = self._entry_slot_bounds(
@@ -16350,6 +16418,19 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             continue
                         display_price = -raw_export_dollar
                         lp_price = max(0.0, display_price)
+                        try:
+                            source_start = datetime.fromisoformat(
+                                self._get_entry_start_time(e).replace("Z", "+00:00")
+                            )
+                        except (AttributeError, TypeError, ValueError):
+                            source_start = None
+                        amber_export_intervals.append(AmberPriceInterval(
+                            start_slot=start_idx,
+                            end_slot=end_idx,
+                            start=source_start,
+                            interval_type=e.get("type"),
+                            is_spike=e.get("spikeStatus") in ("spike", "potential") or e.get("descriptor") == "spike",
+                        ))
                         for pos in range(start_idx, end_idx):
                             export_slots[pos] = lp_price
                             display_export_slots[pos] = display_price
@@ -16461,10 +16542,32 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         chip_reference_export_prices = list(
                             self._last_settlement_export_prices
                         )
-                        export_prices, _ = self._apply_export_boost(
-                            self._last_settlement_export_prices,
-                            import_prices,
-                        )
+                        confidence_used = False
+                        if _provider == "amber" and self.amber_forecast_confidence_enabled:
+                            if epex_override is None and self._epex_export_source() != "custom_entity":
+                                weighted_slots, confidence_diagnostics = weight_amber_export_forecast(
+                                    export_slots, amber_export_intervals, now,
+                                )
+                                confidence_used = confidence_diagnostics["used"]
+                                if confidence_used:
+                                    export_prices = self._fill_price_gaps(weighted_slots)
+                            else:
+                                confidence_diagnostics = {"used": False, "reason": "custom_export_source"}
+                            self._pending_amber_forecast_confidence = {
+                                "enabled": True,
+                                **confidence_diagnostics,
+                            }
+                        if confidence_used:
+                            export_prices, _ = self._apply_export_boost(
+                                self._last_settlement_export_prices,
+                                import_prices,
+                                objective_export_prices=export_prices,
+                            )
+                        else:
+                            export_prices, _ = self._apply_export_boost(
+                                self._last_settlement_export_prices,
+                                import_prices,
+                            )
                         import_prices, export_prices = self._apply_saving_session_prices(import_prices, export_prices)
                         export_prices = self._apply_chip_mode(
                             export_prices,
@@ -16476,7 +16579,8 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
                         # Apply confidence decay for LP input.
                         decay_horizon = 12.0 if self._config.profit_max_enabled else 6.0
-                        if is_flow_power:
+                        if is_flow_power or confidence_used:
+                            # Amber confidence weighting replaces legacy export decay.
                             # Flow Power Happy Hour export is contractual, so keep
                             # the export schedule fixed. Import PEA forecasts still
                             # come from speculative wholesale forecasts and should
@@ -19981,6 +20085,8 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "engine": "built-in",
             "status_message": status_message,
             "cost_function": self._cost_function.value,
+            "amber_forecast_confidence_enabled": self.amber_forecast_confidence_enabled,
+            "amber_forecast_confidence": dict(getattr(self, "_last_amber_forecast_confidence", {})),
             "spread_export_enabled": self._config.spread_export_enabled,
             "spread_import_enabled": self._config.spread_import_enabled,
             "disable_idle_enabled": self.disable_idle_enabled,
@@ -20092,6 +20198,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 ),
                 "allow_grid_charge": self._config.allow_grid_charge,
                 "grid_charge_blackout_windows": self._grid_charge_blackout_windows(),
+                "amber_forecast_confidence_enabled": self.amber_forecast_confidence_enabled,
                 "spread_export_enabled": self._config.spread_export_enabled,
                 "spread_import_enabled": self._config.spread_import_enabled,
                 "disable_idle_enabled": self.disable_idle_enabled,
@@ -20584,6 +20691,8 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "error": "Profit Max and Cost Neutral cannot both be enabled",
                 "changes": [],
             }
+        if "amber_forecast_confidence_enabled" in settings and not isinstance(settings["amber_forecast_confidence_enabled"], bool):
+            return {"success": False, "error": "amber_forecast_confidence_enabled must be a boolean", "changes": []}
         rerun_after_settings = False
         charge_by_time_display_changed = False
 
@@ -21149,6 +21258,12 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 rerun_after_settings = True
                 charge_by_time_display_changed = True
+
+        if "amber_forecast_confidence_enabled" in settings:
+            changed = self.set_amber_forecast_confidence_enabled(settings["amber_forecast_confidence_enabled"])
+            if changed:
+                response["changes"].append(f"amber_forecast_confidence_enabled: {self.amber_forecast_confidence_enabled}")
+                rerun_after_settings = True
 
         if "spread_export_enabled" in settings:
             new_val = bool(settings["spread_export_enabled"])

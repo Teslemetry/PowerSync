@@ -211,3 +211,14 @@ def test_ev_planning_participation_is_owned_by_optimizer_options():
     optimizer_source = source[optimizer_start:optimizer_end]
     assert "CONF_OPTIMIZATION_EV_INTEGRATION" in optimizer_source
     assert "CONF_OPTIMIZATION_PLANNED_EV_LOAD_ENTITY" in optimizer_source
+
+
+def test_amber_confidence_is_optional_provider_scoped_and_owned_by_optimizer():
+    module = _load_module()
+    schema = module.optimizer_settings_schema()
+    assert schema['fields']['amber_forecast_confidence_enabled'] == {
+        'category': 'advanced', 'owner': 'optimizer',
+        'section': 'battery_forecast_inputs', 'order': 84,
+        'visible_if': {'electricity_provider': 'amber'},
+    }
+    assert 'amber_forecast_confidence_enabled' in module.optimizer_settings_groups()['advanced_optimizer']['fields']

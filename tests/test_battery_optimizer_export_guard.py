@@ -4853,3 +4853,48 @@ def test_greedy_future_load_reservation_uses_the_same_export_value_threshold(
     assert dear.lp_stats["battery_export_constraints"][
         "future_reserved_kwh"
     ] == pytest.approx(1.0, abs=1e-6)
+
+
+@pytest.mark.parametrize("terminal_weight", [0.0, 0.3])
+def test_amber_confidence_lp_captures_current_spike_and_retains_larger_later_value(battery_optimizer_module, terminal_weight):
+    import importlib.util
+    path = COMPONENT_ROOT / "optimization/price_forecast_confidence.py"
+    spec = importlib.util.spec_from_file_location("amber_lp_policy", path)
+    policy = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = policy
+    spec.loader.exec_module(policy)
+    now = datetime(2026, 5, 4, 0, 0, tzinfo=timezone.utc)
+    intervals = [policy.AmberPriceInterval(t, t + 1, now + timedelta(hours=t), "CurrentInterval" if t == 0 else "ForecastInterval") for t in range(5)]
+    optimizer = battery_optimizer_module.BatteryOptimizer(
+        capacity_wh=10000, max_charge_w=5000, max_discharge_w=5000,
+        max_grid_export_w=5000, efficiency=1.0, backup_reserve=0.2,
+        hardware_reserve=0.2, interval_minutes=60, horizon_hours=5,
+        terminal_weight=terminal_weight,
+    )
+    def solve(exports):
+        return optimizer.optimize(import_prices=[0.3] * 5, export_prices=exports,
+            solar_forecast=[0.0] * 5, load_forecast=[0.0] * 5,
+            current_soc=0.7, allow_grid_charge=False, allow_battery_export=True)
+    raw = [10.0, 0.05, 24.0, 0.05, 0.05]
+    old = solve(raw)
+    weighted, _ = policy.weight_amber_export_forecast(raw, intervals, now)
+    new = solve(weighted)
+    assert old.feasible and new.feasible
+    assert old.solver_used == new.solver_used == "highs"
+    assert old.grid_export_w[0] == pytest.approx(0.0, abs=1)
+    assert old.grid_export_w[2] > 4900
+    assert new.grid_export_w[0] > 4900
+    assert min(new.schedule.soc) >= 0.2 - 1e-5
+    assert max(new.grid_export_w) <= 5000 + 1e-5
+    assert max(new.grid_import_w) == pytest.approx(0.0, abs=1)
+    # At the original decision time, a genuinely larger later forecast is
+    # still valuable. When that interval becomes current it is undamped.
+    strong = [10.0, 0.05, 40.0, 0.05, 0.05]
+    strong_weighted, _ = policy.weight_amber_export_forecast(strong, intervals, now)
+    future = solve(strong_weighted)
+    assert future.grid_export_w[0] == pytest.approx(0, abs=1)
+    assert future.grid_export_w[2] > 4900
+    actual, _ = policy.weight_amber_export_forecast(strong, intervals, now + timedelta(hours=2))
+    assert actual[2] == 40.0
+    faded, _ = policy.weight_amber_export_forecast([10.0, 0.05, 0.05, 0.05, 0.05], intervals, now + timedelta(hours=1))
+    assert faded[2] == 0.05
