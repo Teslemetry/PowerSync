@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import math
 import sys
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -40,6 +41,7 @@ def _calendar_namespace() -> dict[str, Any]:
         "_calendar_period_range",
         "_calendar_range_includes_today",
         "_calendar_statistics_end_dt",
+        "_calendar_statistics_start_datetime",
         "_calendar_history_bucket_timestamp",
         "_calendar_time_series_from_state_history_rows",
         "_calendar_time_series_from_state_history",
@@ -87,7 +89,9 @@ def _calendar_namespace() -> dict[str, Any]:
         "Any": Any,
         "datetime": datetime,
         "timedelta": timedelta,
+        "timezone": timezone,
         "DOMAIN": "power_sync",
+        "math": math,
         "HomeAssistant": object,
         "dt_util": SimpleNamespace(
             now=lambda: datetime(2026, 5, 16, 12, 0, tzinfo=timezone.utc),
@@ -716,6 +720,60 @@ def test_month_without_long_term_statistics_skips_raw_history_fallback():
     assert history_source == "long_term_statistics_unavailable"
     assert len(rows) == 1
     assert rows[0]["solar_generation"] == 4_200
+
+
+def test_calendar_statistics_accept_numeric_starts_and_reject_invalid_values():
+    namespace = _calendar_namespace()
+    stamp = datetime(2026, 9, 16, 0, 0, tzinfo=timezone.utc)
+
+    assert namespace["_calendar_statistics_start_datetime"](
+        stamp.timestamp()
+    ) == stamp
+    assert namespace["_calendar_statistics_start_datetime"](stamp) is stamp
+    assert namespace["_calendar_statistics_start_datetime"](True) is None
+    assert namespace["_calendar_statistics_start_datetime"](math.nan) is None
+    assert namespace["_calendar_statistics_start_datetime"](math.inf) is None
+    assert namespace["_calendar_statistics_start_datetime"]("not-a-timestamp") is None
+
+
+def test_calendar_statistics_numeric_start_populates_historical_month():
+    namespace = _calendar_namespace()
+    namespace["dt_util"].now = lambda: datetime(
+        2026, 9, 19, 12, 0, tzinfo=timezone.utc
+    )
+    entity_id = "sensor.power_sync_daily_solar_energy"
+    entity_ids = {"solar_generation": entity_id}
+    namespace["_find_calendar_statistic_entity_ids"] = (
+        lambda hass, entry_id: entity_ids
+    )
+    hass = SimpleNamespace(states=_States({entity_id: _state("4.2")}))
+    coordinator = SimpleNamespace(
+        data={"energy_summary": {"pv_today_kwh": 4.2}}
+    )
+    historical_start = datetime(2026, 9, 16, tzinfo=timezone.utc)
+
+    def statistics(*_args: Any) -> dict[str, list[dict[str, Any]]]:
+        return {
+            entity_id: [
+                {"start": historical_start.timestamp(), "change": 12.5}
+            ]
+        }
+
+    with _fake_recorder_statistics(statistics):
+        rows, history_source = asyncio.run(
+            namespace["_calendar_time_series_from_statistics"](
+                hass,
+                "month",
+                "2026-09-18",
+                coordinator,
+                "entry-1",
+            )
+        )
+
+    assert history_source == "long_term_statistics"
+    assert len(rows) == 1
+    assert rows[0]["timestamp"] == historical_start.isoformat()
+    assert rows[0]["solar_generation"] == 12_500
 
 
 def test_calendar_statistic_finder_accepts_foxess_daily_battery_aliases():

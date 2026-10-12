@@ -6798,6 +6798,24 @@ def _calendar_history_bucket_timestamp(
     return bucket.isoformat()
 
 
+def _calendar_statistics_start_datetime(value: Any) -> datetime | None:
+    """Normalize a recorder statistic start to an aware UTC datetime."""
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, bool):
+        return None
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(timestamp):
+        return None
+    try:
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def _calendar_time_series_from_state_history_rows(
     history: dict[str, list[Any]],
     entity_to_field: dict[str, str],
@@ -7033,8 +7051,10 @@ async def _calendar_time_series_from_statistics(
                     change = stat_entry.get("change")
                     if change is None:
                         continue
-                    start = stat_entry.get("start")
-                    if not isinstance(start, datetime):
+                    start = _calendar_statistics_start_datetime(
+                        stat_entry.get("start")
+                    )
+                    if start is None:
                         continue
                     local_start = dt_util.as_local(start)
                     timestamp = local_start.isoformat()
