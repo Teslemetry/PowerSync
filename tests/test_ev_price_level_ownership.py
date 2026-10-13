@@ -8618,3 +8618,157 @@ def test_scheduled_cleanup_rechecks_alias_owner_after_await(monkeypatch, schedul
     assert [c.args[2]["vehicle_id"] for c in f.actions._action_stop_ev_charging_dynamic.await_args_list] == [first]
     assert f.scheduled.get_state()["last_decision"] == "released"
     assert f.ownership.get_ev_ownership(f.hass, f.entry, "ble_car")[1]["owner_mode"] == "manual"
+
+
+@pytest.mark.parametrize("charger_type,loadpoint", [("generic", "generic_ev"), ("ocpp", "ocpp_garage")])
+@pytest.mark.parametrize("guard", ["price", "battery"])
+@pytest.mark.parametrize("tracked", [False, True])
+def test_price_level_enforces_non_tesla_limits_on_plug_in_charging(
+    monkeypatch, fake_actions, charger_type, loadpoint, guard, tracked
+):
+    """Ticket #99: plug-in auto-start and late cloud starts obey the same limits."""
+    hass = _FakeHass(price_settings={"opportunity_price_cents": 18, "home_battery_minimum": 20})
+    entry = SimpleNamespace(entry_id="entry-1", data={}, options={
+        "generic_charger_enabled": charger_type == "generic",
+        "ocpp_enabled": charger_type == "ocpp", "ocpp_charger_id": "garage",
+        "generic_charger_switch_entity": "switch.zeekr_charge",
+        "generic_charger_status_entity": "sensor.zeekr_status",
+        "generic_charger_power_entity": "sensor.zeekr_power",
+    })
+    status_id = "sensor.zeekr_status" if charger_type == "generic" else "sensor.garage_status_connector"
+    hass.states._states[status_id] = SimpleNamespace(
+        entity_id=status_id, state="Charging", attributes={}, last_reported=datetime.now(timezone.utc)
+    )
+    monkeypatch.setattr(ev_planner, "discover_all_tesla_vehicles", _no_vehicles)
+    monkeypatch.setattr(ev_planner, "get_ev_location", AsyncMock(return_value="home"))
+    monkeypatch.setattr(ev_planner, "is_ev_plugged_in", AsyncMock(return_value=True))
+    executor = ev_planner.PriceLevelChargingExecutor(hass, entry)
+    executor._get_ev_soc = AsyncMock(return_value=88)
+    executor._get_home_battery_soc = AsyncMock(return_value=19 if guard == "battery" else 78)
+    executor.apply_preserve_home_battery = AsyncMock()
+    executor._start_charging = AsyncMock()
+    executor._get_or_create_vehicle_state(loadpoint).is_charging = tracked
+    fake_actions._action_stop_ev_charging_dynamic = AsyncMock(return_value=True)
+
+    results = asyncio.run(executor.evaluate_all_vehicles(5 if guard == "battery" else 28))
+
+    assert results[loadpoint][0] is False
+    fake_actions._action_stop_ev_charging_dynamic.assert_awaited_once()
+    params = fake_actions._action_stop_ev_charging_dynamic.call_args.args[2]
+    assert params["vehicle_id"] == loadpoint
+    assert params["charger_type"] == charger_type
+    if charger_type == "generic":
+        assert params["charger_switch_entity"] == "switch.zeekr_charge"
+    executor._start_charging.assert_not_awaited()
+
+
+@pytest.mark.parametrize("charger_type,loadpoint", [("generic", "generic_ev"), ("ocpp", "ocpp_garage")])
+@pytest.mark.parametrize("evidence,expected_stop", [("power", True), ("status", True), ("stale", False), ("other", False), ("switch", False), ("unknown", False)])
+def test_price_level_untracked_stop_requires_current_exact_charger_evidence(
+    monkeypatch, fake_actions, charger_type, loadpoint, evidence, expected_stop
+):
+    hass = _FakeHass()
+    entry = SimpleNamespace(entry_id="entry-1", data={}, options={
+        "generic_charger_enabled": charger_type == "generic", "ocpp_enabled": charger_type == "ocpp",
+        "ocpp_charger_id": "garage", "generic_charger_switch_entity": "switch.zeekr_charge",
+        "generic_charger_status_entity": "sensor.zeekr_status", "generic_charger_power_entity": "sensor.zeekr_power",
+    })
+    status = "sensor.zeekr_status" if charger_type == "generic" else "sensor.garage_status_connector"
+    power = "sensor.zeekr_power" if charger_type == "generic" else "sensor.garage_current_power"
+    if evidence == "other":
+        status, power = "sensor.other_status_connector", "sensor.other_current_power"
+    observed_at = datetime.now(timezone.utc) - timedelta(minutes=10 if evidence == "stale" else 0)
+    for entity_id, value in [(status, "Charging" if evidence in ("status", "stale", "other") else "unknown"),
+                             (power, "2.3" if evidence == "power" else "0"),
+                             ("switch.zeekr_charge", "on")]:
+        hass.states._states[entity_id] = SimpleNamespace(
+            entity_id=entity_id, state=value, attributes={"unit_of_measurement": "kW"}, last_reported=observed_at
+        )
+    monkeypatch.setattr(ev_planner, "discover_all_tesla_vehicles", _no_vehicles)
+    executor = ev_planner.PriceLevelChargingExecutor(hass, entry)
+    executor.get_charging_decision = AsyncMock(return_value=(False, "Price above threshold", ""))
+    executor.apply_preserve_home_battery = AsyncMock()
+    fake_actions._action_stop_ev_charging_dynamic = AsyncMock(return_value=True)
+
+    asyncio.run(executor.evaluate_all_vehicles(28))
+
+    assert fake_actions._action_stop_ev_charging_dynamic.await_count == int(expected_stop)
+
+
+@pytest.mark.parametrize("charger_type,loadpoint", [("generic", "generic_ev"), ("ocpp", "ocpp_garage")])
+@pytest.mark.parametrize("owner", ["yield", "manual", "smart_schedule", "solar_surplus", "away", "unplugged", "disabled"])
+def test_price_level_untracked_non_tesla_charge_preserves_ownership_and_scope(
+    monkeypatch, fake_actions, charger_type, loadpoint, owner
+):
+    hass = _FakeHass()
+    entry = SimpleNamespace(entry_id="entry-1", data={}, options={
+        "generic_charger_enabled": charger_type == "generic", "ocpp_enabled": charger_type == "ocpp",
+        "ocpp_charger_id": "garage", "generic_charger_switch_entity": "switch.zeekr_charge",
+        "generic_charger_status_entity": "sensor.zeekr_status",
+    })
+    status = "sensor.zeekr_status" if charger_type == "generic" else "sensor.garage_status_connector"
+    hass.states._states[status] = SimpleNamespace(
+        entity_id=status, state="Charging", attributes={}, last_reported=datetime.now(timezone.utc)
+    )
+    ownership = importlib.import_module("power_sync.automations.ev_ownership")
+    if owner == "yield":
+        _set_external_policy(hass, loadpoint, policy="yield")
+    elif owner not in ("away", "unplugged", "disabled"):
+        ownership.claim_ev_ownership(hass, entry, loadpoint, owner_mode=owner)
+    monkeypatch.setattr(ev_planner, "discover_all_tesla_vehicles", _no_vehicles)
+    executor = ev_planner.PriceLevelChargingExecutor(hass, entry)
+    executor._state.last_decision = owner if owner in ("away", "unplugged") else "waiting"
+    reason = "Price-level charging is disabled" if owner == "disabled" else "Price above threshold"
+    executor.get_charging_decision = AsyncMock(return_value=(False, reason, ""))
+    executor.apply_preserve_home_battery = AsyncMock()
+    fake_actions._action_stop_ev_charging_dynamic = AsyncMock(return_value=True)
+
+    asyncio.run(executor.evaluate_all_vehicles(28))
+
+    fake_actions._action_stop_ev_charging_dynamic.assert_not_awaited()
+    if owner == "yield":
+        assert ownership.get_ev_ownership(hass, entry, loadpoint)[1]["owner"] == "external"
+        assert executor._get_or_create_vehicle_state(loadpoint).last_decision == "external"
+
+
+@pytest.mark.parametrize("charger_type,loadpoint", [("generic", "generic_ev"), ("ocpp", "ocpp_garage")])
+def test_price_level_yields_eligible_untracked_non_tesla_charge(monkeypatch, fake_actions, charger_type, loadpoint):
+    hass = _FakeHass()
+    _set_external_policy(hass, loadpoint, policy="yield")
+    entry = SimpleNamespace(entry_id="entry-1", data={}, options={
+        "generic_charger_enabled": charger_type == "generic", "ocpp_enabled": charger_type == "ocpp",
+        "ocpp_charger_id": "garage", "generic_charger_status_entity": "sensor.zeekr_status",
+    })
+    status = "sensor.zeekr_status" if charger_type == "generic" else "sensor.garage_status_connector"
+    hass.states._states[status] = SimpleNamespace(entity_id=status, state="Charging", attributes={}, last_reported=datetime.now(timezone.utc))
+    monkeypatch.setattr(ev_planner, "discover_all_tesla_vehicles", _no_vehicles)
+    executor = ev_planner.PriceLevelChargingExecutor(hass, entry)
+    executor.get_charging_decision = AsyncMock(return_value=(True, "Cheap price", "price_level_opportunity"))
+    executor.apply_preserve_home_battery = AsyncMock()
+    executor._start_charging = AsyncMock()
+    fake_actions._action_stop_ev_charging_dynamic = AsyncMock()
+
+    asyncio.run(executor.evaluate_all_vehicles(5))
+
+    executor._start_charging.assert_not_awaited()
+    fake_actions._action_stop_ev_charging_dynamic.assert_not_awaited()
+    assert executor._get_or_create_vehicle_state(loadpoint).last_decision == "external"
+
+
+@pytest.mark.parametrize("disabled", [False, True])
+def test_price_level_cancels_pending_generic_start_when_price_becomes_ineligible(monkeypatch, fake_actions, disabled):
+    hass = _FakeHass()
+    pending = {"cancelled": False}
+    hass.data["power_sync"]["entry-1"]["_pending_generic_ev_starts"] = {"generic_ev": pending}
+    entry = SimpleNamespace(entry_id="entry-1", data={}, options={"generic_charger_enabled": True})
+    monkeypatch.setattr(ev_planner, "discover_all_tesla_vehicles", _no_vehicles)
+    executor = ev_planner.PriceLevelChargingExecutor(hass, entry)
+    reason = "Price-level charging is disabled" if disabled else "Price above threshold"
+    executor.get_charging_decision = AsyncMock(return_value=(False, reason, ""))
+    executor.apply_preserve_home_battery = AsyncMock()
+    fake_actions._action_stop_ev_charging_dynamic = AsyncMock(return_value=True)
+
+    asyncio.run(executor.evaluate_all_vehicles(28))
+
+    fake_actions._action_stop_ev_charging_dynamic.assert_awaited_once()
+    assert fake_actions._action_stop_ev_charging_dynamic.call_args.args[2]["vehicle_id"] == "generic_ev"

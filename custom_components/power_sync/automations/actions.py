@@ -44,6 +44,8 @@ from homeassistant.util import dt as dt_util
 from ..const import (
     DOMAIN,
     CONF_EV_PROVIDER,
+    CONF_GENERIC_CHARGER_START_CONFIRMATION_TIMEOUT,
+    DEFAULT_GENERIC_CHARGER_START_CONFIRMATION_TIMEOUT,
     EV_PROVIDER_FLEET_API,
     EV_PROVIDER_TESLA_BLE,
     EV_PROVIDER_TESLEMETRY_BT,
@@ -481,7 +483,7 @@ async def _start_generic_charger_switch(
 
 # Cloud-backed HA entities can lag an accepted start by tens of seconds.
 # Keep the request pending without replaying it or publishing a managed session.
-_GENERIC_START_CONFIRMATION_TIMEOUT_SECONDS = 60
+_GENERIC_START_CONFIRMATION_TIMEOUT_SECONDS = DEFAULT_GENERIC_CHARGER_START_CONFIRMATION_TIMEOUT
 _GENERIC_START_CONFIRMATION_POLL_SECONDS = 1
 _GENERIC_ACTIVE_POWER_EPSILON_KW = 0.05
 
@@ -539,13 +541,24 @@ async def _wait_for_generic_physical_start(
     ):
         return False, "no Generic charger status or power readback entity is configured"
 
+    private_override = "_generic_start_confirmation_timeout_seconds" in params
     timeout_seconds = params.get(
-        "_generic_start_confirmation_timeout_seconds",
+        "_generic_start_confirmation_timeout_seconds"
+        if private_override else CONF_GENERIC_CHARGER_START_CONFIRMATION_TIMEOUT,
         _GENERIC_START_CONFIRMATION_TIMEOUT_SECONDS,
     )
     try:
-        timeout_seconds = max(0.0, float(timeout_seconds))
-    except (TypeError, ValueError):
+        if isinstance(timeout_seconds, bool):
+            raise ValueError("confirmation timeout must be numeric")
+        timeout_seconds = float(timeout_seconds)
+        if not math.isfinite(timeout_seconds):
+            raise ValueError("confirmation timeout must be finite")
+        if private_override:
+            # Preserve the private zero-duration hook used by focused tests.
+            timeout_seconds = max(0.0, timeout_seconds)
+        elif not 30 <= timeout_seconds <= 300:
+            raise ValueError("confirmation timeout must be between 30 and 300 seconds")
+    except (TypeError, ValueError, OverflowError):
         timeout_seconds = _GENERIC_START_CONFIRMATION_TIMEOUT_SECONDS
 
     loop = asyncio.get_running_loop()
@@ -7568,16 +7581,46 @@ async def _set_vehicle_amps_unchecked(
                     return False
                 if confirmation_started_at is not None:
                     confirmed = False
+                    confirmation_params = dict(params)
+                    entry_options = getattr(config_entry, "options", {}) or {}
+                    entry_data = getattr(config_entry, "data", {}) or {}
+                    confirmation_params.setdefault(
+                        CONF_GENERIC_CHARGER_START_CONFIRMATION_TIMEOUT,
+                        entry_options.get(
+                            CONF_GENERIC_CHARGER_START_CONFIRMATION_TIMEOUT,
+                            entry_data.get(
+                                CONF_GENERIC_CHARGER_START_CONFIRMATION_TIMEOUT,
+                                DEFAULT_GENERIC_CHARGER_START_CONFIRMATION_TIMEOUT,
+                            ),
+                        ),
+                    )
                     try:
                         confirmed, evidence = await _wait_for_generic_physical_start(
                             hass,
-                            params,
+                            confirmation_params,
                             confirmation_started_at,
                         )
                     finally:
-                        # Cancellation during cloud settlement must compensate
-                        # the accepted start before propagating to the caller.
-                        if not confirmed:
+                        # Compensate an unconfirmed accepted start unless another
+                        # owner took over while cloud feedback was pending.
+                        cleanup_allowed = True
+                        if not confirmed and config_entry is not None:
+                            from .ev_ownership import (
+                                can_take_over_ev_ownership,
+                                get_ev_ownership,
+                            )
+
+                            _lease_id, lease = get_ev_ownership(
+                                hass, config_entry, vehicle_id
+                            )
+                            if lease is not None:
+                                cleanup_allowed = can_take_over_ev_ownership(
+                                    lease.get("owner_mode"),
+                                    params.get("owner_mode")
+                                    or params.get("dynamic_mode", "battery_target"),
+                                    allow_takeover=bool(params.get("allow_ownership_takeover", False)),
+                                )
+                        if not confirmed and cleanup_allowed:
                             cleanup_params = dict(params)
                             cleanup_params.pop("require_physical_start_confirmation", None)
                             try:

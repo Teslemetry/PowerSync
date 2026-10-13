@@ -479,6 +479,8 @@ from .const import (
     CONF_GENERIC_CHARGER_AMPS_ENTITY,
     CONF_GENERIC_CHARGER_STATUS_ENTITY,
     CONF_GENERIC_CHARGER_POWER_ENTITY,
+    CONF_GENERIC_CHARGER_START_CONFIRMATION_TIMEOUT,
+    DEFAULT_GENERIC_CHARGER_START_CONFIRMATION_TIMEOUT,
     CONF_GENERIC_CHARGER_SOC_ENTITY,
     CONF_GENERIC_CHARGER_SOC_ENTITY_2,
     CONF_GENERIC_CHARGER_BATTERY_CAPACITY_KWH,
@@ -1126,6 +1128,19 @@ def _stored_normalized_price_to_cents(value: Any) -> float:
     except (TypeError, ValueError):
         return 0.0
     return max(0.0, amount) * 100.0
+
+
+def _validate_generic_charger_confirmation_timeout(value: Any) -> float:
+    """Validate a finite, bounded charger feedback window before saving it."""
+    if isinstance(value, bool):
+        raise ValueError("Use a number between 30 and 300 seconds")
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("Use a number between 30 and 300 seconds") from exc
+    if not 30 <= seconds <= 300:
+        raise ValueError("Use a number between 30 and 300 seconds")
+    return seconds
 
 
 def _normalize_optional_entity(value: Any) -> str | None:
@@ -15674,6 +15689,15 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
         """Step for EV Charging and OCPP configuration."""
         errors: dict[str, str] = {}
         if user_input is not None:
+            if CONF_GENERIC_CHARGER_START_CONFIRMATION_TIMEOUT in user_input:
+                try:
+                    _validate_generic_charger_confirmation_timeout(
+                        user_input[CONF_GENERIC_CHARGER_START_CONFIRMATION_TIMEOUT]
+                    )
+                except ValueError:
+                    errors[CONF_GENERIC_CHARGER_START_CONFIRMATION_TIMEOUT] = (
+                        "invalid_generic_charger_confirmation_timeout"
+                    )
             try:
                 vehicle_mapping = parse_tesla_ble_vehicle_mapping(
                     user_input.get(CONF_TESLA_BLE_VEHICLE_MAPPING)
@@ -15713,6 +15737,15 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
         current_generic_capacity = self._get_option(
             CONF_GENERIC_CHARGER_BATTERY_CAPACITY_KWH, None
         )
+        try:
+            current_generic_confirmation_timeout = _validate_generic_charger_confirmation_timeout(
+                self._get_option(
+                    CONF_GENERIC_CHARGER_START_CONFIRMATION_TIMEOUT,
+                    DEFAULT_GENERIC_CHARGER_START_CONFIRMATION_TIMEOUT,
+                )
+            )
+        except ValueError:
+            current_generic_confirmation_timeout = DEFAULT_GENERIC_CHARGER_START_CONFIRMATION_TIMEOUT
         current_generic_switch_entity = _normalize_optional_entity(
             self._get_option(CONF_GENERIC_CHARGER_SWITCH_ENTITY)
         )
@@ -15784,6 +15817,13 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                 default=self._get_option(CONF_ZAPTEC_STANDALONE_ENABLED, False),
             ): BooleanSelector(),
             # Generic charger
+            vol.Optional(
+                CONF_GENERIC_CHARGER_START_CONFIRMATION_TIMEOUT,
+                default=current_generic_confirmation_timeout,
+            ): NumberSelector(NumberSelectorConfig(
+                min=30, max=300, step=1, unit_of_measurement="s",
+                mode=NumberSelectorMode.BOX,
+            )),
             vol.Optional(
                 CONF_GENERIC_CHARGER_ENABLED,
                 default=self._get_option(CONF_GENERIC_CHARGER_ENABLED, False),
@@ -16113,6 +16153,13 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
             CONF_GENERIC_CHARGER_SOC_ENTITY_2, ""
         ).strip()
         generic_capacity = ev_input.get(CONF_GENERIC_CHARGER_BATTERY_CAPACITY_KWH)
+        final_data[CONF_GENERIC_CHARGER_START_CONFIRMATION_TIMEOUT] = ev_input.get(
+            CONF_GENERIC_CHARGER_START_CONFIRMATION_TIMEOUT,
+            self._get_option(
+                CONF_GENERIC_CHARGER_START_CONFIRMATION_TIMEOUT,
+                DEFAULT_GENERIC_CHARGER_START_CONFIRMATION_TIMEOUT,
+            ),
+        )
         if generic_capacity is None:
             final_data.pop(CONF_GENERIC_CHARGER_BATTERY_CAPACITY_KWH, None)
         else:

@@ -3477,3 +3477,45 @@ def test_ev_load_management_step_clears_removed_phase_sensors():
     # so a plain {**current, **user_input} merge could never clear a sensor.
     assert '{**{key: "" for key in phase_entity_keys}, **user_input}' in step_source
     assert "{**current, **submitted}" in step_source
+
+
+def test_generic_confirmation_timeout_options_save_round_trip():
+    """Keep a saved charger timeout when older clients omit the new form field."""
+    key = "generic_charger_start_confirmation_timeout_seconds"
+    method = _options_flow_method("_save_ev_options")
+    assignment = next(node for node in method.body if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Subscript) and isinstance(target.slice, ast.Name)
+                and target.slice.id == "CONF_GENERIC_CHARGER_START_CONFIRMATION_TIMEOUT"
+                for target in node.targets))
+    module = ast.Module(body=[assignment], type_ignores=[])
+    for submitted, saved, expected in [({key: 60}, 180, 60), ({}, 180, 180), ({}, None, 150)]:
+        data = {"unrelated_option": "preserved"}
+        namespace = {"ev_input": submitted, "final_data": data,
+            "CONF_GENERIC_CHARGER_START_CONFIRMATION_TIMEOUT": key,
+            "DEFAULT_GENERIC_CHARGER_START_CONFIRMATION_TIMEOUT": 150,
+            "self": SimpleNamespace(_get_option=lambda name, default: saved if saved is not None else default)}
+        exec(compile(module, str(CONFIG_FLOW_PATH), "exec"), namespace)
+        assert data == {"unrelated_option": "preserved", key: expected}
+
+
+def test_generic_confirmation_timeout_has_translated_form_help():
+    key = "generic_charger_start_confirmation_timeout_seconds"
+    for path in (STRINGS_PATH, TRANSLATIONS_PATH):
+        payload = json.loads(path.read_text())
+        for step_name in ("ev_charging_setup", "ev_charging"):
+            form = payload["options"]["step"][step_name]
+            assert key in form["data"]
+            assert "150" in form["data_description"][key]
+            assert "30–300" in form["data_description"][key]
+
+
+
+def test_generic_confirmation_timeout_validation_rejects_unbounded_saved_input():
+    import pytest
+
+    validate = _run_top_level_function("_validate_generic_charger_confirmation_timeout")
+    for value in (30, 150, 300, "60"):
+        assert validate(value) == float(value)
+    for value in (None, True, "invalid", 29, 301, float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            validate(value)

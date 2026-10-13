@@ -4639,10 +4639,11 @@ def test_generic_dynamic_start_promotes_only_fresh_physical_readback():
 
 @pytest.mark.parametrize("readback", [
     "status", "power", "stale", "none", "cancel", "stop", "stop_all",
-    "stop_other", "ownership",
+    "stop_other", "ownership", "ownership_timeout", "ownership_cancel",
+    "options_timeout", "data_timeout",
 ])
 def test_generic_cloud_start_settles_delayed_readback_safely(monkeypatch, readback):
-    """Cloud feedback at 45s must settle before session/ownership promotion."""
+    """Cloud feedback at 86s must settle before session/ownership promotion."""
     now = datetime.now(timezone.utc) - timedelta(minutes=1)
     status = _State("sensor.garage_ev_status", "Preparing", last_updated=now)
     power = _State("sensor.garage_ev_power", "0",
@@ -4657,12 +4658,18 @@ def test_generic_cloud_start_settles_delayed_readback_safely(monkeypatch, readba
         "charger_power_entity": power.entity_id,
         "require_physical_start_confirmation": True,
     }
+    entry = _Entry()
+    if readback == "options_timeout":
+        entry.data = {actions.CONF_GENERIC_CHARGER_START_CONFIRMATION_TIMEOUT: 300}
+        entry.options = {actions.CONF_GENERIC_CHARGER_START_CONFIRMATION_TIMEOUT: 60}
+    elif readback == "data_timeout":
+        entry.data = {actions.CONF_GENERIC_CHARGER_START_CONFIRMATION_TIMEOUT: 60}
     elapsed = 0.0
 
     async def advance_cloud_poll(seconds):
         nonlocal elapsed
         assert actions._dynamic_ev_state == {}
-        if readback != "ownership" or elapsed < 10:
+        if not readback.startswith("ownership") or elapsed < 10:
             assert hass.data["power_sync"]["entry-1"].get("ev_ownership") in (None, {})
         assert hass.services.calls == [
             ("switch", "turn_on", {"entity_id": "switch.garage_ev"})
@@ -4677,10 +4684,12 @@ def test_generic_cloud_start_settles_delayed_readback_safely(monkeypatch, readba
                 }
             )
             await actions._action_stop_ev_charging_dynamic(hass, _Entry(), stop_params)
-        if elapsed == 10 and readback == "ownership":
+        if elapsed == 10 and readback.startswith("ownership"):
             from power_sync.automations.ev_ownership import claim_ev_ownership
             claim_ev_ownership(hass, _Entry(), "_default", owner_mode="manual")
-        if elapsed >= 45:
+            if readback == "ownership_cancel":
+                raise asyncio.CancelledError
+        if elapsed >= 86:
             if readback in ("status", "stale", "stop_other", "ownership"):
                 status.state = "Charging"
                 if readback != "stale":
@@ -4694,9 +4703,9 @@ def test_generic_cloud_start_settles_delayed_readback_safely(monkeypatch, readba
             patch.setattr(actions.asyncio, "get_running_loop",
                           lambda: SimpleNamespace(time=lambda: elapsed))
             patch.setattr(actions.asyncio, "sleep", advance_cloud_poll)
-            return await actions._action_start_ev_charging_dynamic(hass, _Entry(), params)
+            return await actions._action_start_ev_charging_dynamic(hass, entry, params)
 
-    if readback == "cancel":
+    if readback in ("cancel", "ownership_cancel"):
         with pytest.raises(asyncio.CancelledError):
             asyncio.run(run_start())
     else:
@@ -4704,26 +4713,67 @@ def test_generic_cloud_start_settles_delayed_readback_safely(monkeypatch, readba
         assert result is (readback in ("status", "power", "stop_other"))
 
     assert hass.data["power_sync"]["entry-1"].get("_pending_generic_ev_starts") == {}
-    if readback == "ownership":
+    if readback.startswith("ownership"):
         from power_sync.automations.ev_ownership import get_ev_ownership
         assert actions._dynamic_ev_state == {}
         assert get_ev_ownership(hass, _Entry(), "_default")[1]["owner_mode"] == "manual"
         assert len(hass.services.calls) == 1
+        assert elapsed == {"ownership": 86, "ownership_timeout": 150,
+                           "ownership_cancel": 10}[readback]
     elif readback in ("status", "power", "stop_other"):
-        assert elapsed == 45
+        assert elapsed == 86
         assert actions._dynamic_ev_state["entry-1"]["_default"]["active"] is True
         assert len(hass.services.calls) == 1
     else:
         if readback in ("stop", "stop_all"):
             assert elapsed == 10
-        elif readback != "cancel":
+        elif readback in ("options_timeout", "data_timeout"):
             assert elapsed == 60
+        elif readback != "cancel":
+            assert elapsed == 150
         assert actions._dynamic_ev_state == {}
         assert hass.data["power_sync"]["entry-1"].get("ev_ownership") in (None, {})
         assert hass.services.calls == [
             ("switch", "turn_on", {"entity_id": "switch.garage_ev"}),
             ("switch", "turn_off", {"entity_id": "switch.garage_ev"}),
         ]
+
+
+@pytest.mark.parametrize("configured, expected", [
+    (30, 30), ("60", 60), (300, 300),
+    (29, 150), (301, 150), (None, 150), (True, 150),
+    ("invalid", 150), (float("nan"), 150), (float("inf"), 150),
+])
+def test_generic_start_confirmation_runtime_timeout_is_bounded(
+    monkeypatch, configured, expected,
+):
+    """Invalid saved values retain a finite wait without confirming stale draw."""
+    now = datetime.now(timezone.utc)
+    hass = _Hass([_State(
+        "sensor.garage_ev_power", "1800", {"unit_of_measurement": "W"},
+        last_updated=now - timedelta(seconds=1),
+    )])
+    elapsed = 0.0
+
+    async def advance_poll(seconds):
+        nonlocal elapsed
+        elapsed += seconds
+
+    async def wait():
+        with monkeypatch.context() as patch:
+            patch.setattr(actions.asyncio, "get_running_loop",
+                          lambda: SimpleNamespace(time=lambda: elapsed))
+            patch.setattr(actions.asyncio, "sleep", advance_poll)
+            return await actions._wait_for_generic_physical_start(
+                hass,
+                {"charger_power_entity": "sensor.garage_ev_power",
+                 actions.CONF_GENERIC_CHARGER_START_CONFIRMATION_TIMEOUT: configured},
+                now,
+            )
+
+    confirmed, _evidence = asyncio.run(wait())
+    assert confirmed is False
+    assert elapsed == expected
 
 
 def test_generic_setup_telemetry_cannot_confirm_later_switch_start():

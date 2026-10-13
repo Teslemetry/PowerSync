@@ -10703,6 +10703,86 @@ class PriceLevelChargingExecutor:
         vehicle_state.last_decision_reason = decision.reason
         return decision.should_charge, decision.reason, decision.mode
 
+    async def _evaluate_non_tesla_loadpoint(
+        self,
+        loadpoint_id: str,
+        current_price_cents: Optional[float],
+    ) -> Tuple[bool, str, str]:
+        """Reconcile tracked and plug-in starts against the same Price-Level policy."""
+        decision = await self.get_charging_decision(current_price_cents)
+        should_charge, reason, mode = decision
+        state = self._get_or_create_vehicle_state(loadpoint_id)
+        if self._state.last_decision in AWAY_EV_DECISIONS:
+            state.last_decision = self._state.last_decision
+            state.last_decision_reason = reason
+        else:
+            enabled = reason != "Price-level charging is disabled"
+            pending = self.hass.data.get(self._domain, {}).get(
+                self.config_entry.entry_id, {}
+            ).get("_pending_generic_ev_starts", {}).get(loadpoint_id)
+            untracked_charge = (
+                enabled and not state.is_charging and not pending
+                and self._has_current_non_tesla_charge(loadpoint_id)
+            )
+            if untracked_charge and _claim_external_charging_ownership(
+                self.hass, self.config_entry, loadpoint_id,
+                reason="Charger started outside PowerSync Price-Level",
+            ):
+                state.last_decision = "external"
+                state.last_decision_reason = f"{reason}; external charging controls this session"
+            elif should_charge and not state.is_charging:
+                await self._start_charging(mode, reason, vehicle_vin=loadpoint_id)
+            elif not should_charge and state.is_charging:
+                await self._stop_charging(reason, vehicle_vin=loadpoint_id)
+            elif not should_charge and (pending or (enabled and untracked_charge)):
+                # The action seam rechecks ownership before dispatch. A pending
+                # start belongs to PowerSync and must be cancellable even before
+                # the cloud publishes positive charging telemetry.
+                await self._stop_charging(reason, vehicle_vin=loadpoint_id)
+            else:
+                state.last_decision = "charging" if state.is_charging else "waiting"
+                state.last_decision_reason = reason
+        await self.apply_preserve_home_battery(state.is_charging, reason)
+        return decision
+
+    def _has_current_non_tesla_charge(self, loadpoint_id: str) -> bool:
+        """Read exact configured charger telemetry; switch-on is not delivered power."""
+        from .ocpp_status import OCPP_POWER_SUFFIXES, normalize_ocpp_status
+
+        opts = {**self.config_entry.data, **self.config_entry.options}
+        params = _build_dynamic_stop_params(
+            self.hass, self._domain, self.config_entry, opts,
+            vehicle_vin=loadpoint_id,
+        )
+        if params.get("charger_type") == "generic":
+            status_ids = [params.get("charger_status_entity")]
+            power_ids = [params.get("charger_power_entity")]
+        elif params.get("charger_type") == "ocpp":
+            prefix = params.get("ocpp_charger_id")
+            if not prefix:
+                return False
+            status_ids = [f"sensor.{prefix}_status_connector", f"sensor.{prefix}_status"]
+            power_ids = [f"sensor.{prefix}{suffix}" for suffix in OCPP_POWER_SUFFIXES]
+        else:
+            return False
+
+        for entity_id in status_ids + power_ids:
+            entity = self.hass.states.get(entity_id) if entity_id else None
+            if entity is None or not is_current_ev_power_observation(
+                getattr(entity, "last_reported", None)
+                or getattr(entity, "last_updated", None)
+                or getattr(entity, "last_changed", None)
+            ):
+                continue
+            if entity_id in status_ids:
+                if normalize_ocpp_status(entity.state) == "charging":
+                    return True
+            else:
+                power_w = _state_power_w(entity)
+                if power_w is not None and math.isfinite(power_w) and power_w > 50:
+                    return True
+        return False
+
     async def evaluate_all_vehicles(
         self,
         current_price_cents: Optional[float]
@@ -10775,8 +10855,6 @@ class PriceLevelChargingExecutor:
                 CONF_SIGENERGY_CHARGER_ENABLED,
             )
             if opts.get(CONF_OCPP_ENABLED):
-                decision = await self.get_charging_decision(current_price_cents)
-                should_charge, reason, mode = decision
                 # vehicle_id of the form "ocpp_<charger_id>" so price-level
                 # initiated sessions share an identifier with the OCPP poll's
                 # session tracker — prevents double-counted sessions when both
@@ -10786,22 +10864,9 @@ class PriceLevelChargingExecutor:
                     opts.get("ocpp_charger_id"),
                 )
                 pseudo_vin = f"ocpp_{ocpp_charger_id}"
-                results[pseudo_vin] = decision
-
-                vehicle_state = self._get_or_create_vehicle_state(pseudo_vin)
-                _LOGGER.debug(
-                    f"OCPP charger decision: should_charge={should_charge}, reason={reason}"
+                results[pseudo_vin] = await self._evaluate_non_tesla_loadpoint(
+                    pseudo_vin, current_price_cents
                 )
-
-                if should_charge and not vehicle_state.is_charging:
-                    await self._start_charging(mode, reason, vehicle_vin=pseudo_vin)
-                elif not should_charge and vehicle_state.is_charging:
-                    await self._stop_charging(reason, vehicle_vin=pseudo_vin)
-                else:
-                    vehicle_state.last_decision = "charging" if vehicle_state.is_charging else "waiting"
-                    vehicle_state.last_decision_reason = reason
-
-                await self.apply_preserve_home_battery(vehicle_state.is_charging, reason)
                 return results
 
             if opts.get(CONF_SIGENERGY_CHARGER_ENABLED):
@@ -10828,25 +10893,10 @@ class PriceLevelChargingExecutor:
 
             # Also check Generic Charger (OCPP via lbbrhzn/ocpp or any switch-based charger)
             if opts.get(CONF_GENERIC_CHARGER_ENABLED):
-                decision = await self.get_charging_decision(current_price_cents)
-                should_charge, reason, mode = decision
                 pseudo_vin = "generic_ev"
-                results[pseudo_vin] = decision
-
-                vehicle_state = self._get_or_create_vehicle_state(pseudo_vin)
-                _LOGGER.debug(
-                    f"Generic Charger decision: should_charge={should_charge}, reason={reason}"
+                results[pseudo_vin] = await self._evaluate_non_tesla_loadpoint(
+                    pseudo_vin, current_price_cents
                 )
-
-                if should_charge and not vehicle_state.is_charging:
-                    await self._start_charging(mode, reason, vehicle_vin=pseudo_vin)
-                elif not should_charge and vehicle_state.is_charging:
-                    await self._stop_charging(reason, vehicle_vin=pseudo_vin)
-                else:
-                    vehicle_state.last_decision = "charging" if vehicle_state.is_charging else "waiting"
-                    vehicle_state.last_decision_reason = reason
-
-                await self.apply_preserve_home_battery(vehicle_state.is_charging, reason)
                 return results
 
             _LOGGER.debug("No Tesla vehicles discovered for multi-vehicle evaluation")
