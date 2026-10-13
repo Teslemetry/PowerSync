@@ -44664,6 +44664,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
     # Register HTTP endpoints for Smart Optimization
+    from .licensing.views import LicensingStatusView, licensing_status
+    licensing_status(hass)  # Shadow while recovery integration and rollout checks are completed.
+    hass.http.register_view(LicensingStatusView(hass))
     hass.http.register_view(OptimizationView(hass))
     hass.http.register_view(OptimizationSettingsView(hass))
     hass.http.register_view(OptimizationAISummaryView(hass))
@@ -44809,6 +44812,9 @@ class OptimizationView(HomeAssistantView):
             })
 
         api_data = opt_coordinator.get_api_data()
+        if license_admission := self._hass.data.get("power_sync_licensing"):
+            api_data["licensing"] = license_admission.api_status()
+            api_data.setdefault("features", {})["licensing_v1"] = True
         api_data.setdefault("features", {})["ai_summary"] = True
         service = _optimization_ai_service(
             self._hass,
