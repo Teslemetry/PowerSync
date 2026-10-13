@@ -9207,6 +9207,8 @@ class BatteryOptimizer:
             available_kwh = battery_export_w / 1000.0 * self.dt_hours
             allowed_bonus_kwh = 0.0
             allowed_base_kwh = 0.0
+            remaining_before_battery = remaining
+            bonus_remaining_before_battery = bonus_remaining
             if remaining > 0 and bonus_price > 0 and bonus_remaining > 0:
                 bonus_unit_value = base_price + bonus_price
                 if bonus_unit_value > 0:
@@ -9228,14 +9230,26 @@ class BatteryOptimizer:
                 remaining = max(
                     0.0, remaining - allowed_base_kwh * base_price
                 )
-            bonus_remaining_by_group[group] = bonus_remaining
             allowed_export_w = (
                 allowed_bonus_kwh + allowed_base_kwh
             ) / max(self.dt_hours, 1e-12) * 1000.0
-            earned = (
-                allowed_bonus_kwh * (base_price + bonus_price)
-                + allowed_base_kwh * base_price
-            )
+            emitted_export_w = round(allowed_export_w, 1)
+            if emitted_export_w <= ACTION_THRESHOLD_W:
+                # The rounded action cannot execute as an export command. Do
+                # not spend settlement credit on energy that is removed from
+                # the emitted flow, and keep only the natural home discharge.
+                allowed_bonus_kwh = 0.0
+                allowed_base_kwh = 0.0
+                allowed_export_w = 0.0
+                remaining = remaining_before_battery
+                bonus_remaining = bonus_remaining_before_battery
+                earned = 0.0
+            else:
+                    earned = (
+                        allowed_bonus_kwh * (base_price + bonus_price)
+                        + allowed_base_kwh * base_price
+                    )
+            bonus_remaining_by_group[group] = bonus_remaining
             planned_earnings += earned
             remaining_by_day[day] = remaining
             if planned_earnings_by_day is not None:
@@ -9245,7 +9259,7 @@ class BatteryOptimizer:
             new_discharge_w = min(discharge_w, net_home_w) + allowed_export_w
             emitted_action = action.action
             power_w = float(action.power_w or 0.0)
-            if allowed_export_w <= ACTION_THRESHOLD_W:
+            if emitted_export_w <= ACTION_THRESHOLD_W:
                 emitted_action = "self_consumption"
                 power_w = min(new_discharge_w, net_home_w)
             else:
@@ -9540,11 +9554,13 @@ class BatteryOptimizer:
                         net_home_w,
                     )
                     battery_export_w = max(0.0, discharge_w - home_discharge_w)
+                    emitted_battery_export_w = round(battery_export_w, 1)
                     if (
-                        battery_export_w <= ACTION_THRESHOLD_W
+                        emitted_battery_export_w <= ACTION_THRESHOLD_W
                         and action.control_source != "manual"
                     ):
                         emitted_action = "self_consumption"
+                        discharge_w = home_discharge_w
                         power_w = discharge_w
                     else:
                         power_w = battery_export_w

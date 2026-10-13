@@ -873,6 +873,151 @@ def test_final_schedule_guard_trims_overlay_without_touching_home_discharge(
     assert trimmed.actions[0].power_w == pytest.approx(500.0)
 
 
+@pytest.mark.parametrize(
+    ("battery_export_w", "expected_action"),
+    [
+        (99.9, "self_consumption"),
+        (100.0, "self_consumption"),
+        (100.01, "self_consumption"),
+        (100.1, "export"),
+    ],
+)
+def test_reconcile_uses_emitted_export_threshold(
+    optimizer_module,
+    battery_export_w,
+    expected_action,
+):
+    """Rounded sub-threshold export must not survive as an export action."""
+    module = optimizer_module
+    optimizer = _optimizer(module)
+    optimizer.interval_minutes = 5
+    optimizer.dt_hours = 5 / 60
+    start = _timestamps(1)[0]
+    schedule = module.OptimizationSchedule(
+        actions=[module.ScheduleAction(
+            timestamp=start,
+            action="export",
+            power_w=battery_export_w,
+            soc=0.5,
+            battery_discharge_w=2_000.0 + battery_export_w,
+        )],
+        predicted_cost=0.0,
+        predicted_savings=0.0,
+        last_updated=start,
+    )
+
+    reconciled = optimizer.reconcile_result_with_schedule(
+        module.OptimizerResult(schedule=schedule),
+        schedule,
+        import_prices=[0.20],
+        export_prices=[0.10],
+        solar=[0.0],
+        load=[2.0],
+        initial_soc=0.5,
+    )
+
+    action = reconciled.schedule.actions[0]
+    assert action.action == expected_action
+    if expected_action == "self_consumption":
+        assert action.battery_discharge_w == pytest.approx(2_000.0)
+        assert reconciled.grid_export_w == pytest.approx([0.0])
+        assert reconciled.battery_to_grid_w == pytest.approx([0.0])
+    else:
+        assert action.battery_discharge_w == pytest.approx(
+            2_000.0 + battery_export_w
+        )
+        assert reconciled.grid_export_w == pytest.approx([battery_export_w])
+        assert reconciled.battery_to_grid_w == pytest.approx([battery_export_w])
+
+
+def test_cost_neutral_subthreshold_export_does_not_consume_earnings_cap(
+    optimizer_module,
+):
+    """A converted export is not physical export and earns no settlement credit."""
+    module = optimizer_module
+    optimizer = _optimizer(module)
+    optimizer.interval_minutes = 5
+    optimizer.dt_hours = 5 / 60
+    start = _timestamps(1)[0]
+    schedule = module.OptimizationSchedule(
+        actions=[module.ScheduleAction(
+            timestamp=start,
+            action="export",
+            power_w=100.0,
+            soc=0.5,
+            battery_discharge_w=2_100.0,
+        )],
+        predicted_cost=0.0,
+        predicted_savings=0.0,
+        last_updated=start,
+    )
+
+    reconciled = optimizer.reconcile_result_with_schedule(
+        module.OptimizerResult(schedule=schedule),
+        schedule,
+        import_prices=[0.20],
+        export_prices=[0.10],
+        solar=[0.0],
+        load=[2.0],
+        initial_soc=0.5,
+        cost_neutral_earnings_cap=1.0,
+        cost_neutral_slots=[True],
+    )
+
+    action = reconciled.schedule.actions[0]
+    assert action.action == "self_consumption"
+    assert action.battery_discharge_w == pytest.approx(2_000.0)
+    assert reconciled.grid_export_w == pytest.approx([0.0])
+    assert reconciled.battery_to_grid_w == pytest.approx([0.0])
+    assert reconciled.lp_stats["cost_neutral_planned_earnings"] == pytest.approx(0.0)
+
+
+def test_cost_neutral_dated_subthreshold_export_does_not_consume_day_credit(
+    optimizer_module,
+):
+    """Dated settlement accounting must match the final zero-export action."""
+    module = optimizer_module
+    optimizer = _optimizer(module)
+    optimizer.interval_minutes = 5
+    optimizer.dt_hours = 5 / 60
+    start = _timestamps(1)[0]
+    schedule = module.OptimizationSchedule(
+        actions=[module.ScheduleAction(
+            timestamp=start,
+            action="export",
+            power_w=100.0,
+            soc=0.5,
+            battery_discharge_w=2_100.0,
+        )],
+        predicted_cost=0.0,
+        predicted_savings=0.0,
+        last_updated=start,
+    )
+    plan = module.CostNeutralPlan(
+        day_ids=["2026-08-01"],
+        earnings_caps_by_day={"2026-08-01": 1.0},
+        forecast_import_costs_by_day={"2026-08-01": 0.0},
+        fixed_cost_allowances_by_day={"2026-08-01": 1.0},
+        current_day="2026-08-01",
+    )
+
+    reconciled = optimizer.reconcile_result_with_schedule(
+        module.OptimizerResult(schedule=schedule),
+        schedule,
+        import_prices=[0.20],
+        export_prices=[0.10],
+        solar=[0.0],
+        load=[2.0],
+        initial_soc=0.5,
+        cost_neutral_plan=plan,
+    )
+
+    assert reconciled.grid_export_w == pytest.approx([0.0])
+    assert reconciled.lp_stats["cost_neutral_planned_earnings_by_day"] == {
+        "2026-08-01": pytest.approx(0.0),
+    }
+
+
 def test_final_schedule_guard_values_only_remaining_capped_export_bonus(
     optimizer_module,
 ):
