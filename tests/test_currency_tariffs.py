@@ -110,7 +110,7 @@ def test_dashboard_history_chart_projects_series_to_now():
     dashboard = COMPONENT_ROOT / "frontend" / "power-sync-strategy.js"
     source = dashboard.read_text()
 
-    assert "const data = this._projectHistoryToNow(rawData, stateObj, now, start, end)" in source
+    assert ": this._projectHistoryToNow(rawData, stateObj, now, start, end)" in source
     assert "projected.push([now, value])" in source
     assert "const marker = mode === 'tou' || mode === 'forecast'" in source
 

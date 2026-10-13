@@ -52,6 +52,7 @@ class PowerSyncChart extends HTMLElement {
     this._historyCache = new Map();
     this._historyRequestKey = null;
     this._hiddenSeries = new Set();
+    this._initializedSeries = new Set();
     this._lastRenderSignature = '';
   }
 
@@ -63,6 +64,14 @@ class PowerSyncChart extends HTMLElement {
     const validKeys = new Set((config.series || []).map((series, index) => this._seriesKey(series, index)));
     for (const key of Array.from(this._hiddenSeries)) {
       if (!validKeys.has(key)) this._hiddenSeries.delete(key);
+    }
+    for (const key of Array.from(this._initializedSeries)) {
+      if (!validKeys.has(key)) this._initializedSeries.delete(key);
+    }
+    for (const [index, series] of (config.series || []).entries()) {
+      const key = this._seriesKey(series, index);
+      if (!this._initializedSeries.has(key) && series.hiddenByDefault) this._hiddenSeries.add(key);
+      this._initializedSeries.add(key);
     }
     this._scheduleRender();
   }
@@ -131,6 +140,7 @@ class PowerSyncChart extends HTMLElement {
       axis: seriesConfig.axis,
       minValue: seriesConfig.minValue,
       maxValue: seriesConfig.maxValue,
+      hiddenByDefault: seriesConfig.hiddenByDefault,
       state: this._chartEntitySignature(mode, seriesConfig, config),
       cache: mode === 'history' ? this._historyCacheSignature(seriesConfig.entity) : undefined,
     }));
@@ -167,6 +177,10 @@ class PowerSyncChart extends HTMLElement {
       pricePrecision: config.pricePrecision,
       rightYMin: config.rightYMin,
       rightYMax: config.rightYMax,
+      priceYUnit: config.priceYUnit,
+      priceTickUnit: config.priceTickUnit,
+      timeZone: this._hass?.config?.time_zone,
+      priceYMultiplier: config.priceYMultiplier,
       zeroBaseline: config.zeroBaseline,
       hideZeroTickLabel: config.hideZeroTickLabel,
       stepLine: config.stepLine,
@@ -250,7 +264,9 @@ class PowerSyncChart extends HTMLElement {
     const visibleSeries = allSeries.filter((series) => !series.hidden);
     const chartSeries = visibleSeries;
     const rightAxisSeries = chartSeries.filter((series) => series.axis === 'right');
-    const primaryAxisSeries = chartSeries.filter((series) => series.axis !== 'right');
+    const priceAxisSeries = chartSeries.filter((series) => series.axis === 'price');
+    const primaryAxisSeries = chartSeries.filter((series) => series.axis !== 'right' && series.axis !== 'price');
+    const hasPriceAxis = priceAxisSeries.some((series) => series.data.length > 0);
     const hasRightAxis = rightAxisSeries.some((series) => series.data.length > 0);
 
     const box = this.getBoundingClientRect();
@@ -272,6 +288,8 @@ class PowerSyncChart extends HTMLElement {
         ? (needsExtraWidePriceYAxis ? (compact ? 86 : 104) : (compact ? 68 : 82))
         : (compact ? 42 : 56),
     };
+    const rightAxisSpace = hasRightAxis ? pad.right : 0;
+    if (hasPriceAxis) pad.right = rightAxisSpace + (compact ? 80 : 96);
     const chartW = W - pad.left - pad.right;
     const chartH = H - pad.top - pad.bottom;
 
@@ -374,6 +392,15 @@ class PowerSyncChart extends HTMLElement {
     }
     if (rightTicks.length > 20) rightTicks.length = 20;
 
+    const priceYMultiplier = Number(config.priceYMultiplier) || 1;
+    const priceValues = priceAxisSeries.flatMap(series => series.data.map(([, v]) => v * priceYMultiplier));
+    const priceMin = Math.min(0, ...priceValues);
+    const priceMax = Math.max(0, ...priceValues);
+    const priceStep = this._niceStep((priceMax - priceMin || 1) / (compact ? 4 : 5));
+    const priceYMin = Math.floor(priceMin / priceStep) * priceStep;
+    const priceYMax = Math.max(priceYMin + priceStep, Math.ceil(priceMax / priceStep) * priceStep);
+    const priceYScale = v => pad.top + chartH - ((v - priceYMin) / (priceYMax - priceYMin)) * chartH;
+
     const xScale = (t) => pad.left + ((t - xMin) / (xMax - xMin)) * chartW;
     const yScale = (v) => pad.top + chartH - ((v - yMin) / (yMax - yMin)) * chartH;
     const rightYScale = (v) => pad.top + chartH - ((v - rightYMin) / (rightYMax - rightYMin)) * chartH;
@@ -407,6 +434,15 @@ class PowerSyncChart extends HTMLElement {
       }
     }
 
+    if (hasPriceAxis) {
+      const axisX = W - pad.right + rightAxisSpace;
+      for (let tick = priceYMin; tick <= priceYMax + priceStep * 0.01; tick += priceStep) {
+        const y = priceYScale(tick);
+        const label = this._formatValue(tick, config.priceTickUnit || config.priceYUnit, true, true);
+        svg += `<text x="${axisX + 6}" y="${y + 4}" text-anchor="start" font-size="${compact ? 10 : 11}" fill="var(--secondary-text-color, #888)">${this._escSvg(label)}</text>`;
+      }
+    }
+
     const spanHours = (xMax - xMin) / 3600000;
     let xTickInterval;
     if (spanHours <= 6) xTickInterval = compact ? 2 : 1;
@@ -416,13 +452,16 @@ class PowerSyncChart extends HTMLElement {
     else xTickInterval = compact ? 12 : 8;
 
     const startDate = new Date(xMin);
-    const firstHour = new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate(), Math.ceil(startDate.getHours() / xTickInterval) * xTickInterval);
+    const firstHour = fixedWindow && config.historyRange === 'today' ? new Date(xMin)
+      : new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate(), Math.ceil(startDate.getHours() / xTickInterval) * xTickInterval);
     for (let t = firstHour.getTime(); t <= xMax; t += xTickInterval * 3600000) {
       const x = xScale(t);
       if (x < pad.left || x > W - pad.right) continue;
       const d = new Date(t);
       let label;
-      if (spanHours > 24) {
+      if (fixedWindow && config.historyRange === 'today') {
+        label = d.toLocaleTimeString([], { timeZone: hass.config?.time_zone, hour: '2-digit', minute: '2-digit', hour12: false });
+      } else if (spanHours > 24) {
         const day = d.toLocaleDateString([], { weekday: 'short' });
         label = day + ' ' + String(d.getHours()).padStart(2, '0') + ':00';
       } else {
@@ -452,9 +491,9 @@ class PowerSyncChart extends HTMLElement {
     for (const series of chartSeries) {
       if (series.data.length === 0) continue;
       const step = config.stepLine !== undefined ? config.stepLine : mode === 'history';
-      const seriesYScale = series.axis === 'right' ? rightYScale : yScale;
-      const seriesYMultiplier = series.axis === 'right' ? rightYMultiplier : yMultiplier;
-      const seriesYMin = series.axis === 'right' ? rightYMin : yMin;
+      const seriesYScale = series.axis === 'price' ? priceYScale : series.axis === 'right' ? rightYScale : yScale;
+      const seriesYMultiplier = series.axis === 'price' ? priceYMultiplier : series.axis === 'right' ? rightYMultiplier : yMultiplier;
+      const seriesYMin = series.axis === 'price' ? priceYMin : series.axis === 'right' ? rightYMin : yMin;
       let pathD = '';
 
       for (let i = 0; i < series.data.length; i++) {
@@ -752,7 +791,9 @@ class PowerSyncChart extends HTMLElement {
 
       const targetT = xMin + ((localX - pad.left) / chartW) * (xMax - xMin);
       const points = allSeries
-        .map((series) => ({ series, point: nearestPoint(series.data, targetT) }))
+        .map((series) => ({ series, point: series.axis === 'price'
+          ? (targetT >= series.data[0]?.[0] && targetT <= series.data[series.data.length - 1]?.[0] ? this._pointAt(series.data, targetT) : null)
+          : nearestPoint(series.data, targetT) }))
         .filter((item) => item.point && Number.isFinite(item.point[1]));
       if (points.length === 0) {
         hide();
@@ -812,6 +853,7 @@ class PowerSyncChart extends HTMLElement {
     const options = spanHours > 24
       ? { weekday: 'short', hour: '2-digit', minute: '2-digit' }
       : { hour: '2-digit', minute: '2-digit' };
+    if (this._config?.historyRange === 'today') options.timeZone = this._hass?.config?.time_zone;
     return d.toLocaleString([], options);
   }
 
@@ -833,6 +875,9 @@ class PowerSyncChart extends HTMLElement {
   }
 
   _seriesDisplayValue(series, rawValue, yMultiplier, rightYMultiplier, config) {
+    if (series.axis === 'price') {
+      return this._formatValue(rawValue * (Number(config.priceYMultiplier) || 1), config.priceYUnit, true, true);
+    }
     const rightAxis = series.axis === 'right';
     const multiplier = rightAxis ? rightYMultiplier : yMultiplier;
     const unit = rightAxis ? config.rightYUnit : config.yUnit;
@@ -1063,10 +1108,28 @@ class PowerSyncChart extends HTMLElement {
       const rawData = cached.length
         ? cached
         : this._statePoint(stateObj, now);
-      const data = this._projectHistoryToNow(rawData, stateObj, now, start, end);
+      const data = s.axis === 'price'
+        ? this._priceHistoryPoints(cached, stateObj, window)
+        : this._projectHistoryToNow(rawData, stateObj, now, start, end);
       const filtered = this._filterSeriesData(data, s);
       return { entity: s.entity, key: s.key, name: s.name, color: s.color, fill: !!s.fill, strokeWidth: s.strokeWidth, axis: s.axis, data: filtered.filter(([t]) => t >= start && t <= end) };
     });
+  }
+
+  _priceHistoryPoints(cached, stateObj, window) {
+    // Preserve signed observations; never fill earlier gaps or future hours.
+    const { startMs, nowMs } = window;
+    const points = cached.filter(([t, v]) => Number.isFinite(t) && Number.isFinite(v) && t <= nowMs)
+      .map(point => [...point]).sort((a, b) => a[0] - b[0]);
+    const state = stateObj?.state;
+    const value = state == null || String(state).trim() === '' ? NaN : Number(state);
+    if (!Number.isFinite(value)) return points;
+    const observed = Date.parse(stateObj?.last_updated || stateObj?.last_changed || '');
+    if (!points.length && Number.isFinite(observed) && observed <= nowMs) {
+      points.push([Math.max(startMs, observed), value]);
+    }
+    if (points.length && points[points.length - 1][0] < nowMs) points.push([nowMs, value]);
+    return points;
   }
 
   _filterSeriesData(data, seriesConfig) {
@@ -1158,8 +1221,11 @@ class PowerSyncChart extends HTMLElement {
     const now = new Date();
     const nowMs = now.getTime();
     if (config.historyRange === 'today') {
-      const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-      const end = new Date(start.getFullYear(), start.getMonth(), start.getDate() + 1);
+      const timeZone = this._hass?.config?.time_zone;
+      const parts = this._localCalendarParts(nowMs, timeZone);
+      const day = Date.UTC(parts.year, parts.month - 1, parts.day);
+      const start = new Date(this._localMidnight(day, timeZone));
+      const end = new Date(this._localMidnight(day + 86400000, timeZone));
       return {
         startMs: start.getTime(),
         endMs: end.getTime(),
@@ -1175,6 +1241,23 @@ class PowerSyncChart extends HTMLElement {
       queryEndMs: nowMs,
       nowMs,
     };
+  }
+
+  _localCalendarParts(timestamp, timeZone) {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+      timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+    }).formatToParts(new Date(timestamp));
+    return Object.fromEntries(parts.filter(part => part.type !== 'literal').map(part => [part.type, Number(part.value)]));
+  }
+
+  _localMidnight(day, timeZone) {
+    let timestamp = day;
+    for (let i = 0; i < 3; i++) {
+      const p = this._localCalendarParts(timestamp, timeZone);
+      timestamp += day - Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
+    }
+    return timestamp;
   }
 
   _escSvg(str) {
@@ -6898,7 +6981,7 @@ class PowerSyncStrategy {
 
     // --- Controls Column: Combined Energy Chart ---
     if (hasE('solar_power')) {
-      left.push(_combinedEnergyChart(e, hasE('home_load'), hasE('battery_level')));
+      left.push(_combinedEnergyChart(e, hasE('home_load'), hasE('battery_level'), hass));
     }
 
     // --- Center Column: Daily Energy Summary ---
@@ -8716,7 +8799,9 @@ function _batteryHealth(e, hass) {
   };
 }
 
-function _combinedEnergyChart(e, hasHome, hasBatterySoc) {
+function _combinedEnergyChart(e, hasHome, hasBatterySoc, hass) {
+  const priceEntity = hass?.states?.[e('current_import_price')] ? e('current_import_price') : e('current_export_price');
+  const priceMeta = _priceMeta(hass, priceEntity);
   const series = [
     { entity: e('solar_power'), name: 'Solar', color: '#FFD700', fill: true },
     { entity: e('grid_power'), name: 'Grid', color: '#F44336' },
@@ -8736,9 +8821,20 @@ function _combinedEnergyChart(e, hasHome, hasBatterySoc) {
       strokeWidth: 2.5,
     });
   }
+  for (const [suffix, name, color] of [
+    ['current_import_price', 'Buy Price', '#FF9800'],
+    ['current_export_price', 'Sell Price', '#E91E63'],
+  ]) {
+    if (hass?.states?.[e(suffix)]) {
+      series.push({ entity: e(suffix), name, color, axis: 'price', hiddenByDefault: true });
+    }
+  }
   return {
     type: 'custom:power-sync-chart',
     title: 'Energy - 24 Hours',
+    priceYUnit: priceMeta.minorPriceUnit,
+    priceTickUnit: priceMeta.minorUnit,
+    priceYMultiplier: 100,
     mode: 'history',
     historyHours: 24,
     historyRange: 'today',
