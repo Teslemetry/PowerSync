@@ -4641,6 +4641,7 @@ def test_generic_dynamic_start_promotes_only_fresh_physical_readback():
     "status", "power", "stale", "none", "cancel", "stop", "stop_all",
     "stop_other", "ownership", "ownership_timeout", "ownership_cancel",
     "options_timeout", "data_timeout",
+    "manual_adoption", "newer_request",
 ])
 def test_generic_cloud_start_settles_delayed_readback_safely(monkeypatch, readback):
     """Cloud feedback at 86s must settle before session/ownership promotion."""
@@ -4668,8 +4669,12 @@ def test_generic_cloud_start_settles_delayed_readback_safely(monkeypatch, readba
 
     async def advance_cloud_poll(seconds):
         nonlocal elapsed
-        assert actions._dynamic_ev_state == {}
-        if not readback.startswith("ownership") or elapsed < 10:
+        if readback not in ("manual_adoption",) or elapsed < 10:
+            assert actions._dynamic_ev_state == {}
+        if (
+            not readback.startswith("ownership")
+            and readback != "manual_adoption"
+        ) or elapsed < 10:
             assert hass.data["power_sync"]["entry-1"].get("ev_ownership") in (None, {})
         assert hass.services.calls == [
             ("switch", "turn_on", {"entity_id": "switch.garage_ev"})
@@ -4689,6 +4694,20 @@ def test_generic_cloud_start_settles_delayed_readback_safely(monkeypatch, readba
             claim_ev_ownership(hass, _Entry(), "_default", owner_mode="manual")
             if readback == "ownership_cancel":
                 raise asyncio.CancelledError
+        if elapsed == 10 and readback == "manual_adoption":
+            await actions.record_manual_ev_charging_session(
+                hass,
+                entry,
+                "_default",
+                {
+                    "charger_type": "generic",
+                    "charger_switch_entity": "switch.garage_ev",
+                },
+            )
+        if elapsed == 10 and readback == "newer_request":
+            hass.data["power_sync"]["entry-1"][
+                "_pending_generic_ev_starts"
+            ]["_default"] = {"cancelled": False}
         if elapsed >= 86:
             if readback in ("status", "stale", "stop_other", "ownership"):
                 status.state = "Charging"
@@ -4712,19 +4731,31 @@ def test_generic_cloud_start_settles_delayed_readback_safely(monkeypatch, readba
         result = asyncio.run(run_start())
         assert result is (readback in ("status", "power", "stop_other"))
 
-    assert hass.data["power_sync"]["entry-1"].get("_pending_generic_ev_starts") == {}
+    pending_starts = hass.data["power_sync"]["entry-1"].get(
+        "_pending_generic_ev_starts"
+    )
+    if readback == "newer_request":
+        assert pending_starts == {"_default": {"cancelled": False}}
+    else:
+        assert pending_starts == {}
     if readback.startswith("ownership"):
         from power_sync.automations.ev_ownership import get_ev_ownership
-        assert actions._dynamic_ev_state == {}
         assert get_ev_ownership(hass, _Entry(), "_default")[1]["owner_mode"] == "manual"
+        assert actions._dynamic_ev_state == {}
         assert len(hass.services.calls) == 1
         assert elapsed == {"ownership": 86, "ownership_timeout": 150,
                            "ownership_cancel": 10}[readback]
+    elif readback == "manual_adoption":
+        from power_sync.automations.ev_ownership import get_ev_ownership
+        assert get_ev_ownership(hass, entry, "_default")[1]["owner_mode"] == "manual"
+        assert actions._dynamic_ev_state["entry-1"]["_default"]["active"] is True
+        assert elapsed == 10
+        assert len(hass.services.calls) == 1
     elif readback in ("status", "power", "stop_other"):
         assert elapsed == 86
         assert actions._dynamic_ev_state["entry-1"]["_default"]["active"] is True
         assert len(hass.services.calls) == 1
-    else:
+    elif readback != "newer_request":
         if readback in ("stop", "stop_all"):
             assert elapsed == 10
         elif readback in ("options_timeout", "data_timeout"):

@@ -488,6 +488,51 @@ _GENERIC_START_CONFIRMATION_POLL_SECONDS = 1
 _GENERIC_ACTIVE_POWER_EPSILON_KW = 0.05
 
 
+def _generic_start_cleanup_is_current(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry | None,
+    vehicle_id: str,
+    params: Mapping[str, Any],
+) -> bool:
+    """Return whether a failed Generic start may still compensate physically.
+
+    A pending start can be superseded while its cloud-readback wait is active.
+    Cleanup must not stop the newer request or owner that replaced it.
+    """
+    pending = params.get("_generic_pending_start")
+    if not isinstance(pending, dict):
+        return True
+
+    if pending.get("superseded"):
+        return False
+
+    entry_id = getattr(config_entry, "entry_id", None)
+    pending_starts = (
+        hass.data.get(DOMAIN, {}).get(entry_id, {}).get(
+            "_pending_generic_ev_starts", {}
+        )
+        if entry_id is not None
+        else {}
+    )
+    if pending_starts.get(vehicle_id) is not pending:
+        return False
+
+    from .ev_ownership import get_ev_ownership
+
+    _lease_id, lease = get_ev_ownership(hass, config_entry, vehicle_id)
+    if lease is None:
+        return True
+
+    requested_owner_mode = params.get("owner_mode") or params.get("dynamic_mode")
+    if (
+        lease.get("owner") != "powersync"
+        or not requested_owner_mode
+        or str(lease.get("owner_mode")) != str(requested_owner_mode)
+    ):
+        return False
+    return True
+
+
 def _generic_start_confirmation_evidence(
     hass: HomeAssistant,
     params: Dict[str, Any],
@@ -7601,26 +7646,17 @@ async def _set_vehicle_amps_unchecked(
                             confirmation_started_at,
                         )
                     finally:
-                        # Compensate an unconfirmed accepted start unless another
-                        # owner took over while cloud feedback was pending.
-                        cleanup_allowed = True
-                        if not confirmed and config_entry is not None:
-                            from .ev_ownership import (
-                                can_take_over_ev_ownership,
-                                get_ev_ownership,
+                        # Cancellation during cloud settlement must compensate
+                        # the accepted start before propagating to the caller.
+                        if (
+                            not confirmed
+                            and _generic_start_cleanup_is_current(
+                                hass,
+                                config_entry,
+                                vehicle_id,
+                                params,
                             )
-
-                            _lease_id, lease = get_ev_ownership(
-                                hass, config_entry, vehicle_id
-                            )
-                            if lease is not None:
-                                cleanup_allowed = can_take_over_ev_ownership(
-                                    lease.get("owner_mode"),
-                                    params.get("owner_mode")
-                                    or params.get("dynamic_mode", "battery_target"),
-                                    allow_takeover=bool(params.get("allow_ownership_takeover", False)),
-                                )
-                        if not confirmed and cleanup_allowed:
+                        ):
                             cleanup_params = dict(params)
                             cleanup_params.pop("require_physical_start_confirmation", None)
                             try:
@@ -7637,6 +7673,12 @@ async def _set_vehicle_amps_unchecked(
                                     vehicle_id,
                                     cleanup_error,
                                 )
+                        elif not confirmed:
+                            _LOGGER.info(
+                                "Skipping superseded Generic charger start cleanup "
+                                "for %s",
+                                vehicle_id,
+                            )
                     if not confirmed:
                         _LOGGER.warning(
                             "Generic charger start was not promoted to a session: %s",
@@ -13334,14 +13376,19 @@ async def _action_start_ev_charging_dynamic_locked(
                 pending_starts = hass.data.setdefault(DOMAIN, {}).setdefault(
                     entry_id, {}
                 ).setdefault("_pending_generic_ev_starts", {})
-                start_params["_generic_pending_start"] = {"cancelled": False}
-                pending_starts[vehicle_id] = start_params["_generic_pending_start"]
+                pending_start_marker = {"cancelled": False}
+                start_params["_generic_pending_start"] = pending_start_marker
+                pending_starts[vehicle_id] = pending_start_marker
             try:
                 start_success = await _set_vehicle_amps(
                     hass, config_entry, vehicle_id, start_amps, start_params
                 )
             finally:
-                if pending_starts is not None:
+                if (
+                    pending_starts is not None
+                    and pending_starts.get(vehicle_id)
+                    is start_params.get("_generic_pending_start")
+                ):
                     pending_starts.pop(vehicle_id, None)
             if start_success:
                 start_amps = _phase_applied_amps(start_params, start_amps)
@@ -13821,6 +13868,8 @@ async def _action_stop_ev_charging_dynamic(
         for pending_id, pending in pending_starts.items():
             if not vehicle_id or vehicle_id == DEFAULT_VEHICLE_ID or pending_id == vehicle_id:
                 pending["cancelled"] = True
+                if not stop_charging:
+                    pending["superseded"] = True
 
     vehicles = _dynamic_ev_state.get(entry_id, {})
 
