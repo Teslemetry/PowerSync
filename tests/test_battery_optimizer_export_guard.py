@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import importlib
+import ast
+import json
 import sys
+import textwrap
 import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1557,8 +1560,9 @@ def test_pad_array_honors_default_for_short_nonempty_array(battery_optimizer_mod
     assert padded == [1.0, 2.0, 9.0, 9.0, 9.0]
 
 
+@pytest.mark.parametrize("limit", ["kTimeLimit", "kIterationLimit"])
 def test_solve_lp_highs_keeps_time_limit_incumbent(
-    battery_optimizer_module, monkeypatch
+    battery_optimizer_module, monkeypatch, limit
 ):
     module = battery_optimizer_module
     if not module.HIGHS_AVAILABLE:
@@ -1583,7 +1587,7 @@ def test_solve_lp_highs_keeps_time_limit_incumbent(
             pass
 
         def getModelStatus(self):
-            return real_highspy.HighsModelStatus.kTimeLimit
+            return getattr(real_highspy.HighsModelStatus, limit)
 
         def modelStatusToString(self, status):
             return "Time limit reached."
@@ -5022,3 +5026,100 @@ def test_amber_confidence_lp_captures_current_spike_and_retains_larger_later_val
     assert actual[2] == 40.0
     faded, _ = policy.weight_amber_export_forecast([10.0, 0.05, 0.05, 0.05, 0.05], intervals, now + timedelta(hours=1))
     assert faded[2] == 0.05
+
+@pytest.mark.parametrize(
+    ("status", "message", "failure"),
+    [
+        (13, "Time limit reached", "timeout"),
+        (14, "Iteration limit reached", "iteration_limit"),
+        (8, "Infeasible", "infeasible"),
+        (10, "Unbounded", "failed"),
+    ],
+)
+def test_projection_failure_retains_plan_and_accurate_provenance(
+    battery_optimizer_module, monkeypatch, status, message, failure,
+):
+    """Ticket 410: a later limited solve must not invalidate or mislabel a plan."""
+    module = battery_optimizer_module
+    if not module.HIGHS_AVAILABLE:
+        pytest.skip("highspy unavailable")
+    optimizer = module.BatteryOptimizer(
+        capacity_wh=10_000, max_charge_w=7_000, max_discharge_w=5_000,
+        backup_reserve=0.20, hardware_reserve=0.05,
+        interval_minutes=60, horizon_hours=2, efficiency=1.0, terminal_weight=0.0,
+    )
+    real_solve = module._solve_lp_highs
+    calls = []
+
+    def fail_later(*args, **kwargs):
+        if calls:
+            calls.append(None)
+            return module._HighsResult(None, False, message, status, None)
+        solved = real_solve(*args, **kwargs)
+        calls.append(solved)
+        return solved
+
+    monkeypatch.setattr(module, "_solve_lp_highs", fail_later)
+    result = optimizer._solve_lp(
+        2, [0.4, 0.1], [0.15, 0.05], [0, 7], [1, 0], 0.4,
+        "cost", 0.0, allow_battery_export=[False, False],
+        allow_grid_charge=False,
+    )
+    assert len(calls) == 2
+    assert result.feasible and result.solver_used == "highs"
+    assert result.lp_stats["status"] == calls[0].status
+    assert result.lp_stats["message"] == calls[0].message
+    assert result.lp_stats["fallback_reason"] == (
+        f"mode_projection_{failure}_projected_highs"
+    )
+    assert result.lp_stats["mode_projection_failure_status"] == status
+    assert result.lp_stats["mode_projection_failure_message"] == message
+    assert result.lp_stats["mode_converged"] is False
+    # Retained actions and reserve limits still describe a usable trajectory.
+    assert result.schedule.actions
+    assert all(action.soc >= 0.05 for action in result.schedule.actions)
+
+    # Exercise the actual get_api_data stats block with this retained result;
+    # no HA or hardware is required for diagnostic serialization.
+    source = (COMPONENT_ROOT / "optimization/coordinator.py").read_text()
+    method_source = source[source.index("    def get_api_data("):]
+    method_source = method_source.split("\n    def ", 1)[0].split("\n    async def ", 1)[0]
+    method = ast.parse(textwrap.dedent(method_source)).body[0]
+    stats_nodes = []
+    for index, node in enumerate(method.body):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "lp_stats"
+            for target in node.targets
+        ):
+            stats_nodes = method.body[index:index + 2]
+            break
+    assert stats_nodes
+    scope = {"self": types.SimpleNamespace(_last_optimizer_result=result)}
+    exec(compile(ast.Module(body=stats_nodes, type_ignores=[]), "get_api_data_stats", "exec"), scope)
+    data = json.loads(json.dumps(scope["lp_stats"]))
+    assert data["status"] == calls[0].status
+    assert data["mode_projection_failure_status"] == status
+    assert data["mode_projection_failure_message"] == message
+
+
+@pytest.mark.parametrize("status", [13, 14])
+def test_primary_limit_without_incumbent_returns_labeled_greedy_plan(
+    battery_optimizer_module, monkeypatch, status,
+):
+    module = battery_optimizer_module
+    if not module.HIGHS_AVAILABLE:
+        pytest.skip("highspy unavailable")
+    message = "Time limit reached" if status == 13 else "Iteration limit reached"
+    monkeypatch.setattr(
+        module, "_solve_lp_highs",
+        lambda *args, **kwargs: module._HighsResult(None, False, message, status, None),
+    )
+    optimizer = _optimizer(module)
+    result = optimizer._solve_lp(
+        2, [0.4, 0.1], [0.15, 0.05], [0, 7], [1, 0], 0.4, "cost",
+        allow_battery_export=[False, False], allow_grid_charge=False,
+    )
+    assert result.solver_used == "greedy"
+    assert result.lp_stats["fallback_reason"] == "solver_failed"
+    assert result.lp_stats["status"] == status
+    assert result.lp_stats["message"] == message

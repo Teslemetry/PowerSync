@@ -165,9 +165,12 @@ def test_cost_neutral_five_minute_deadline_can_top_up_before_target(
 
 
 @pytest.mark.parametrize("cost_neutral_enabled", [True, False])
+@pytest.mark.parametrize("projection_limit", [None, 13, 14])
 def test_subthreshold_deadline_grid_top_up_is_not_reported_as_idle_charge(
     optimizer_module,
     cost_neutral_enabled,
+    projection_limit,
+    monkeypatch,
 ):
     """An executable idle fallback must not retain suppressed grid energy."""
     if not optimizer_module.HIGHS_AVAILABLE:
@@ -190,6 +193,24 @@ def test_subthreshold_deadline_grid_top_up_is_not_reported_as_idle_charge(
     )
     optimizer.pre_window_slot = n
     optimizer.pre_window_soc_target = 1.0
+    if projection_limit is not None:
+        real_solve = optimizer_module._solve_lp_highs
+        solve_count = 0
+
+        def limited_projection(*args, **kwargs):
+            nonlocal solve_count
+            solve_count += 1
+            if solve_count > 1:
+                message = (
+                    "Time limit reached" if projection_limit == 13
+                    else "Iteration limit reached"
+                )
+                return optimizer_module._HighsResult(
+                    None, False, message, projection_limit, None
+                )
+            return real_solve(*args, **kwargs)
+
+        monkeypatch.setattr(optimizer_module, "_solve_lp_highs", limited_projection)
     start = datetime(2026, 10, 13, 15, 0, tzinfo=timezone(timedelta(hours=10)))
     result = optimizer.optimize(
         import_prices=[0.1291225] * n,
@@ -210,9 +231,13 @@ def test_subthreshold_deadline_grid_top_up_is_not_reported_as_idle_charge(
     assert result.feasible is False
     assert (
         result.lp_stats["fallback_reason"]
-        == "mode_projection_infeasible_executable_deadline"
+        == "mode_projection_" + (
+            "infeasible" if projection_limit is None
+            else "timeout" if projection_limit == 13 else "iteration_limit"
+        ) + "_executable_deadline"
     )
     assert result.lp_stats["deadline_unmet_after_mode_projection"] is True
+    assert result.reserve_recommendation == {}
     assert all(action.action == "idle" for action in result.schedule.actions)
     assert all(action.battery_charge_w == 0.0 for action in result.schedule.actions)
     assert all(action.battery_discharge_w == 0.0 for action in result.schedule.actions)

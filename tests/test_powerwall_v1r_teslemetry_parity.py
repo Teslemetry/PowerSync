@@ -17,13 +17,6 @@ from unittest.mock import AsyncMock
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from tesla_protocol.energy_device import (
-    authorization_types_pb2,
-    common_api_pb2,
-    device_pb2,
-    transport_pb2,
-)
-
 
 ROOT = (
     Path(__file__).resolve().parent.parent
@@ -43,6 +36,12 @@ _LOCAL_PKG = f"{_PKG}.powerwall_local"
 local_pkg = types.ModuleType(_LOCAL_PKG)
 local_pkg.__path__ = [str(LOCAL_ROOT)]
 sys.modules.setdefault(_LOCAL_PKG, local_pkg)
+
+energy_device = importlib.import_module(f"{_LOCAL_PKG}.energy_device")
+authorization_types_pb2 = energy_device.authorization_types_pb2
+common_api_pb2 = energy_device.common_api_pb2
+device_pb2 = energy_device.device_pb2
+transport_pb2 = energy_device.transport_pb2
 
 transport_mod = importlib.import_module(f"{_LOCAL_PKG}.transport")
 client_mod = importlib.import_module(f"{_LOCAL_PKG}.client")

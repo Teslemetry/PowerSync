@@ -2743,17 +2743,33 @@ class BatteryOptimizer:
                 result.lp_stats["mode_iterations"] = iteration + 1
                 if result.solver_used != "highs":
                     if last_result is not None:
+                        # Keep the retained plan's solve status separate from
+                        # the failed provisional pass. A limit without an
+                        # incumbent does not establish infeasibility.
+                        failure_status = result.lp_stats.get("status")
+                        failure_message = result.lp_stats.get("message", "")
+                        if "infeasible" in failure_message.lower():
+                            failure_reason = "infeasible"
+                        elif failure_status == int(highspy.HighsModelStatus.kTimeLimit):
+                            failure_reason = "timeout"
+                        elif failure_status == int(highspy.HighsModelStatus.kIterationLimit):
+                            failure_reason = "iteration_limit"
+                        else:
+                            failure_reason = "failed"
                         _LOGGER.warning(
-                            "Optimizer command-mode projection became infeasible on "
-                            "pass %d; using the previous physically projected HiGHS plan",
+                            "Optimizer command-mode projection failed on pass %d "
+                            "(%s); using the previous physically projected HiGHS plan",
                             iteration + 1,
+                            failure_message or failure_reason,
                         )
                         last_result.lp_stats = {
                             **last_result.lp_stats,
                             "mode_iterations": iteration + 1,
                             "mode_converged": False,
+                            "mode_projection_failure_status": failure_status,
+                            "mode_projection_failure_message": failure_message,
                             "fallback_reason": (
-                                "mode_projection_infeasible_projected_highs"
+                                f"mode_projection_{failure_reason}_projected_highs"
                             ),
                         }
                         if not self._schedule_meets_effective_deadline(
@@ -2764,7 +2780,7 @@ class BatteryOptimizer:
                             last_result.lp_stats.update(
                                 {
                                     "fallback_reason": (
-                                        "mode_projection_infeasible_executable_deadline"
+                                        f"mode_projection_{failure_reason}_executable_deadline"
                                     ),
                                     "deadline_unmet_after_mode_projection": True,
                                 }

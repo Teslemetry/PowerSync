@@ -30,7 +30,7 @@ import aiohttp
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
-from tesla_protocol.energy_device import (
+from .energy_device import (
     authorization_types_pb2,
     device_pb2,
     filestore_api_pb2,
@@ -691,7 +691,7 @@ class TEDAPIv1rTransport:
                     "id": event.id,
                     "name": event.name,
                     # `sheduling_info` (sic) — the field is misspelled upstream
-                    # in tesla_protocol.energy_device.teg_api_pb2.BackupEvent.
+                    # in the bundled energy_device.teg_api_pb2.BackupEvent.
                     "start_time": event.sheduling_info.start_time.seconds,
                     "duration_seconds": event.sheduling_info.duration_seconds,
                     "priority": event.sheduling_info.priority,
