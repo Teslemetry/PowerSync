@@ -12,6 +12,8 @@ Strategy:
 """
 from __future__ import annotations
 
+from ..licensing.guard import optimizer_work, optimizer_command
+
 import asyncio
 import logging
 import math
@@ -181,6 +183,7 @@ class EVCoordinator:
         self._mode = mode
         _LOGGER.info(f"EV charging mode set to: {mode.value}")
 
+    @optimizer_work
     async def start(self) -> bool:
         """Start EV coordination."""
         if self._running:
@@ -210,6 +213,42 @@ class EVCoordinator:
             self._task = None
 
         _LOGGER.info("EV coordination stopped")
+
+    async def recover_license_sessions(self) -> bool:
+        """Stop only our own sessions; never reclaim stale or newer manual ownership."""
+        from ..licensing.guard import manager_for
+        manager = manager_for(self)
+        state = manager.entries.setdefault(self.entry_id, {}) if manager else {}
+        targets = state.setdefault("ev_targets", [])
+        for config in self._ev_configs:
+            if self._owns_loadpoint(config) and config.entity_id not in targets:
+                targets.append(config.entity_id)
+        if manager:
+            try:
+                await manager.persist()
+            except OSError:
+                _LOGGER.warning("EV recovery journal cannot be saved; keeping pending state in memory")
+        for entity_id in list(targets):
+            config = next((c for c in self._ev_configs if c.entity_id == entity_id), None)
+            if config is None:
+                continue  # Keep unresolved recovery visible if a charger was removed.
+            if self._owns_loadpoint(config):
+                if not await self._stop_charging(config, reason="optimiser access ended"):
+                    continue
+            else:
+                mode = get_active_ev_owner_mode(self.hass, self._config_entry, self._ownership_vehicle_id(config)) if self._config_entry else None
+                if mode is None:
+                    status = await self._get_ev_status(config)
+                    # Restart clears native active ownership. Do not claim it from a persisted journal.
+                    if status.charging or not status.connected:
+                        entity = self.hass.states.get(entity_id)
+                        if not entity or entity.state in ("unknown", "unavailable") or status.charging:
+                            continue
+                # A newer manual/Boost owner takes precedence; its session is left alone.
+            targets.remove(entity_id)
+            if manager:
+                await manager.persist()
+        return not targets
 
     async def _coordination_loop(self) -> None:
         """Main coordination loop - runs every 5 minutes."""
@@ -290,6 +329,7 @@ class EVCoordinator:
             state=ev_state,
         )
 
+    @optimizer_work
     async def _evaluate_and_control(self) -> None:
         """Evaluate charging conditions and control EVs."""
         if self._mode == EVChargingMode.OFF:
@@ -822,6 +862,7 @@ class EVCoordinator:
             params["zaptec_installation_id"] = self._get_zaptec_installation_id(config.entity_id) or ""
         return params
 
+    @optimizer_command
     async def _set_shared_action_amps(self, config: EVConfig, amps: int) -> bool | None:
         """Set/start/stop via shared EV actions; None means unsupported config."""
         params = self._legacy_shared_action_params(config)
@@ -862,6 +903,7 @@ class EVCoordinator:
         )
         return owner_family(owner_mode) == owner_family(EV_COORDINATOR_OWNER_MODE)
 
+    @optimizer_command
     async def _start_charging(self, config: EVConfig, power_w: float | None = None) -> bool:
         """Start EV charging with dynamic amp adjustment.
 
@@ -911,6 +953,7 @@ class EVCoordinator:
             self._record_loadpoint_failure(config, "start_ev_coordinator", str(e))
             return False
 
+    @optimizer_command
     async def _set_charging_amps(self, config: EVConfig, amps: int) -> bool:
         """Set EV charging amps for dynamic power sharing.
 

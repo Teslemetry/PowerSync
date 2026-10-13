@@ -819,7 +819,7 @@ def test_hybrid_curtailment_handlers_use_tariff_schedule_fallback():
         ("handle_foxess_curtailment", "foxess_curtailment_state"),
         ("handle_sigenergy_curtailment", "sigenergy_curtailment_state"),
         ("handle_alphaess_curtailment", "alphaess_curtailment_state"),
-        ("handle_goodwe_curtailment", "goodwe_curtailment_state"),
+        ("_handle_goodwe_curtailment_locked", "goodwe_curtailment_state"),
         ("handle_solaredge_curtailment", "solaredge_curtailment_state"),
     ):
         handler = _function_source(handler_name)
@@ -906,7 +906,7 @@ def test_goodwe_curtailment_state_is_initialized():
 
 
 def test_goodwe_curtailment_periodically_reapplies_export_limit():
-    handler = _function_source("handle_goodwe_curtailment")
+    handler = _function_source("_handle_goodwe_curtailment_locked")
 
     assert "_last_goodwe_curtailment_reapply" in handler
     assert "GoodWe curtailment RE-APPLY" in handler
@@ -971,7 +971,7 @@ def test_goodwe_force_discharge_fails_closed_when_curtailment_restore_fails():
 
 
 def test_goodwe_curtailment_does_not_reapply_during_force_export():
-    handler = _function_source("handle_goodwe_curtailment")
+    handler = _function_source("_handle_goodwe_curtailment_locked")
     helper = _function_source("_goodwe_force_export_active")
 
     assert "get_active_force_state" in helper

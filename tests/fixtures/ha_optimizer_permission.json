@@ -4,7 +4,7 @@
   "key_id": "ha-test-vector",
   "now": 1700000000,
   "installation_id": "12345678-1234-4234-8234-123456789abc",
-  "permission": "eyJhbGciOiJFZERTQSIsInR5cCI6IlBTSEExIiwia2lkIjoiaGEtdGVzdC12ZWN0b3IifQ.eyJzY2hlbWEiOjEsImlzc3VlciI6InBvd2Vyc3luYy1oYS1saWNlbnNpbmciLCJhdWRpZW5jZSI6InBvd2VyX3N5bmM6aGFfb3B0aW1pemVyIiwiaW5zdGFsbGF0aW9uX2lkIjoiMTIzNDU2NzgtMTIzNC00MjM0LTgyMzQtMTIzNDU2Nzg5YWJjIiwiZmVhdHVyZXMiOlsiaGFfb3B0aW1pemVyIl0sImNyZWRlbnRpYWxfZ2VuZXJhdGlvbiI6MSwiZW50aXRsZW1lbnRfcmV2aXNpb24iOjcsInBvbGljeV9lcG9jaCI6MSwiaXNzdWVkX2F0IjoxNzAwMDAwMDAwLCJyZWZyZXNoX2FmdGVyIjoxNzAwMDg2NDAwLCJleHBpcmVzX2F0IjoxNzAwNjA0ODAwLCJzb3VyY2Vfc3RhdGUiOiJwYWlkIn0.a1EYexP09w2Eyix9DCSnvxmQsdmIUeYoN_aiRuMO8jvyRbgmIRWGH5QBDuab-NKm3rlwjtzSHI7_1zPfKMC8BA",
+  "permission": "eyJhbGciOiJFZERTQSIsInR5cCI6IlBTSEExIiwia2lkIjoiaGEtdGVzdC12ZWN0b3IifQ.eyJzY2hlbWEiOjEsImlzc3VlciI6InBvd2Vyc3luYy1oYS1saWNlbnNpbmciLCJhdWRpZW5jZSI6InBvd2VyX3N5bmM6aGFfb3B0aW1pemVyIiwiaW5zdGFsbGF0aW9uX2lkIjoiMTIzNDU2NzgtMTIzNC00MjM0LTgyMzQtMTIzNDU2Nzg5YWJjIiwiZmVhdHVyZXMiOlsiaGFfb3B0aW1pemVyIl0sImNyZWRlbnRpYWxfZ2VuZXJhdGlvbiI6MSwiZW50aXRsZW1lbnRfcmV2aXNpb24iOjcsInBvbGljeV9lcG9jaCI6MSwiaXNzdWVkX2F0IjoxNzAwMDAwMDAwLCJyZWZyZXNoX2FmdGVyIjoxNzAwMDAzNjAwLCJleHBpcmVzX2F0IjoxNzAwNjA0ODAwLCJzb3VyY2Vfc3RhdGUiOiJwYWlkIn0.Nh51V0WQ6FAUfpe5Wew9rXWHZuO_yVczlN82EToLO9I5bQdGOLjpB9ZPx9k0QKoP_jW8ft4diWcKfsTdVAy9AQ",
   "denial": "eyJhbGciOiJFZERTQSIsInR5cCI6IlBTSEExIiwia2lkIjoiaGEtdGVzdC12ZWN0b3IifQ.eyJzY2hlbWEiOjEsImlzc3VlciI6InBvd2Vyc3luYy1oYS1saWNlbnNpbmciLCJhdWRpZW5jZSI6InBvd2VyX3N5bmM6aGFfb3B0aW1pemVyIiwiaW5zdGFsbGF0aW9uX2lkIjoiMTIzNDU2NzgtMTIzNC00MjM0LTgyMzQtMTIzNDU2Nzg5YWJjIiwiZmVhdHVyZXMiOltdLCJjcmVkZW50aWFsX2dlbmVyYXRpb24iOjEsImVudGl0bGVtZW50X3JldmlzaW9uIjo4LCJwb2xpY3lfZXBvY2giOjEsImlzc3VlZF9hdCI6MTcwMDAwMDAwMCwicmVmcmVzaF9hZnRlciI6MTcwMDAwMDA2MCwiZXhwaXJlc19hdCI6MTcwMDAwMDMwMCwic291cmNlX3N0YXRlIjoic3Vic2NyaXB0aW9uX3JlcXVpcmVkIn0.dWn_PpfjMxQZzjmaogxePaetx2IYDfOHp4431YADDevfr0wAQMIYMyKYl44fsd4zwJHqbfvCAgSRDqq7aOn2Dg",
   "claims": {
     "schema": 1,
@@ -18,8 +18,20 @@
     "entitlement_revision": 7,
     "policy_epoch": 1,
     "issued_at": 1700000000,
-    "refresh_after": 1700086400,
+    "refresh_after": 1700003600,
     "expires_at": 1700604800,
     "source_state": "paid"
+  },
+  "policy": "eyJhbGciOiJFZERTQSIsInR5cCI6IlBTSFAxIiwia2lkIjoiaGEtdGVzdC12ZWN0b3IifQ.eyJzY2hlbWEiOjEsImlzc3VlciI6InBvd2Vyc3luYy1oYS1saWNlbnNpbmciLCJhdWRpZW5jZSI6InBvd2VyX3N5bmM6aGFfcG9saWN5IiwicG9saWN5X2Vwb2NoIjoxLCJyb2xsb3V0X21vZGUiOiJlbmZvcmNlZCIsImFjdGl2YXRpb25fYXQiOjE2OTk5OTk5OTksImxlZ2FjeV9hY2Nlc3NfdW50aWwiOjE3MDAwMDAwMDAsImlzc3VlZF9hdCI6MTcwMDAwMDAwMCwiZXhwaXJlc19hdCI6MTcwMDYwNDgwMH0.IQloFQ5zfDrO_Tyz6AvTM584eF4pLJufp5jTo7vNbw5imjn7hNHBjD49x8nPgvFeFiBTlIaPXFnydVKBFAzRCA",
+  "policy_claims": {
+    "schema": 1,
+    "issuer": "powersync-ha-licensing",
+    "audience": "power_sync:ha_policy",
+    "policy_epoch": 1,
+    "rollout_mode": "enforced",
+    "activation_at": 1699999999,
+    "legacy_access_until": 1700000000,
+    "issued_at": 1700000000,
+    "expires_at": 1700604800
   }
 }

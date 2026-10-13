@@ -8,6 +8,8 @@ Provides unified interface for controlling different battery systems:
 """
 from __future__ import annotations
 
+from ..licensing.guard import optimizer_command, optimizer_service_data
+
 import collections
 import enum
 import logging
@@ -87,6 +89,7 @@ class BatteryControllerWrapper:
         self.hass = hass
         self.battery_system = battery_system
 
+    @optimizer_command
     async def force_charge(self, duration_minutes: int = 60, power_w: float = 5000, _extend_hardware: bool = False) -> bool:
         """
         Command battery to charge.
@@ -111,7 +114,7 @@ class BatteryControllerWrapper:
                 response = await self.hass.services.async_call(
                     "power_sync",
                     "force_charge",
-                    service_data,
+                    optimizer_service_data(self, service_data),
                     blocking=True,
                     return_response=True,
                 )
@@ -126,7 +129,7 @@ class BatteryControllerWrapper:
                 await self.hass.services.async_call(
                     "power_sync",
                     "force_charge",
-                    service_data,
+                    optimizer_service_data(self, service_data),
                     blocking=True,
                 )
             return True
@@ -135,6 +138,7 @@ class BatteryControllerWrapper:
             _LOGGER.error(f"Force charge failed: {e}", exc_info=True)
             return False
 
+    @optimizer_command
     async def force_discharge(
         self,
         duration_minutes: int = 60,
@@ -173,7 +177,7 @@ class BatteryControllerWrapper:
                 response = await self.hass.services.async_call(
                     "power_sync",
                     "force_discharge",
-                    service_data,
+                    optimizer_service_data(self, service_data),
                     blocking=True,
                     return_response=True,
                 )
@@ -188,7 +192,7 @@ class BatteryControllerWrapper:
                 await self.hass.services.async_call(
                     "power_sync",
                     "force_discharge",
-                    service_data,
+                    optimizer_service_data(self, service_data),
                     blocking=True,
                     return_response=False,
                 )
@@ -225,7 +229,7 @@ class BatteryControllerWrapper:
                 response = await self.hass.services.async_call(
                     "power_sync",
                     "restore_normal",
-                    service_data,
+                    optimizer_service_data(self, service_data),
                     blocking=True,
                     return_response=True,
                 )
@@ -240,7 +244,7 @@ class BatteryControllerWrapper:
                 await self.hass.services.async_call(
                     "power_sync",
                     "restore_normal",
-                    service_data,
+                    optimizer_service_data(self, service_data),
                     blocking=True,
                 )
             return True
@@ -249,6 +253,7 @@ class BatteryControllerWrapper:
             _LOGGER.error(f"Restore normal failed: {e}", exc_info=True)
             return False
 
+    @optimizer_command
     async def set_self_consumption_mode(self) -> bool:
         """
         Set battery to pure self-consumption mode (no TOU optimization).
@@ -270,7 +275,7 @@ class BatteryControllerWrapper:
 
             await self.hass.services.async_call(
                 "power_sync", "set_self_consumption",
-                {"source": "optimizer"},
+                optimizer_service_data(self, {"source": "optimizer"}),
                 blocking=True,
             )
             return True
@@ -279,6 +284,7 @@ class BatteryControllerWrapper:
             _LOGGER.error(f"Set self-consumption mode failed: {e}", exc_info=True)
             return False
 
+    @optimizer_command
     async def set_autonomous_mode(self) -> bool:
         """
         Set battery to autonomous (TOU) mode.
@@ -296,7 +302,7 @@ class BatteryControllerWrapper:
 
             await self.hass.services.async_call(
                 "power_sync", "set_autonomous",
-                {},
+                optimizer_service_data(self, {"source": "optimizer"}),
                 blocking=True,
             )
             return True
@@ -404,6 +410,7 @@ class BatteryControllerWrapper:
             _LOGGER.debug(f"get_tesla_operation_mode failed: {e}")
             return None
 
+    @optimizer_command
     async def set_backup_reserve(self, percent: int) -> bool:
         """
         Set battery backup reserve percentage.
@@ -424,7 +431,7 @@ class BatteryControllerWrapper:
                 response = await self.hass.services.async_call(
                     "power_sync",
                     "set_backup_reserve",
-                    service_data,
+                    optimizer_service_data(self, service_data),
                     blocking=True,
                     return_response=True,
                 )
@@ -439,7 +446,7 @@ class BatteryControllerWrapper:
                 await self.hass.services.async_call(
                     "power_sync",
                     "set_backup_reserve",
-                    service_data,
+                    optimizer_service_data(self, service_data),
                     blocking=True,
                 )
             return True

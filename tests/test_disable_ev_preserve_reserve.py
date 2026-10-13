@@ -81,6 +81,7 @@ def _disable_coordinator(opt_module, *, last_executed_action, pre_idle_reserve, 
     coordinator = object.__new__(opt_module.OptimizationCoordinator)
     coordinator._enabled = True
     coordinator.entry_id = "entry-1"
+    coordinator.battery_system = "sigenergy"
     coordinator.hass = SimpleNamespace(data={"power_sync": {"entry-1": {}}})
     coordinator._monitoring_mode_active = lambda: False
     coordinator._last_executed_action = last_executed_action
@@ -508,3 +509,36 @@ def test_bypass_monitoring_true_has_exactly_one_caller():
         "bypass_monitoring=True"
     )
     assert total == 1
+
+def test_licence_shutdown_restores_after_enabled_flag_is_closed_and_retries(opt_module):
+    async def run():
+        c=_disable_coordinator(opt_module,last_executed_action='no_discharge',pre_idle_reserve=35,ev_active=False)
+        c._enabled=False
+        calls=[]
+        async def restore(value):calls.append(value);return True
+        c.battery_controller=SimpleNamespace(set_backup_reserve=restore)
+        attempts=0
+        async def stop(**kwargs):
+            nonlocal attempts
+            attempts+=1
+            assert not c._enabled and kwargs=={'restore_normal':True,'retry_restore':True}
+            return attempts>1
+        c._executor=SimpleNamespace(stop=stop)
+        with pytest.raises(RuntimeError,match='restore_pending'):await c.disable(licensing=True)
+        await c.disable(licensing=True)
+        assert calls==[35] and attempts==2
+    asyncio.run(run())
+
+
+def test_licence_shutdown_preserves_newer_manual_force(opt_module):
+    async def run():
+        c=_disable_coordinator(opt_module,last_executed_action='no_discharge',pre_idle_reserve=35,ev_active=False)
+        c._get_active_force_state=lambda:{'active':True,'source':'user'}
+        writes=[]
+        async def restore(value):writes.append(value);return True
+        c.battery_controller=SimpleNamespace(set_backup_reserve=restore)
+        async def stop(**kwargs):assert kwargs['restore_normal'] is False;return True
+        c._executor=SimpleNamespace(stop=stop)
+        await c.disable(licensing=True)
+        assert writes==[] and c._pre_idle_backup_reserve==35
+    asyncio.run(run())

@@ -6,6 +6,8 @@ to produce a schedule, which the execution layer then applies.
 """
 from __future__ import annotations
 
+from ..licensing.guard import optimizer_work, optimizer_command, fenced_call, restoration_work
+
 import asyncio
 import calendar
 import hashlib
@@ -995,6 +997,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return await method(*args, automatic=True)
         return await method(*args)
 
+    @restoration_work
     async def _restore_pre_idle_backup_reserve(
         self, battery, context: str = "", bypass_monitoring: bool = False
     ) -> bool:
@@ -1014,7 +1017,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             return False
         try:
-            result = await battery.set_backup_reserve(self._pre_idle_backup_reserve)
+            result = await fenced_call(self, lambda: battery.set_backup_reserve(self._pre_idle_backup_reserve), 'set_backup_reserve')
             if result is False:
                 _LOGGER.warning(
                     "Failed to restore backup reserve to %d%%: command returned False "
@@ -1054,6 +1057,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         return bool(state.get("active"))
 
+    @optimizer_command
     async def _set_scheduled_ev_no_discharge_mode(self, battery, reason: str) -> bool:
         """Prevent home-battery discharge while still allowing battery charging."""
         if self._scheduled_ev_no_discharge_active:
@@ -1064,7 +1068,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.energy_coordinator
                 and hasattr(self.energy_coordinator, "set_no_discharge_mode")
             ):
-                ok = await self.energy_coordinator.set_no_discharge_mode()
+                ok = await fenced_call(self, lambda: self.energy_coordinator.set_no_discharge_mode(), 'set_no_discharge_mode')
             else:
                 ok = await self._set_idle_hold_mode(battery, preserve_charge=True)
         except Exception as err:
@@ -1085,6 +1089,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         return True
 
+    @restoration_work
     async def _release_scheduled_ev_no_discharge_mode(self, reason: str = "") -> bool:
         """Release scheduled EV no-discharge mode when preserve is no longer active."""
         if not self._scheduled_ev_no_discharge_active:
@@ -1139,6 +1144,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         return True
 
+    @optimizer_command
     async def _set_idle_hold_mode(self, battery, preserve_charge: bool = False) -> bool:
         """Apply the existing optimiser hold semantics.
 
@@ -1162,7 +1168,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "Optimizer: Sungrow IDLE discharge-cap control is unavailable"
                 )
                 return False
-            if await self.energy_coordinator.set_backup_mode() is False:
+            if await fenced_call(self, lambda: self.energy_coordinator.set_backup_mode(), 'set_backup_mode') is False:
                 return False
             _LOGGER.info(
                 "Optimizer: IDLE — Sungrow discharge-cap hold at %d%% SOC "
@@ -1183,7 +1189,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "Optimizer: FoxESS IDLE Backup-mode control is unavailable"
                 )
                 return False
-            if await self.energy_coordinator.set_backup_mode() is not True:
+            if await fenced_call(self, lambda: self.energy_coordinator.set_backup_mode(), 'set_backup_mode') is not True:
                 return False
             _LOGGER.info(
                 "Optimizer: IDLE — FoxESS Backup hold at %d%% SOC "
@@ -1204,7 +1210,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "Optimizer: Fronius IDLE power-limit control is unavailable"
                 )
                 return False
-            if await self.energy_coordinator.set_backup_mode() is False:
+            if await fenced_call(self, lambda: self.energy_coordinator.set_backup_mode(), 'set_backup_mode') is False:
                 return False
             _LOGGER.info(
                 "Optimizer: IDLE — Fronius power-limit hold at %d%% SOC "
@@ -1225,7 +1231,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "Optimizer: SAJ H2 IDLE passive control is unavailable"
                 )
                 return False
-            if await self.energy_coordinator.set_backup_mode() is False:
+            if await fenced_call(self, lambda: self.energy_coordinator.set_backup_mode(), 'set_backup_mode') is False:
                 return False
             _LOGGER.info(
                 "Optimizer: IDLE — SAJ H2 passive hold at %d%% SOC "
@@ -1242,7 +1248,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         ):
             if getattr(self, "_idle_no_discharge_active", False):
                 return True
-            if await self.energy_coordinator.set_no_discharge_mode() is False:
+            if await fenced_call(self, lambda: self.energy_coordinator.set_no_discharge_mode(), 'set_no_discharge_mode') is False:
                 return False
             self._idle_no_discharge_active = True
             self._idle_hold_reserve = None
@@ -1260,7 +1266,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "Optimizer: GoodWe IDLE conserve control is unavailable"
                     )
                     return False
-                if await self.energy_coordinator.set_backup_mode() is False:
+                if await fenced_call(self, lambda: self.energy_coordinator.set_backup_mode(), 'set_backup_mode') is False:
                     return False
                 _LOGGER.info(
                     "Optimizer: IDLE — GoodWe conserve hold at %d%% SOC "
@@ -1269,7 +1275,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
             else:
                 if hasattr(battery, "set_self_consumption_mode"):
-                    await battery.set_self_consumption_mode()
+                    await fenced_call(self, lambda: battery.set_self_consumption_mode(), 'set_self_consumption_mode')
                 elif hasattr(battery, "restore_normal"):
                     await battery.restore_normal()
                 _LOGGER.info(
@@ -1349,9 +1355,9 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if hasattr(battery, "set_backup_reserve") and self.battery_system != "sigenergy":
                 self._idle_reserve_adjustment = True
                 try:
-                    reserve_result = await battery.set_backup_reserve(
+                    reserve_result = await fenced_call(self, lambda: battery.set_backup_reserve(
                         non_tesla_hold_pct
-                    )
+                    ), 'set_backup_reserve')
                 finally:
                     self._idle_reserve_adjustment = False
                 if self.battery_system == "solaredge" and reserve_result is False:
@@ -1370,7 +1376,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if hasattr(battery, "set_backup_reserve"):
             if hasattr(battery, "set_self_consumption_mode"):
                 reserve = min(max(soc_pct, 0), 80)
-                if await battery.set_self_consumption_mode() is False:
+                if await fenced_call(self, lambda: battery.set_self_consumption_mode(), 'set_self_consumption_mode') is False:
                     return False
             elif hasattr(battery, "restore_normal"):
                 reserve = non_tesla_hold_pct
@@ -1380,7 +1386,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 reserve = non_tesla_hold_pct
             self._idle_reserve_adjustment = True
             try:
-                reserve_result = await battery.set_backup_reserve(reserve)
+                reserve_result = await fenced_call(self, lambda: battery.set_backup_reserve(reserve), 'set_backup_reserve')
             finally:
                 self._idle_reserve_adjustment = False
             if reserve_result is False:
@@ -1398,7 +1404,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return True
 
         if hasattr(battery, "set_self_consumption_mode"):
-            mode_result = await battery.set_self_consumption_mode()
+            mode_result = await fenced_call(self, lambda: battery.set_self_consumption_mode(), 'set_self_consumption_mode')
             if self.battery_system == "solaredge" and mode_result is False:
                 return False
             _LOGGER.info("Optimizer: IDLE — self-consumption (no set_backup_reserve)")
@@ -5376,6 +5382,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._run_optimization(), "powersync_price_reoptimize"
         )
 
+    @optimizer_work
     async def enable(self) -> bool:
         """Enable optimization and start the built-in optimizer."""
         if self._enabled:
@@ -5530,6 +5537,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if ctrl is not None and hasattr(ctrl, "_restore_backup_reserve_pct"):
             ctrl._restore_backup_reserve_pct = int(reserve_pct)
 
+    @optimizer_work
     async def _deferred_enable_restore(self) -> None:
         """Restore backup reserve and work mode in the background.
 
@@ -5537,6 +5545,9 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         time-out) don't block async_setup_entry and risk HA bootstrap
         stage 2 cancellation.
         """
+        force = self._get_active_force_state()
+        if force and force.get("active") and force.get("source") != "optimizer":
+            return  # Startup must not change a newer manual/external force mode.
         if not self._enabled:
             return
         attempt = 0
@@ -5564,7 +5575,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 ):
                     return bool(await self.energy_coordinator.restore_normal())
                 if hasattr(battery, "set_self_consumption_mode"):
-                    return bool(await battery.set_self_consumption_mode())
+                    return bool(await fenced_call(self, lambda: battery.set_self_consumption_mode(), 'set_self_consumption_mode'))
                 return False
 
             # Restore the user's reserve target without trusting the live
@@ -5744,14 +5755,20 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return False
         return self._enabled
 
-    async def disable(self) -> None:
+    @restoration_work
+    async def disable(self, *, licensing: bool = False) -> None:
         """Disable optimization."""
         monitoring_mode = self._monitoring_mode_active()
+        if licensing:
+            self._enabled = False  # Stop eligibility before any awaited cleanup.
+            force = self._get_active_force_state()
+            if force and force.get("active") and force.get("source") != "optimizer":
+                monitoring_mode = True  # A newer user/external force owns hardware.
         solar_export_hold = getattr(self, "_solar_export_hold", None)
         if solar_export_hold and solar_export_hold.active:
             # Recheck immediately before the write: a monitoring transition can
             # arrive after the initial lifecycle snapshot.
-            monitoring_mode = self._monitoring_mode_active()
+            monitoring_mode = monitoring_mode or self._monitoring_mode_active()
             if monitoring_mode:
                 _LOGGER.info(
                     "Optimizer shutdown: monitoring mode active — deferring "
@@ -5762,7 +5779,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "Profit Max: solar-export hold restore failed during disable; "
                     "persisted cleanup will retry on startup"
                 )
-        if not self._enabled:
+        if not self._enabled and not licensing:
             return
 
         # Safety: restore any pending pre-IDLE backup_reserve before shutting
@@ -5861,15 +5878,29 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._octopus_gate_listener_unsub()
             self._octopus_gate_listener_unsub = None
 
+        recovery_failed = False
         if self._executor:
             if monitoring_mode:
                 _LOGGER.info(
                     "Optimizer shutdown: monitoring mode active — skipping executor restore writes"
                 )
-            await self._executor.stop(restore_normal=not monitoring_mode)
+            if licensing:
+                try:
+                    restored = await self._executor.stop(restore_normal=not monitoring_mode, retry_restore=True)
+                    recovery_failed = restored is False
+                except Exception:
+                    recovery_failed = True
+                    _LOGGER.warning("Battery restoration failed; continuing independent EV recovery")
+            else:
+                await self._executor.stop(restore_normal=not monitoring_mode)
 
         if self._ev_coordinator:
             await self._ev_coordinator.stop()
+            if licensing and not await self._ev_coordinator.recover_license_sessions():
+                recovery_failed = True
+
+        if recovery_failed:
+            raise RuntimeError("optimizer_restore_pending")
 
         # Flush cost data to disk before shutdown
         await self._cost_store.async_save(self._cost_data_to_save())
@@ -5879,6 +5910,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         _LOGGER.info("Optimization disabled")
 
+    @restoration_work
     async def _restore_idle_no_discharge_mode(self, context: str) -> bool:
         """Release a temporary IDLE discharge cap, preserving retry state."""
         if not getattr(self, "_idle_no_discharge_active", False):
@@ -6770,6 +6802,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_external_energy_allocation = allocation
         return result
 
+    @optimizer_work
     async def _run_optimization(
         self,
         force: bool = False,
@@ -8273,6 +8306,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.error("Error in schedule polling: %s", e)
                 await asyncio.sleep(60)
 
+    @optimizer_work
     async def _execute_cached_current_action_if_changed(self) -> None:
         """Apply the cached schedule action when coordinator refresh crosses a boundary."""
         if not getattr(self, "_enabled", False):
@@ -10074,7 +10108,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if hasattr(battery, "restore_normal"):
                     await battery.restore_normal()
                 elif hasattr(battery, "set_self_consumption_mode"):
-                    await battery.set_self_consumption_mode()
+                    await fenced_call(self, lambda: battery.set_self_consumption_mode(), 'set_self_consumption_mode')
             return False, 0.0
 
         guard = self._network_export_guard()
@@ -10103,7 +10137,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     0.0,
                     float(total_battery_discharge_w),
                 )
-            result = await battery.force_discharge(power_w=applied_w, **writer_kwargs)
+            result = await fenced_call(self, lambda: battery.force_discharge(power_w=applied_w, **writer_kwargs), 'force_discharge')
             return result is not False
 
         if guard is None:
@@ -10123,7 +10157,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if hasattr(battery, "restore_normal"):
                 stopped = await battery.restore_normal()
             elif hasattr(battery, "set_self_consumption_mode"):
-                stopped = await battery.set_self_consumption_mode()
+                stopped = await fenced_call(self, lambda: battery.set_self_consumption_mode(), 'set_self_consumption_mode')
             if stopped is False:
                 await guard.manager.async_set_fault(
                     "network envelope blocked export; export stop command failed"
@@ -10755,6 +10789,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return None
         return charge_kw, grid_import_kw, soc_pct
 
+    @optimizer_work
     async def _execute_optimizer_action(
         self,
         action: Any,
@@ -10866,7 +10901,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if solar_export_cleanup_failed:
             try:
                 if hasattr(battery, "set_self_consumption_mode"):
-                    await battery.set_self_consumption_mode()
+                    await fenced_call(self, lambda: battery.set_self_consumption_mode(), 'set_self_consumption_mode')
                 elif hasattr(battery, "restore_normal"):
                     await battery.restore_normal()
             except Exception:
@@ -10923,7 +10958,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if hasattr(battery, "restore_normal"):
                 restore_success = await battery.restore_normal()
             elif hasattr(battery, "set_self_consumption_mode"):
-                restore_success = await battery.set_self_consumption_mode()
+                restore_success = await fenced_call(self, lambda: battery.set_self_consumption_mode(), 'set_self_consumption_mode')
             if restore_success is False:
                 _LOGGER.warning(
                     "Optimizer: spike-protection restore failed; retaining force "
@@ -10997,7 +11032,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         if hasattr(battery, "restore_normal"):
                             restore_success = await battery.restore_normal()
                         elif hasattr(battery, "set_self_consumption_mode"):
-                            restore_success = await battery.set_self_consumption_mode()
+                            restore_success = await fenced_call(self, lambda: battery.set_self_consumption_mode(), 'set_self_consumption_mode')
                         if restore_success is False:
                             _LOGGER.warning(
                                 "Optimizer: blackout restore failed; retaining force "
@@ -11052,7 +11087,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             if hasattr(battery, "restore_normal"):
                                 restore_success = await battery.restore_normal()
                             elif hasattr(battery, "set_self_consumption_mode"):
-                                restore_success = await battery.set_self_consumption_mode()
+                                restore_success = await fenced_call(self, lambda: battery.set_self_consumption_mode(), 'set_self_consumption_mode')
                         finally:
                             self._optimizer_restore_in_progress = False
                         if restore_success is False:
@@ -11111,7 +11146,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                 if hasattr(battery, "restore_normal"):
                                     restore_success = await battery.restore_normal()
                                 elif hasattr(battery, "set_self_consumption_mode"):
-                                    restore_success = await battery.set_self_consumption_mode()
+                                    restore_success = await fenced_call(self, lambda: battery.set_self_consumption_mode(), 'set_self_consumption_mode')
                                 if restore_success is False:
                                     _LOGGER.warning(
                                         "Optimizer: Force-discharge reserve restore failed; "
@@ -11149,7 +11184,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         if hasattr(battery, "restore_normal"):
                             await battery.restore_normal()
                         elif hasattr(battery, "set_self_consumption_mode"):
-                            await battery.set_self_consumption_mode()
+                            await fenced_call(self, lambda: battery.set_self_consumption_mode(), 'set_self_consumption_mode')
                         self._last_executed_planned_action = action.action
                         self._last_executed_action = "self_consumption"
                         return
@@ -11203,7 +11238,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                 restore_success = await battery.restore_normal()
                             elif hasattr(battery, "set_self_consumption_mode"):
                                 restore_success = (
-                                    await battery.set_self_consumption_mode()
+                                    await fenced_call(self, lambda: battery.set_self_consumption_mode(), 'set_self_consumption_mode')
                                 )
                             if restore_success is False:
                                 _LOGGER.warning(
@@ -11359,11 +11394,11 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             # service falls through to the full tariff uploader
                             # so the TOU force window is rolled forward too.
                             if force_type == "charge":
-                                refresh_result = await battery.force_charge(
+                                refresh_result = await fenced_call(self, lambda: battery.force_charge(
                                     duration_minutes=extend_mins,
                                     power_w=force_power_w,
                                     _extend_hardware=True,
-                                )
+                                ), 'force_charge')
                                 if refresh_result is False:
                                     _LOGGER.warning(
                                         "Optimizer: force-charge hardware refresh "
@@ -11929,7 +11964,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     if hasattr(battery, "restore_normal"):
                         restore_success = await battery.restore_normal()
                     elif hasattr(battery, "set_self_consumption_mode"):
-                        restore_success = await battery.set_self_consumption_mode()
+                        restore_success = await fenced_call(self, lambda: battery.set_self_consumption_mode(), 'set_self_consumption_mode')
                     if restore_success is False:
                         _LOGGER.warning(
                             "Optimizer: blackout restore failed; next cycle will retry"
@@ -11979,7 +12014,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     if hasattr(battery, "restore_normal"):
                         restore_success = await battery.restore_normal()
                     elif hasattr(battery, "set_self_consumption_mode"):
-                        restore_success = await battery.set_self_consumption_mode()
+                        restore_success = await fenced_call(self, lambda: battery.set_self_consumption_mode(), 'set_self_consumption_mode')
                     if restore_success is False:
                         _LOGGER.warning(
                             "Optimizer: Grid-charge SOC-cap restore failed; "
@@ -11993,7 +12028,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     if self._tesla_force_charge_should_yield_to_live_solar(action):
                         effective_action = "self_consumption"
                         if hasattr(battery, "set_self_consumption_mode"):
-                            await battery.set_self_consumption_mode()
+                            await fenced_call(self, lambda: battery.set_self_consumption_mode(), 'set_self_consumption_mode')
                         elif hasattr(battery, "restore_normal"):
                             await battery.restore_normal()
                     if effective_action != "charge":
@@ -12049,7 +12084,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                 restore_success = await battery.restore_normal()
                             elif hasattr(battery, "set_self_consumption_mode"):
                                 restore_success = (
-                                    await battery.set_self_consumption_mode()
+                                    await fenced_call(self, lambda: battery.set_self_consumption_mode(), 'set_self_consumption_mode')
                                 )
                             if restore_success is False:
                                 _LOGGER.warning(
@@ -12085,7 +12120,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         )
                         effective_action = "self_consumption"
                         if hasattr(battery, "set_self_consumption_mode"):
-                            await battery.set_self_consumption_mode()
+                            await fenced_call(self, lambda: battery.set_self_consumption_mode(), 'set_self_consumption_mode')
                         elif hasattr(battery, "restore_normal"):
                             await battery.restore_normal()
                     elif mins_to_demand is not None and mins_to_demand <= charge_duration:
@@ -12095,10 +12130,10 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             "(%d min before demand window)",
                             charge_duration, mins_to_demand,
                         )
-                        force_result = await battery.force_charge(
+                        force_result = await fenced_call(self, lambda: battery.force_charge(
                             duration_minutes=charge_duration,
                             power_w=charge_power_w,
-                        )
+                        ), 'force_charge')
                         if force_result is False:
                             _LOGGER.warning(
                                 "Optimizer: force-charge command failed — keeping "
@@ -12117,10 +12152,10 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             charge_power_w, charge_duration,
                         )
                     else:
-                        force_result = await battery.force_charge(
+                        force_result = await fenced_call(self, lambda: battery.force_charge(
                             duration_minutes=charge_duration,
                             power_w=charge_power_w,
-                        )
+                        ), 'force_charge')
                         if force_result is False:
                             _LOGGER.warning(
                                 "Optimizer: force-charge command failed — keeping "
@@ -12159,7 +12194,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         )
                         effective_action = "self_consumption"
                         if hasattr(battery, "set_self_consumption_mode"):
-                            await battery.set_self_consumption_mode()
+                            await fenced_call(self, lambda: battery.set_self_consumption_mode(), 'set_self_consumption_mode')
                         elif hasattr(battery, "restore_normal"):
                             await battery.restore_normal()
                     else:
@@ -12198,7 +12233,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             mode_result = True
                             if hasattr(battery, "set_self_consumption_mode"):
                                 mode_result = (
-                                    await battery.set_self_consumption_mode()
+                                    await fenced_call(self, lambda: battery.set_self_consumption_mode(), 'set_self_consumption_mode')
                                 )
                             elif hasattr(battery, "restore_normal"):
                                 mode_result = await battery.restore_normal()
@@ -12315,7 +12350,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             )
                             effective_action = "self_consumption"
                             if hasattr(battery, "set_self_consumption_mode"):
-                                await battery.set_self_consumption_mode()
+                                await fenced_call(self, lambda: battery.set_self_consumption_mode(), 'set_self_consumption_mode')
                         else:
                             _LOGGER.debug("Optimizer: OFF_GRID — holding, safety OK")
                     except Exception as err:
@@ -12335,7 +12370,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             )
                             effective_action = "self_consumption"
                             if hasattr(battery, "set_self_consumption_mode"):
-                                await battery.set_self_consumption_mode()
+                                await fenced_call(self, lambda: battery.set_self_consumption_mode(), 'set_self_consumption_mode')
                         else:
                             _LOGGER.info(
                                 "Optimizer: OFF_GRID — physically disconnected from grid"
@@ -12689,7 +12724,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                 )
                         elif hasattr(battery, "set_self_consumption_mode"):
                             if apply_self_consumption:
-                                if await battery.set_self_consumption_mode() is False:
+                                if await fenced_call(self, lambda: battery.set_self_consumption_mode(), 'set_self_consumption_mode') is False:
                                     mode_apply_failed = True
                         elif hasattr(battery, "restore_normal"):
                             if apply_self_consumption:
@@ -12701,7 +12736,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             sungrow_reapply_reserve_pct is not None
                             and hasattr(battery, "set_backup_reserve")
                         ):
-                            await battery.set_backup_reserve(sungrow_reapply_reserve_pct)
+                            await fenced_call(self, lambda: battery.set_backup_reserve(sungrow_reapply_reserve_pct), 'set_backup_reserve')
                         # Tesla only: restore the authoritative hardware backup
                         # reserve after an action transition. Modbus batteries
                         # such as GoodWe expose this as a real hardware/DOD
@@ -12722,7 +12757,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                 reserve_pct = max(0, min(100, reserve_pct))
                                 if 81 <= reserve_pct <= 99:
                                     reserve_pct = 80
-                            reserve_result = await battery.set_backup_reserve(reserve_pct)
+                            reserve_result = await fenced_call(self, lambda: battery.set_backup_reserve(reserve_pct), 'set_backup_reserve')
                             if reserve_result is not False:
                                 self._last_optimizer_self_consumption_reserve_target = (
                                     reserve_pct
@@ -20820,10 +20855,10 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.hass.config_entries.async_update_entry(self._entry, options=new_options)
 
         if "auto_apply_reserve_enabled" in settings:
-            changed = await self.set_auto_apply_reserve_enabled(
+            changed = await fenced_call(self, lambda: self.set_auto_apply_reserve_enabled(
                 bool(settings["auto_apply_reserve_enabled"]),
                 rerun=False,
-            )
+            ), 'set_auto_apply_reserve_enabled')
             response["changes"].append(
                 f"auto_apply_reserve_enabled: {settings['auto_apply_reserve_enabled']}"
             )

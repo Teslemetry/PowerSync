@@ -25,10 +25,14 @@ class OptimizerAdmission:
             self.suspend()
 
     def suspend(self) -> None:
+        if self.suspended:
+            return
         self.suspended = True
         self.generation += 1
 
     def permits(self, now: int, *, generation: int | None = None) -> bool:
+        if generation is not None and generation != self.generation:
+            return False
         if not self.enforced:
             return True
         if self.permission and not self.suspended and now >= self.permission.expires_at:

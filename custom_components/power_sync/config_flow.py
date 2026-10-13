@@ -8593,6 +8593,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
         menu_options.extend(
             [
                 "optimization",
+                "optimizer_access",
                 "ev_charging",
                 "ev_load_management",
                 "advanced",
@@ -11914,6 +11915,52 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                 submitted,
             ),
             form_step_id=form_step_id,
+        )
+
+    async def async_step_optimizer_access(self, user_input=None):
+        """Pair this server without storing account/password credentials in HA."""
+        from .licensing.manager import async_get_manager
+        manager = await async_get_manager(self.hass)
+        errors = {}
+        if user_input is not None:
+            try:
+                action = user_input.get("action")
+                if action == "start_pairing":
+                    response = await manager.start_pairing()
+                    self._license_pairing_code = response["pairing_code"]
+                elif action == "finish_pairing":
+                    code = getattr(self, "_license_pairing_code", None)
+                    if not code:
+                        raise ValueError("pairing_code_required")
+                    await manager.finish_pairing(code)
+                elif action == "refresh":
+                    await manager.maintain(force=True)
+                    await manager.reconcile_entries()
+                elif action == "resume":
+                    await manager.resume_entry(self.config_entry.entry_id)
+                elif action == "reset_pairing":
+                    await manager.reset_pairing()
+            except Exception:
+                errors["base"] = "optimizer_access_unavailable"
+        status = manager.status(self.config_entry.entry_id)
+        return self.async_show_form(
+            step_id="optimizer_access",
+            data_schema=vol.Schema({vol.Required("action", default="refresh"): SelectSelector(SelectSelectorConfig(
+                options=[
+                    {"value": "start_pairing", "label": "Start pairing"},
+                    {"value": "finish_pairing", "label": "Finish pairing"},
+                    {"value": "refresh", "label": "Refresh access"},
+                    {"value": "resume", "label": "Resume optimisation"},
+                    {"value": "reset_pairing", "label": "Reset pairing"},
+                ], mode=SelectSelectorMode.DROPDOWN,
+            ))}),
+            errors=errors,
+            description_placeholders={
+                "account_url": status["account_url"],
+                "pairing_code": getattr(self, "_license_pairing_code", None) or "Not started",
+                "access_state": status["access_state"],
+                "resume_required": str(status["requires_resume"]),
+            },
         )
 
     async def _async_step_optimization(

@@ -485,6 +485,12 @@ class SolarExportChargeHoldAdapter:
         return []
 
     async def _write_target(self, target: dict[str, Any], *, hold: bool) -> bool:
+        if hold:
+            from ..licensing.guard import fenced_call
+            return await fenced_call(self, lambda: self._write_target_unchecked(target, hold=True), "set_charge_hold")
+        return await self._write_target_unchecked(target, hold=False)
+
+    async def _write_target_unchecked(self, target: dict[str, Any], *, hold: bool) -> bool:
         value = 0.0 if hold else target.get("value")
         target_id = target.get("id")
         if self.system == "sigenergy":

@@ -80,6 +80,8 @@ class _Entry:
 
 class _States:
     def get(self, entity_id: str):
+        if entity_id.startswith("switch."):
+            return SimpleNamespace(state="off", attributes={})
         return None
 
 
@@ -482,3 +484,18 @@ def test_optimizer_vehicle_following_tesla_away_releases_without_stop(monkeypatc
     last_command = ev_ownership.get_ev_last_commands(hass, _Entry())[config.entity_id]
     assert last_command["command"] == "release"
     assert "away" in last_command["reason"]
+
+def test_licence_recovery_stops_owned_charger_and_preserves_manual_owner():
+    async def run():
+        hass=_Hass();entry=_Entry()
+        owned=ev_coordinator.EVConfig(entity_id='switch.owned',name='Owned')
+        manual=ev_coordinator.EVConfig(entity_id='switch.manual',name='Manual')
+        c=ev_coordinator.EVCoordinator(hass,[owned,manual],config_entry=entry);c.entry_id=entry.entry_id
+        assert await c._start_charging(owned)
+        ev_ownership.claim_ev_ownership(hass,entry,'switch.manual',owner_mode='manual')
+        hass.services.calls.clear()
+        from power_sync.licensing.guard import recovery_scope
+        with recovery_scope():assert await c.recover_license_sessions()
+        assert hass.services.calls==[('switch','turn_off',{'entity_id':'switch.owned'})]
+        assert ev_ownership.get_active_ev_owner_mode(hass,entry,'switch.manual')=='manual'
+    asyncio.run(run())

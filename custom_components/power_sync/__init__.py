@@ -21261,6 +21261,8 @@ def _sync_covau_withdrawn_plan_issue(
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up PowerSync from a config entry."""
+    from .licensing.manager import async_get_manager
+    await async_get_manager(hass)
     _LOGGER.info("=" * 60)
     _LOGGER.info("PowerSync integration loading...")
     _LOGGER.info("Domain: %s", DOMAIN)
@@ -24210,6 +24212,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     async def _stop_guarded_network_export() -> bool:
         """Conservatively release active PowerSync export control on a guard fault."""
+        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+            from .licensing.entry_routing import entry_service_data
+        else:
+            entry_service_data = lambda _entry_id, data, origin=None: data
         if not hass.services.has_service(DOMAIN, SERVICE_RESTORE_NORMAL):
             _LOGGER.error(
                 "Network export guard could not stop export: restore service unavailable"
@@ -24219,11 +24225,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             await hass.services.async_call(
                 DOMAIN,
                 SERVICE_RESTORE_NORMAL,
-                {
+                (entry_service_data(entry.entry_id, {
                     "source": "network_envelope",
                     "_force_restore": True,
                     "_allow_monitoring_restore": True,
-                },
+                })),
                 blocking=True,
             )
         except Exception as err:
@@ -24807,6 +24813,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
             async def _restore_after_failed_bounce() -> None:
                 """Recover either bounce without overwriting a newer owner."""
+                if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                    from .licensing.entry_routing import entry_service_data
+                else:
+                    entry_service_data = lambda _entry_id, data, origin=None: data
                 if not _charge_kick_is_current():
                     _LOGGER.info(
                         "Charge kick (%s) superseded during confirmation; skipping stale cleanup",
@@ -24833,7 +24843,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 # Reuse normal restoration and its persisted, bounded retry path.
                 try:
                     await hass.services.async_call(
-                        DOMAIN, SERVICE_RESTORE_NORMAL, {}, blocking=True,
+                        DOMAIN, SERVICE_RESTORE_NORMAL, (entry_service_data(entry.entry_id, {})), blocking=True,
                     )
                 except Exception as restore_err:
                     _LOGGER.error("Auto-restore after charge kick failure also failed: %s", restore_err)
@@ -30969,6 +30979,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Restore force mode state from persistence (after HA restart)
     async def restore_force_mode_from_persistence():
         """Restore force charge/discharge state after HA restart."""
+        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+            from .licensing.entry_routing import entry_service_data
+        else:
+            entry_service_data = lambda _entry_id, data, origin=None: data
 
         if active_battery_system == BATTERY_SYSTEM_SOLAREDGE:
             _LOGGER.warning(
@@ -30992,7 +31006,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     await hass.services.async_call(
                         DOMAIN,
                         SERVICE_RESTORE_NORMAL,
-                        {
+                        (entry_service_data(entry.entry_id, {
                             "_allow_monitoring_restore": True,
                             "_skip_backup_reserve_restore": bool(
                                 persisted_pending_restore.get(
@@ -31000,7 +31014,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                                 )
                             ),
                             "source": "startup_pending_restore",
-                        },
+                        })),
                         blocking=True,
                     )
                 except Exception as err:
@@ -31052,6 +31066,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             service_data: dict[str, Any],
         ) -> bool:
             """Restore persisted state once the active battery integration is ready."""
+            if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                from .licensing.entry_routing import entry_service_data
+            else:
+                entry_service_data = lambda _entry_id, data, origin=None: data
             coordinator = _native_battery_control_coordinator()
             if not await _wait_for_native_battery_control_ready(
                 "Persisted force cleanup"
@@ -31064,7 +31082,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     await hass.services.async_call(
                         DOMAIN,
                         SERVICE_RESTORE_NORMAL,
-                        service_data,
+                        (entry_service_data(entry.entry_id, service_data)),
                         blocking=True,
                     )
                     return True
@@ -31121,6 +31139,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             retry_at = dt_util.utcnow() + timedelta(seconds=retry_delay)
 
             async def _retry_expired_force_cleanup(_now):
+                if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                    from .licensing.entry_routing import entry_service_data
+                else:
+                    entry_service_data = lambda _entry_id, data, origin=None: data
                 if entry.entry_id not in hass.data.get(DOMAIN, {}):
                     return
                 if _command_generation[0] != retry_generation:
@@ -31143,10 +31165,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     await hass.services.async_call(
                         DOMAIN,
                         SERVICE_RESTORE_NORMAL,
-                        {
+                        (entry_service_data(entry.entry_id, {
                             **service_data,
                             "_restore_retry": next_retry,
-                        },
+                        })),
                         blocking=True,
                     )
                 except Exception as err:
@@ -31447,11 +31469,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         await hass.services.async_call(
                             DOMAIN,
                             SERVICE_RESTORE_NORMAL,
-                            {
+                            (entry_service_data(entry.entry_id, {
                                 "source": persisted_source,
                                 "_native_control": True,
                                 "_allow_monitoring_restore": True,
-                            },
+                            })),
                             blocking=True,
                         )
                         restore_completed = True
@@ -31665,7 +31687,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                             service_data["power_w"] = persisted_power_w
                         await hass.services.async_call(
                             DOMAIN, SERVICE_FORCE_CHARGE,
-                            service_data,
+                            (entry_service_data(entry.entry_id, service_data)),
                             blocking=True,
                         )
                         _LOGGER.info(
@@ -31680,12 +31702,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     _restore_gen_charge_persisted = _command_generation[0]
 
                     async def auto_restore_charge(_now):
+                        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                            from .licensing.entry_routing import entry_service_data
+                        else:
+                            entry_service_data = lambda _entry_id, data, origin=None: data
                         if _command_generation[0] != _restore_gen_charge_persisted:
                             _LOGGER.debug("Persisted force charge timer superseded — skipping restore")
                             return
                         if force_charge_state["active"]:
                             _LOGGER.info("⏰ Force charge expired (restored timer), auto-restoring")
-                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, {"source": "force_timer", "_allow_monitoring_restore": True}, blocking=True)
+                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, (entry_service_data(entry.entry_id, {"source": "force_timer", "_allow_monitoring_restore": True})), blocking=True)
 
                     force_charge_state["cancel_expiry_timer"] = async_track_point_in_utc_time(
                         hass, auto_restore_charge, expires_at
@@ -31777,7 +31803,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                             service_data["power_w"] = persisted_power_w
                         await hass.services.async_call(
                             DOMAIN, SERVICE_FORCE_DISCHARGE,
-                            service_data,
+                            (entry_service_data(entry.entry_id, service_data)),
                             blocking=True,
                         )
                         _LOGGER.info(
@@ -31792,12 +31818,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     _restore_gen_discharge_persisted = _command_generation[0]
 
                     async def auto_restore_discharge(_now):
+                        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                            from .licensing.entry_routing import entry_service_data
+                        else:
+                            entry_service_data = lambda _entry_id, data, origin=None: data
                         if _command_generation[0] != _restore_gen_discharge_persisted:
                             _LOGGER.debug("Persisted force discharge timer superseded — skipping restore")
                             return
                         if force_discharge_state["active"]:
                             _LOGGER.info("⏰ Force discharge expired (restored timer), auto-restoring")
-                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, {"source": "force_timer", "_allow_monitoring_restore": True}, blocking=True)
+                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, (entry_service_data(entry.entry_id, {"source": "force_timer", "_allow_monitoring_restore": True})), blocking=True)
 
                     force_discharge_state["cancel_expiry_timer"] = async_track_point_in_utc_time(
                         hass, auto_restore_discharge, expires_at
@@ -32791,6 +32821,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         controller_generation = solaredge_coord.intent_generation
 
         async def auto_restore_solaredge(_now):
+            if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                from .licensing.entry_routing import entry_service_data
+            else:
+                entry_service_data = lambda _entry_id, data, origin=None: data
             if _command_generation[0] != restore_generation:
                 _LOGGER.debug(
                     "SolarEdge force %s timer superseded — skipping restore", direction
@@ -32801,11 +32835,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 await hass.services.async_call(
                     DOMAIN,
                     SERVICE_RESTORE_NORMAL,
-                    {
+                    (entry_service_data(entry.entry_id, {
                         "source": "force_timer",
                         "_allow_monitoring_restore": True,
                         "_solaredge_generation": controller_generation,
-                    },
+                    })),
                     blocking=True,
                 )
 
@@ -32829,6 +32863,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     async def handle_force_discharge(call: ServiceCall) -> dict[str, Any] | None:
         """Force discharge mode - switches to autonomous with high export tariff."""
+        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+            from .licensing.guard import service_allowed
+            if not service_allowed(hass, call.data, 'handle_force_discharge'):
+                raise HomeAssistantError("HA optimiser access is required; queued work was discarded")
+            from .licensing.runtime import DATA_KEY as _LICENSE_MANAGER_KEY
+            manager = hass.data.get(_LICENSE_MANAGER_KEY)
+            if manager and _control_call_source(call) != "optimizer":
+                await manager.relinquish(entry.entry_id)
 
         # Warn if calibration suspected (don't block — user manual command)
         _fd_entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
@@ -33415,12 +33457,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         force_discharge_state["cancel_expiry_timer"]()
 
                     async def auto_restore_sigenergy(_now):
+                        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                            from .licensing.entry_routing import entry_service_data
+                        else:
+                            entry_service_data = lambda _entry_id, data, origin=None: data
                         if _command_generation[0] != _restore_gen:
                             _LOGGER.debug("Sigenergy force discharge timer superseded — skipping restore")
                             return
                         if force_discharge_state["active"]:
                             _LOGGER.info("⏰ Sigenergy force discharge expired, auto-restoring")
-                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, {"source": "force_timer", "_allow_monitoring_restore": True}, blocking=True)
+                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, (entry_service_data(entry.entry_id, {"source": "force_timer", "_allow_monitoring_restore": True}, call)), blocking=True)
 
                     force_discharge_state["cancel_expiry_timer"] = async_track_point_in_utc_time(
                         hass,
@@ -33475,12 +33521,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         force_discharge_state["cancel_expiry_timer"]()
 
                     async def auto_restore_discharge_foxess(_now):
+                        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                            from .licensing.entry_routing import entry_service_data
+                        else:
+                            entry_service_data = lambda _entry_id, data, origin=None: data
                         if _command_generation[0] != _restore_gen:
                             _LOGGER.debug("FoxESS force discharge timer superseded — skipping restore")
                             return
                         if force_discharge_state["active"]:
                             _LOGGER.info("FoxESS force discharge expired, auto-restoring")
-                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, {"source": "force_timer", "_allow_monitoring_restore": True}, blocking=True)
+                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, (entry_service_data(entry.entry_id, {"source": "force_timer", "_allow_monitoring_restore": True}, call)), blocking=True)
 
                     force_discharge_state["cancel_expiry_timer"] = async_track_point_in_utc_time(
                         hass,
@@ -33561,12 +33611,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         force_discharge_state["cancel_expiry_timer"]()
 
                     async def auto_restore_discharge_goodwe(_now):
+                        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                            from .licensing.entry_routing import entry_service_data
+                        else:
+                            entry_service_data = lambda _entry_id, data, origin=None: data
                         if _command_generation[0] != _restore_gen:
                             _LOGGER.debug("GoodWe force discharge timer superseded — skipping restore")
                             return
                         if force_discharge_state["active"]:
                             _LOGGER.info("GoodWe force discharge expired, auto-restoring")
-                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, {"source": "force_timer", "_allow_monitoring_restore": True}, blocking=True)
+                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, (entry_service_data(entry.entry_id, {"source": "force_timer", "_allow_monitoring_restore": True}, call)), blocking=True)
 
                     force_discharge_state["cancel_expiry_timer"] = async_track_point_in_utc_time(
                         hass,
@@ -33627,12 +33681,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         force_discharge_state["cancel_expiry_timer"]()
 
                     async def auto_restore_discharge_alphaess(_now):
+                        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                            from .licensing.entry_routing import entry_service_data
+                        else:
+                            entry_service_data = lambda _entry_id, data, origin=None: data
                         if _command_generation[0] != _restore_gen:
                             _LOGGER.debug("AlphaESS force discharge timer superseded — skipping restore")
                             return
                         if force_discharge_state["active"]:
                             _LOGGER.info("AlphaESS force discharge expired, auto-restoring")
-                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, {"source": "force_timer", "_allow_monitoring_restore": True}, blocking=True)
+                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, (entry_service_data(entry.entry_id, {"source": "force_timer", "_allow_monitoring_restore": True}, call)), blocking=True)
 
                     force_discharge_state["cancel_expiry_timer"] = async_track_point_in_utc_time(
                         hass,
@@ -33685,12 +33743,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         force_discharge_state["cancel_expiry_timer"]()
 
                     async def auto_restore_discharge_esy(_now):
+                        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                            from .licensing.entry_routing import entry_service_data
+                        else:
+                            entry_service_data = lambda _entry_id, data, origin=None: data
                         if _command_generation[0] != _restore_gen:
                             _LOGGER.debug("ESY Sunhome force discharge timer superseded — skipping restore")
                             return
                         if force_discharge_state["active"]:
                             _LOGGER.info("ESY Sunhome force discharge expired, auto-restoring")
-                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, {"source": "force_timer", "_allow_monitoring_restore": True}, blocking=True)
+                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, (entry_service_data(entry.entry_id, {"source": "force_timer", "_allow_monitoring_restore": True}, call)), blocking=True)
 
                     force_discharge_state["cancel_expiry_timer"] = async_track_point_in_utc_time(
                         hass,
@@ -33761,11 +33823,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         force_discharge_state["cancel_expiry_timer"]()
 
                     async def auto_restore_discharge_solax(_now):
+                        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                            from .licensing.entry_routing import entry_service_data
+                        else:
+                            entry_service_data = lambda _entry_id, data, origin=None: data
                         if _command_generation[0] != _restore_gen:
                             return
                         if force_discharge_state["active"]:
                             _LOGGER.info("Solax force discharge expired, auto-restoring")
-                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, {"source": "force_timer", "_allow_monitoring_restore": True}, blocking=True)
+                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, (entry_service_data(entry.entry_id, {"source": "force_timer", "_allow_monitoring_restore": True}, call)), blocking=True)
 
                     force_discharge_state["cancel_expiry_timer"] = async_track_point_in_utc_time(
                         hass, auto_restore_discharge_solax, force_discharge_state["expires_at"]
@@ -33815,11 +33881,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         force_discharge_state["cancel_expiry_timer"]()
 
                     async def auto_restore_discharge_saj(_now):
+                        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                            from .licensing.entry_routing import entry_service_data
+                        else:
+                            entry_service_data = lambda _entry_id, data, origin=None: data
                         if _command_generation[0] != _restore_gen:
                             return
                         if force_discharge_state["active"]:
                             _LOGGER.info("SAJ H2 force discharge expired, auto-restoring")
-                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, {"source": "force_timer", "_allow_monitoring_restore": True}, blocking=True)
+                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, (entry_service_data(entry.entry_id, {"source": "force_timer", "_allow_monitoring_restore": True}, call)), blocking=True)
 
                     force_discharge_state["cancel_expiry_timer"] = async_track_point_in_utc_time(
                         hass, auto_restore_discharge_saj, force_discharge_state["expires_at"]
@@ -33869,11 +33939,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         force_discharge_state["cancel_expiry_timer"]()
 
                     async def auto_restore_discharge_fronius(_now):
+                        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                            from .licensing.entry_routing import entry_service_data
+                        else:
+                            entry_service_data = lambda _entry_id, data, origin=None: data
                         if _command_generation[0] != _restore_gen:
                             return
                         if force_discharge_state["active"]:
                             _LOGGER.info("Fronius GEN24 storage force discharge expired, auto-restoring")
-                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, {"source": "force_timer", "_allow_monitoring_restore": True}, blocking=True)
+                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, (entry_service_data(entry.entry_id, {"source": "force_timer", "_allow_monitoring_restore": True}, call)), blocking=True)
 
                     force_discharge_state["cancel_expiry_timer"] = async_track_point_in_utc_time(
                         hass, auto_restore_discharge_fronius, force_discharge_state["expires_at"]
@@ -33924,11 +33998,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         force_discharge_state["cancel_expiry_timer"]()
 
                     async def auto_restore_discharge_neovolt(_now):
+                        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                            from .licensing.entry_routing import entry_service_data
+                        else:
+                            entry_service_data = lambda _entry_id, data, origin=None: data
                         if _command_generation[0] != _restore_gen:
                             return
                         if force_discharge_state["active"]:
                             _LOGGER.info("Neovolt force discharge expired, auto-restoring")
-                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, {"source": "force_timer", "_allow_monitoring_restore": True}, blocking=True)
+                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, (entry_service_data(entry.entry_id, {"source": "force_timer", "_allow_monitoring_restore": True}, call)), blocking=True)
 
                     force_discharge_state["cancel_expiry_timer"] = async_track_point_in_utc_time(
                         hass, auto_restore_discharge_neovolt, force_discharge_state["expires_at"]
@@ -33978,6 +34056,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         force_discharge_state["cancel_expiry_timer"]()
 
                     async def auto_restore_discharge_sungrow(_now):
+                        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                            from .licensing.entry_routing import entry_service_data
+                        else:
+                            entry_service_data = lambda _entry_id, data, origin=None: data
                         if _command_generation[0] != _restore_gen:
                             _LOGGER.debug("Sungrow force discharge timer superseded — skipping restore")
                             return
@@ -33992,10 +34074,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                             await hass.services.async_call(
                                 DOMAIN,
                                 SERVICE_RESTORE_NORMAL,
-                                {
+                                (entry_service_data(entry.entry_id, {
                                     "source": "force_timer",
                                     "_allow_monitoring_restore": True,
-                                },
+                                }, call)),
                                 blocking=True,
                             )
 
@@ -34074,12 +34156,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         force_discharge_state["cancel_expiry_timer"]()
 
                     async def auto_restore_discharge_anker_solix(_now):
+                        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                            from .licensing.entry_routing import entry_service_data
+                        else:
+                            entry_service_data = lambda _entry_id, data, origin=None: data
                         if _command_generation[0] != _restore_gen:
                             _LOGGER.debug("Anker Solix force discharge timer superseded — skipping restore")
                             return
                         if force_discharge_state["active"]:
                             _LOGGER.info("Anker Solix force discharge expired, auto-restoring")
-                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, {"source": "force_timer", "_allow_monitoring_restore": True}, blocking=True)
+                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, (entry_service_data(entry.entry_id, {"source": "force_timer", "_allow_monitoring_restore": True}, call)), blocking=True)
 
                     force_discharge_state["cancel_expiry_timer"] = async_track_point_in_utc_time(
                         hass,
@@ -34132,6 +34218,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 preserve_newer_reserve: bool = False,
             ) -> None:
                 """Restore Tesla settings after any partially applied discharge."""
+                if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                    from .licensing.entry_routing import entry_service_data
+                else:
+                    entry_service_data = lambda _entry_id, data, origin=None: data
                 force_discharge_state[
                     "_skip_backup_reserve_restore"
                 ] = preserve_newer_reserve
@@ -34157,11 +34247,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     await hass.services.async_call(
                         DOMAIN,
                         SERVICE_RESTORE_NORMAL,
-                        {
+                        (entry_service_data(entry.entry_id, {
                             "source": "force_cleanup",
                             "_allow_monitoring_restore": True,
                             "_skip_backup_reserve_restore": preserve_newer_reserve,
-                        },
+                        }, call)),
                         blocking=True,
                     )
                 except Exception as err:
@@ -34554,6 +34644,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
                 async def auto_restore(_now):
                     """Auto-restore normal operation when discharge expires."""
+                    if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                        from .licensing.entry_routing import entry_service_data
+                    else:
+                        entry_service_data = lambda _entry_id, data, origin=None: data
                     if _command_generation[0] != _restore_gen:
                         _LOGGER.debug("Tesla force discharge timer superseded — skipping restore")
                         return
@@ -34568,7 +34662,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         await hass.services.async_call(
                             DOMAIN,
                             SERVICE_RESTORE_NORMAL,
-                            {"_allow_monitoring_restore": True},
+                            (entry_service_data(entry.entry_id, {"_allow_monitoring_restore": True}, call)),
                             blocking=True,
                         )
 
@@ -34785,6 +34879,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     async def handle_force_charge(call: ServiceCall) -> dict[str, Any] | None:
         """Force charge mode - switches to autonomous with free import tariff."""
+        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+            from .licensing.guard import service_allowed
+            if not service_allowed(hass, call.data, 'handle_force_charge'):
+                raise HomeAssistantError("HA optimiser access is required; queued work was discarded")
+            from .licensing.runtime import DATA_KEY as _LICENSE_MANAGER_KEY
+            manager = hass.data.get(_LICENSE_MANAGER_KEY)
+            if manager and _control_call_source(call) != "optimizer":
+                await manager.relinquish(entry.entry_id)
 
         # Warn if calibration suspected (don't block — user manual command)
         _fc_entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
@@ -35192,12 +35294,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         force_charge_state["cancel_expiry_timer"]()
 
                     async def auto_restore_charge_sigenergy(_now):
+                        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                            from .licensing.entry_routing import entry_service_data
+                        else:
+                            entry_service_data = lambda _entry_id, data, origin=None: data
                         if _command_generation[0] != _restore_gen:
                             _LOGGER.debug("Sigenergy force charge timer superseded — skipping restore")
                             return
                         if force_charge_state["active"]:
                             _LOGGER.info("⏰ Sigenergy force charge expired, auto-restoring")
-                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, {"source": "force_timer", "_allow_monitoring_restore": True}, blocking=True)
+                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, (entry_service_data(entry.entry_id, {"source": "force_timer", "_allow_monitoring_restore": True}, call)), blocking=True)
 
                     force_charge_state["cancel_expiry_timer"] = async_track_point_in_utc_time(
                         hass,
@@ -35257,12 +35363,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         force_charge_state["cancel_expiry_timer"]()
 
                     async def auto_restore_charge_foxess(_now):
+                        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                            from .licensing.entry_routing import entry_service_data
+                        else:
+                            entry_service_data = lambda _entry_id, data, origin=None: data
                         if _command_generation[0] != _restore_gen:
                             _LOGGER.debug("FoxESS force charge timer superseded — skipping restore")
                             return
                         if force_charge_state["active"]:
                             _LOGGER.info("FoxESS force charge expired, auto-restoring")
-                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, {"source": "force_timer", "_allow_monitoring_restore": True}, blocking=True)
+                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, (entry_service_data(entry.entry_id, {"source": "force_timer", "_allow_monitoring_restore": True}, call)), blocking=True)
 
                     force_charge_state["cancel_expiry_timer"] = async_track_point_in_utc_time(
                         hass,
@@ -35320,12 +35430,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         force_charge_state["cancel_expiry_timer"]()
 
                     async def auto_restore_charge_goodwe(_now):
+                        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                            from .licensing.entry_routing import entry_service_data
+                        else:
+                            entry_service_data = lambda _entry_id, data, origin=None: data
                         if _command_generation[0] != _restore_gen:
                             _LOGGER.debug("GoodWe force charge timer superseded — skipping restore")
                             return
                         if force_charge_state["active"]:
                             _LOGGER.info("GoodWe force charge expired, auto-restoring")
-                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, {"source": "force_timer", "_allow_monitoring_restore": True}, blocking=True)
+                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, (entry_service_data(entry.entry_id, {"source": "force_timer", "_allow_monitoring_restore": True}, call)), blocking=True)
 
                     force_charge_state["cancel_expiry_timer"] = async_track_point_in_utc_time(
                         hass,
@@ -35382,12 +35496,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         force_charge_state["cancel_expiry_timer"]()
 
                     async def auto_restore_charge_alphaess(_now):
+                        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                            from .licensing.entry_routing import entry_service_data
+                        else:
+                            entry_service_data = lambda _entry_id, data, origin=None: data
                         if _command_generation[0] != _restore_gen:
                             _LOGGER.debug("AlphaESS force charge timer superseded — skipping restore")
                             return
                         if force_charge_state["active"]:
                             _LOGGER.info("AlphaESS force charge expired, auto-restoring")
-                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, {"source": "force_timer", "_allow_monitoring_restore": True}, blocking=True)
+                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, (entry_service_data(entry.entry_id, {"source": "force_timer", "_allow_monitoring_restore": True}, call)), blocking=True)
 
                     force_charge_state["cancel_expiry_timer"] = async_track_point_in_utc_time(
                         hass,
@@ -35444,12 +35562,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         force_charge_state["cancel_expiry_timer"]()
 
                     async def auto_restore_charge_esy(_now):
+                        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                            from .licensing.entry_routing import entry_service_data
+                        else:
+                            entry_service_data = lambda _entry_id, data, origin=None: data
                         if _command_generation[0] != _restore_gen:
                             _LOGGER.debug("ESY Sunhome force charge timer superseded — skipping restore")
                             return
                         if force_charge_state["active"]:
                             _LOGGER.info("ESY Sunhome force charge expired, auto-restoring")
-                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, {"source": "force_timer", "_allow_monitoring_restore": True}, blocking=True)
+                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, (entry_service_data(entry.entry_id, {"source": "force_timer", "_allow_monitoring_restore": True}, call)), blocking=True)
 
                     force_charge_state["cancel_expiry_timer"] = async_track_point_in_utc_time(
                         hass,
@@ -35509,11 +35631,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         force_charge_state["cancel_expiry_timer"]()
 
                     async def auto_restore_charge_solax(_now):
+                        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                            from .licensing.entry_routing import entry_service_data
+                        else:
+                            entry_service_data = lambda _entry_id, data, origin=None: data
                         if _command_generation[0] != _restore_gen:
                             return
                         if force_charge_state["active"]:
                             _LOGGER.info("Solax force charge expired, auto-restoring")
-                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, {"source": "force_timer", "_allow_monitoring_restore": True}, blocking=True)
+                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, (entry_service_data(entry.entry_id, {"source": "force_timer", "_allow_monitoring_restore": True}, call)), blocking=True)
 
                     force_charge_state["cancel_expiry_timer"] = async_track_point_in_utc_time(
                         hass, auto_restore_charge_solax, force_charge_state["expires_at"]
@@ -35567,11 +35693,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         force_charge_state["cancel_expiry_timer"]()
 
                     async def auto_restore_charge_saj(_now):
+                        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                            from .licensing.entry_routing import entry_service_data
+                        else:
+                            entry_service_data = lambda _entry_id, data, origin=None: data
                         if _command_generation[0] != _restore_gen:
                             return
                         if force_charge_state["active"]:
                             _LOGGER.info("SAJ H2 force charge expired, auto-restoring")
-                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, {"source": "force_timer", "_allow_monitoring_restore": True}, blocking=True)
+                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, (entry_service_data(entry.entry_id, {"source": "force_timer", "_allow_monitoring_restore": True}, call)), blocking=True)
 
                     force_charge_state["cancel_expiry_timer"] = async_track_point_in_utc_time(
                         hass, auto_restore_charge_saj, force_charge_state["expires_at"]
@@ -35626,11 +35756,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         force_charge_state["cancel_expiry_timer"]()
 
                     async def auto_restore_charge_fronius(_now):
+                        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                            from .licensing.entry_routing import entry_service_data
+                        else:
+                            entry_service_data = lambda _entry_id, data, origin=None: data
                         if _command_generation[0] != _restore_gen:
                             return
                         if force_charge_state["active"]:
                             _LOGGER.info("Fronius GEN24 storage force charge expired, auto-restoring")
-                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, {"source": "force_timer", "_allow_monitoring_restore": True}, blocking=True)
+                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, (entry_service_data(entry.entry_id, {"source": "force_timer", "_allow_monitoring_restore": True}, call)), blocking=True)
 
                     force_charge_state["cancel_expiry_timer"] = async_track_point_in_utc_time(
                         hass, auto_restore_charge_fronius, force_charge_state["expires_at"]
@@ -35685,11 +35819,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         force_charge_state["cancel_expiry_timer"]()
 
                     async def auto_restore_charge_neovolt(_now):
+                        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                            from .licensing.entry_routing import entry_service_data
+                        else:
+                            entry_service_data = lambda _entry_id, data, origin=None: data
                         if _command_generation[0] != _restore_gen:
                             return
                         if force_charge_state["active"]:
                             _LOGGER.info("Neovolt force charge expired, auto-restoring")
-                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, {"source": "force_timer", "_allow_monitoring_restore": True}, blocking=True)
+                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, (entry_service_data(entry.entry_id, {"source": "force_timer", "_allow_monitoring_restore": True}, call)), blocking=True)
 
                     force_charge_state["cancel_expiry_timer"] = async_track_point_in_utc_time(
                         hass, auto_restore_charge_neovolt, force_charge_state["expires_at"]
@@ -35790,6 +35928,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         force_charge_state["cancel_expiry_timer"]()
 
                     async def auto_restore_charge_sungrow(_now):
+                        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                            from .licensing.entry_routing import entry_service_data
+                        else:
+                            entry_service_data = lambda _entry_id, data, origin=None: data
                         if _command_generation[0] != _restore_gen:
                             _LOGGER.debug("Sungrow force charge timer superseded — skipping restore")
                             return
@@ -35804,10 +35946,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                             await hass.services.async_call(
                                 DOMAIN,
                                 SERVICE_RESTORE_NORMAL,
-                                {
+                                (entry_service_data(entry.entry_id, {
                                     "source": "force_timer",
                                     "_allow_monitoring_restore": True,
-                                },
+                                }, call)),
                                 blocking=True,
                             )
 
@@ -35866,12 +36008,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         force_charge_state["cancel_expiry_timer"]()
 
                     async def auto_restore_charge_anker_solix(_now):
+                        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                            from .licensing.entry_routing import entry_service_data
+                        else:
+                            entry_service_data = lambda _entry_id, data, origin=None: data
                         if _command_generation[0] != _restore_gen:
                             _LOGGER.debug("Anker Solix force charge timer superseded — skipping restore")
                             return
                         if force_charge_state["active"]:
                             _LOGGER.info("Anker Solix force charge expired, auto-restoring")
-                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, {"source": "force_timer", "_allow_monitoring_restore": True}, blocking=True)
+                            await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, (entry_service_data(entry.entry_id, {"source": "force_timer", "_allow_monitoring_restore": True}, call)), blocking=True)
 
                     force_charge_state["cancel_expiry_timer"] = async_track_point_in_utc_time(
                         hass,
@@ -35907,6 +36053,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 preserve_newer_reserve: bool = False,
             ) -> None:
                 """Arm cleanup and immediately restore any partially applied charge state."""
+                if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                    from .licensing.entry_routing import entry_service_data
+                else:
+                    entry_service_data = lambda _entry_id, data, origin=None: data
                 force_charge_state[
                     "_skip_backup_reserve_restore"
                 ] = preserve_newer_reserve
@@ -35930,11 +36080,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     await hass.services.async_call(
                         DOMAIN,
                         SERVICE_RESTORE_NORMAL,
-                        {
+                        (entry_service_data(entry.entry_id, {
                             "source": "force_cleanup",
                             "_allow_monitoring_restore": True,
                             "_skip_backup_reserve_restore": preserve_newer_reserve,
-                        },
+                        }, call)),
                         blocking=True,
                     )
                 except Exception as err:
@@ -36369,6 +36519,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
                 async def auto_restore_charge(_now):
                     """Auto-restore normal operation when charge expires."""
+                    if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                        from .licensing.entry_routing import entry_service_data
+                    else:
+                        entry_service_data = lambda _entry_id, data, origin=None: data
                     if _command_generation[0] != _restore_gen:
                         _LOGGER.debug("Tesla force charge timer superseded — skipping restore")
                         return
@@ -36380,7 +36534,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         return
                     if force_charge_state["active"]:
                         _LOGGER.info("Force charge expired, auto-restoring normal operation")
-                        await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, {"source": "force_timer", "_allow_monitoring_restore": True}, blocking=True)
+                        await hass.services.async_call(DOMAIN, SERVICE_RESTORE_NORMAL, (entry_service_data(entry.entry_id, {"source": "force_timer", "_allow_monitoring_restore": True}, call)), blocking=True)
 
                 # Use async_track_point_in_utc_time for one-time expiry (not recurring daily)
                 force_charge_state["cancel_expiry_timer"] = async_track_point_in_utc_time(
@@ -36760,6 +36914,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             retry_command_generation = _command_generation[0]
 
             async def _retry_tesla_restore(_now):
+                if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                    from .licensing.entry_routing import entry_service_data
+                else:
+                    entry_service_data = lambda _entry_id, data, origin=None: data
                 if not (
                     force_charge_state.get("active")
                     or force_discharge_state.get("active")
@@ -36782,14 +36940,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 await hass.services.async_call(
                     DOMAIN,
                     SERVICE_RESTORE_NORMAL,
-                    {
+                    (entry_service_data(entry.entry_id, {
                         "_restore_retry": next_retry,
                         "_allow_monitoring_restore": True,
                         "_skip_backup_reserve_restore": (
                             skip_backup_reserve_restore
                         ),
                         "_tesla_restore_generation": retry_command_generation,
-                    },
+                    }, call)),
                     blocking=True,
                 )
 
@@ -36824,6 +36982,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             retry_reserve_generation = _tesla_reserve_generation[0]
 
             async def _retry_tesla_hold_restore(_now):
+                if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                    from .licensing.entry_routing import entry_service_data
+                else:
+                    entry_service_data = lambda _entry_id, data, origin=None: data
                 if not hold_soc_state.get("active"):
                     return
                 if (
@@ -36846,11 +37008,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 await hass.services.async_call(
                     DOMAIN,
                     SERVICE_RESTORE_NORMAL,
-                    {
+                    (entry_service_data(entry.entry_id, {
                         "source": "hold_soc_cleanup",
                         "_force_restore": True,
                         "_restore_retry": next_retry,
-                    },
+                    }, call)),
                     blocking=True,
                 )
 
@@ -36894,6 +37056,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             next_retry = restore_retry_count + 1
 
             async def _retry_sigenergy_restore(_now):
+                if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                    from .licensing.entry_routing import entry_service_data
+                else:
+                    entry_service_data = lambda _entry_id, data, origin=None: data
                 if source != "optimizer" and not (
                     force_charge_state.get("active")
                     or force_discharge_state.get("active")
@@ -36911,12 +37077,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 await hass.services.async_call(
                     DOMAIN,
                     SERVICE_RESTORE_NORMAL,
-                    {
+                    (entry_service_data(entry.entry_id, {
                         "source": source,
                         "_restore_retry": next_retry,
                         "_allow_monitoring_restore": True,
                         "_native_control": sigenergy_native_control,
-                    },
+                    }, call)),
                     blocking=True,
                 )
 
@@ -36961,6 +37127,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             next_retry = restore_retry_count + 1
 
             async def _retry_goodwe_restore(_now):
+                if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                    from .licensing.entry_routing import entry_service_data
+                else:
+                    entry_service_data = lambda _entry_id, data, origin=None: data
                 if not retry_state.get("active"):
                     _LOGGER.debug(
                         "GoodWe restore retry skipped; force state is no longer active"
@@ -36975,11 +37145,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 await hass.services.async_call(
                     DOMAIN,
                     SERVICE_RESTORE_NORMAL,
-                    {
+                    (entry_service_data(entry.entry_id, {
                         "source": source,
                         "_restore_retry": next_retry,
                         "_allow_monitoring_restore": True,
-                    },
+                    }, call)),
                     blocking=True,
                 )
 
@@ -38451,6 +38621,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         Source-aware: optimizer-sourced calls skip state management so the
         user-facing Controls screen never displays automated activity.
         """
+        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+            from .licensing.entry_routing import entry_service_data
+        else:
+            entry_service_data = lambda _entry_id, data, origin=None: data
+
+        if manager := getattr(hass, "data", {}).get("power_sync_license_manager"):
+            from .licensing.guard import service_allowed
+            if not service_allowed(hass, call.data, "handle_hold_battery_soc"):
+                return
+            if call.data.get("source") != "optimizer":
+                await manager.relinquish(entry.entry_id)
 
         raw_duration = call.data.get("duration", DEFAULT_DISCHARGE_DURATION)
         try:
@@ -38524,6 +38705,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             restore_reserve_generation = _tesla_reserve_generation[0]
 
             async def auto_restore_hold_soc(_now):
+                if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                    from .licensing.entry_routing import entry_service_data
+                else:
+                    entry_service_data = lambda _entry_id, data, origin=None: data
                 if (
                     _command_generation[0] != restore_generation
                     or _tesla_reserve_generation[0]
@@ -38541,7 +38726,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     await hass.services.async_call(
                         DOMAIN,
                         SERVICE_RESTORE_NORMAL,
-                        {"source": "hold_soc_cleanup", "_force_restore": True, "_solaredge_generation": solaredge_generation},
+                        (entry_service_data(entry.entry_id, {"source": "hold_soc_cleanup", "_force_restore": True, "_solaredge_generation": solaredge_generation}, call)),
                         blocking=True,
                     )
 
@@ -38614,13 +38799,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     return
                 await hass.services.async_call(
                     DOMAIN, "set_self_consumption",
-                    {
+                    (entry_service_data(entry.entry_id, {
                         "source": "hold_soc",
                         "_reserve_restore_target": target_reserve,
                         "_hold_soc_transition_token": (
                             _hold_soc_transition_token
                         ),
-                    },
+                    }, call)),
                     blocking=True,
                 )
                 if (
@@ -38750,6 +38935,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         - Does NOT restore TOU tariff
         - Does NOT send push notifications
         """
+        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+            from .licensing.entry_routing import entry_service_data
+        else:
+            entry_service_data = lambda _entry_id, data, origin=None: data
+        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+            from .licensing.guard import service_allowed
+            if not service_allowed(hass, call.data, 'handle_set_self_consumption'):
+                raise HomeAssistantError("HA optimiser access is required; queued work was discarded")
+            from .licensing.runtime import DATA_KEY as _LICENSE_MANAGER_KEY
+            manager = hass.data.get(_LICENSE_MANAGER_KEY)
+            if manager and _control_call_source(call) != "optimizer":
+                await manager.relinquish(entry.entry_id)
 
         source = _control_call_source(call)
         raw_duration = call.data.get("duration", DEFAULT_DISCHARGE_DURATION)
@@ -38884,7 +39081,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             await hass.services.async_call(
                 DOMAIN,
                 SERVICE_RESTORE_NORMAL,
-                {"source": "user", "_force_restore": True},
+                (entry_service_data(entry.entry_id, {"source": "user", "_force_restore": True}, call)),
                 blocking=True,
             )
 
@@ -38934,13 +39131,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             solaredge_generation = solaredge_coord.intent_generation if is_solaredge_sc else None
 
             async def auto_restore_self_consumption(_now):
+                if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                    from .licensing.entry_routing import entry_service_data
+                else:
+                    entry_service_data = lambda _entry_id, data, origin=None: data
                 if _command_generation[0] != _restore_gen_self:
                     _LOGGER.debug("Self-consumption timer superseded — skipping restore")
                     return
                 if self_consumption_state["active"]:
                     _LOGGER.info("⏰ Self-consumption override expired, auto-restoring")
                     await hass.services.async_call(
-                        DOMAIN, SERVICE_RESTORE_NORMAL, ({"source": "force_timer", "_solaredge_generation": solaredge_generation} if is_solaredge_sc else {"source": "user"}), blocking=True
+                        DOMAIN, SERVICE_RESTORE_NORMAL, ((entry_service_data(entry.entry_id, {"source": "force_timer", "_solaredge_generation": solaredge_generation} if is_solaredge_sc else {"source": "user"}, call))), blocking=True
                     )
 
             self_consumption_state["cancel_expiry_timer"] = async_track_point_in_utc_time(
@@ -39387,6 +39588,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         backup_reserve to act as a hard floor that prevents discharge.
         In self_consumption mode, backup_reserve alone is not reliably enforced.
         """
+        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+            from .licensing.guard import service_allowed
+            if not service_allowed(hass, call.data, 'handle_set_autonomous'):
+                raise HomeAssistantError("HA optimiser access is required; queued work was discarded")
+            from .licensing.runtime import DATA_KEY as _LICENSE_MANAGER_KEY
+            manager = hass.data.get(_LICENSE_MANAGER_KEY)
+            if manager and _control_call_source(call) != "optimizer":
+                await manager.relinquish(entry.entry_id)
         source = _control_call_source(call)
 
         if _monitoring_mode_should_block_control(call):
@@ -39493,6 +39702,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         Supports both Tesla Powerwall and SigEnergy systems.
         """
+        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+            from .licensing.guard import service_allowed
+            if not service_allowed(hass, call.data, 'handle_set_backup_reserve'):
+                raise HomeAssistantError("HA optimiser access is required; queued work was discarded")
+            from .licensing.runtime import DATA_KEY as _LICENSE_MANAGER_KEY
+            manager = hass.data.get(_LICENSE_MANAGER_KEY)
+            if manager and _control_call_source(call) != "optimizer":
+                await manager.relinquish(entry.entry_id)
         response: dict[str, Any] | None = None
         percent = call.data.get("percent")
         if percent is None:
@@ -40666,6 +40883,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         Bound to ``async_call_later`` from both fresh schedules and on-startup
         re-arm — the implementation is identical so we share the closure.
         """
+        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+            from .licensing.entry_routing import entry_service_data
+        else:
+            entry_service_data = lambda _entry_id, data, origin=None: data
         data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
         target = data.pop("max_backup_saved_reserve", None)
         local_event = bool(data.pop("max_backup_local_event", False))
@@ -40690,7 +40911,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         try:
             await hass.services.async_call(
                 DOMAIN, "set_backup_reserve",
-                {"percent": int(target), "source": "user"}, blocking=True,
+                (entry_service_data(entry.entry_id, {"percent": int(target), "source": "user"})), blocking=True,
             )
         except Exception as err:
             _LOGGER.error("schedule_max_backup: restore failed: %s", err)
@@ -40705,6 +40926,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         the user's baseline). The schedule is persisted to the per-entry
         Store and resumes after HA restart.
         """
+        if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+            from .licensing.entry_routing import entry_service_data
+        else:
+            entry_service_data = lambda _entry_id, data, origin=None: data
         duration_minutes = call.data.get("duration_minutes")
         if duration_minutes is None:
             _LOGGER.error("schedule_max_backup requires 'duration_minutes'")
@@ -40791,7 +41016,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 return
             await hass.services.async_call(
                 DOMAIN, "set_backup_reserve",
-                {"percent": 100, "source": "user"}, blocking=True,
+                (entry_service_data(entry.entry_id, {"percent": 100, "source": "user"}, call)), blocking=True,
             )
 
         cancel = async_call_later(hass, duration_minutes * 60, _max_backup_restore)
@@ -40840,6 +41065,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             )
         return result
 
+    from .licensing.entry_routing import register_handlers, routed_handler
+    register_handlers(hass, entry.entry_id, {
+        'force_charge': handle_force_charge,
+        'force_discharge': handle_force_discharge,
+        'restore_normal': handle_restore_normal,
+        'set_self_consumption': handle_set_self_consumption,
+        'set_autonomous': handle_set_autonomous,
+        'set_backup_reserve': handle_set_backup_reserve,
+        'hold_battery_soc': handle_hold_battery_soc,
+    })
     hass.services.async_register(
         DOMAIN,
         "reconcile_solaredge_control",
@@ -40851,24 +41086,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.services.async_register(
         DOMAIN,
         SERVICE_FORCE_DISCHARGE,
-        handle_force_discharge,
+        routed_handler(hass, entry.entry_id, 'force_discharge', handle_force_discharge),
         supports_response=SupportsResponse.OPTIONAL,
     )
     hass.services.async_register(
         DOMAIN,
         SERVICE_FORCE_CHARGE,
-        handle_force_charge,
+        routed_handler(hass, entry.entry_id, 'force_charge', handle_force_charge),
         supports_response=SupportsResponse.OPTIONAL,
     )
-    hass.services.async_register(DOMAIN, SERVICE_HOLD_BATTERY_SOC, handle_hold_battery_soc)
+    hass.services.async_register(DOMAIN, SERVICE_HOLD_BATTERY_SOC, routed_handler(hass, entry.entry_id, "hold_battery_soc", handle_hold_battery_soc))
     hass.services.async_register(
         DOMAIN,
         SERVICE_RESTORE_NORMAL,
-        handle_restore_normal,
+        routed_handler(hass, entry.entry_id, 'restore_normal', handle_restore_normal),
         supports_response=SupportsResponse.OPTIONAL,
     )
-    hass.services.async_register(DOMAIN, "set_self_consumption", handle_set_self_consumption)
-    hass.services.async_register(DOMAIN, "set_autonomous", handle_set_autonomous)
+    hass.services.async_register(DOMAIN, "set_self_consumption", routed_handler(hass, entry.entry_id, 'set_self_consumption', handle_set_self_consumption))
+    hass.services.async_register(DOMAIN, "set_autonomous", routed_handler(hass, entry.entry_id, 'set_autonomous', handle_set_autonomous))
 
     # Now that handle_restore_normal is defined, schedule expired force mode restore
     if persisted_force_state:
@@ -40878,7 +41113,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.services.async_register(
         DOMAIN,
         SERVICE_SET_BACKUP_RESERVE,
-        handle_set_backup_reserve,
+        routed_handler(hass, entry.entry_id, 'set_backup_reserve', handle_set_backup_reserve),
         supports_response=SupportsResponse.OPTIONAL,
     )
     hass.services.async_register(DOMAIN, SERVICE_SET_OPERATION_MODE, handle_set_operation_mode)
@@ -44138,7 +44373,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 optimization_coordinator._saving_session_coordinator = saving_session_coordinator
                 _LOGGER.info("Saving session coordinator linked to LP optimizer")
 
-            # Enable the optimizer
+            # Register the controller before admission, so renewal/recovery can reconcile it.
+            from .licensing.manager import async_get_manager
+            license_manager = await async_get_manager(hass)
+            license_manager.attach(optimization_coordinator)
             await optimization_coordinator.enable()
 
             hass.data[DOMAIN][entry.entry_id]["optimization_coordinator"] = optimization_coordinator
@@ -44440,6 +44678,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     )
 
                 async def _restore_vpp_aemo_spike():
+                    if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                        from .licensing.entry_routing import entry_service_data
+                    else:
+                        entry_service_data = lambda _entry_id, data, origin=None: data
                     if not vpp_spike_state["in_spike_mode"] or _is_monitoring_mode():
                         return
                     if (
@@ -44448,7 +44690,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     ):
                         await hass.services.async_call(
                             DOMAIN, SERVICE_RESTORE_NORMAL,
-                            {"source": "aemo_spike"}, blocking=True,
+                            (entry_service_data(entry.entry_id, {"source": "aemo_spike"})), blocking=True,
                         )
                         if force_discharge_state.get("active"):
                             raise RuntimeError("AEMO spike restore remains pending")
@@ -44461,6 +44703,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         await _check_aemo_spike_for_vpp(now)
 
                 async def _check_aemo_spike_for_vpp(now):
+                    if getattr(hass, "data", {}).get("power_sync_license_manager") is not None:
+                        from .licensing.entry_routing import entry_service_data
+                    else:
+                        entry_service_data = lambda _entry_id, data, origin=None: data
                     try:
                         if not _vpp_aemo_commands_allowed():
                             await _restore_vpp_aemo_spike()
@@ -44497,7 +44743,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                                 # Use the force discharge service (30 min for VPP events)
                                 await hass.services.async_call(
                                     DOMAIN, SERVICE_FORCE_DISCHARGE,
-                                    {"duration": 30, "source": "aemo_spike"},
+                                    (entry_service_data(entry.entry_id, {"duration": 30, "source": "aemo_spike"})),
                                     blocking=True,
                                 )
 
@@ -44665,7 +44911,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Register HTTP endpoints for Smart Optimization
     from .licensing.views import LicensingStatusView, licensing_status
-    licensing_status(hass)  # Shadow while recovery integration and rollout checks are completed.
+    from .licensing.manager import async_get_manager
+    await async_get_manager(hass)
     hass.http.register_view(LicensingStatusView(hass))
     hass.http.register_view(OptimizationView(hass))
     hass.http.register_view(OptimizationSettingsView(hass))
@@ -44812,8 +45059,8 @@ class OptimizationView(HomeAssistantView):
             })
 
         api_data = opt_coordinator.get_api_data()
-        if license_admission := self._hass.data.get("power_sync_licensing"):
-            api_data["licensing"] = license_admission.api_status()
+        if license_manager := self._hass.data.get("power_sync_license_manager"):
+            api_data["licensing"] = license_manager.status(opt_coordinator.entry_id)
             api_data.setdefault("features", {})["licensing_v1"] = True
         api_data.setdefault("features", {})["ai_summary"] = True
         service = _optimization_ai_service(
@@ -44850,6 +45097,11 @@ class OptimizationView(HomeAssistantView):
                 "success": False,
                 "error": "Optimization not configured"
             }, status=400)
+
+        if license_manager := self._hass.data.get("power_sync_license_manager"):
+            if not license_manager.permits(opt_coordinator.entry_id):
+                return web.json_response({"success": False, "error": "optimizer_access_required",
+                    "licensing": license_manager.status(opt_coordinator.entry_id)}, status=402)
 
         try:
             result = await opt_coordinator.force_reoptimize()
@@ -46271,6 +46523,8 @@ class OptimizationAISummaryView(HomeAssistantView):
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
+    if license_manager := hass.data.get("power_sync_license_manager"):
+        license_manager.detach(entry.entry_id)
     _LOGGER.info("Unloading PowerSync integration")
 
     # Tear down TOU sync hooks (AEMO dispatch subscriber + dispatch-trigger

@@ -103,7 +103,7 @@ Solar inverters that bypass the battery can be curtailed during negative feed-in
 5. **Done!** Sensors appear automatically and a **PowerSync dashboard** is auto-created in your sidebar. Enable [Smart Optimization](https://github.com/bolagnaise/PowerSync/wiki/Smart-Optimization) for automated scheduling, or install the [Mobile App](#mobile-app) for remote control.
 
 > **Tesla Powerwall users — two options:**
-> - **Home Assistant integration (this repo):** Free. Connects via the built-in OAuth flow at [powersync.cc](https://powersync.cc) — no developer registration, no monthly fees. Just click "Sign in with Tesla" during setup.
+> - **Home Assistant integration (this repo):** Monitoring, dashboards and manual controls remain free. HA optimiser access is A$4/month directly, or qualifying recurring GitHub sponsorship from US$3/month while active. Direct signup requires a card and gives one seven-day HA trial, then automatic monthly billing until cancelled. GitHub sponsorship starts paying immediately. [Activation and subscription guide](https://powersync.cc/ha-optimiser). Tesla provider sign-in remains separate from optimiser activation.
 > - **[PowerSync Cloud](https://powersync.cc/#cloud) ($4.99/month):** No Home Assistant required. Fully hosted service — sign in with Tesla, choose your retailer (Amber, GloBird, Energy Locals), and PowerSync handles negative-price protection, AEMO spike export, and real-time monitoring entirely in the cloud. Includes iOS/Android apps.
 
 ---
@@ -213,6 +213,6 @@ Remote monitoring and control via iOS and Android.
 
 Copyright (c) 2024–2026 Ben Boller. All rights reserved.
 
-Licensed under [PolyForm Noncommercial 1.0.0](LICENSE) — free for personal, hobby, and noncommercial use.
+Source licensed under [PolyForm Noncommercial 1.0.0](LICENSE) for personal, hobby, and noncommercial use. The hosted HA optimiser verification service requires a separate subscription or qualifying active sponsorship. This does not change the source licence.
 
 **Commercial use is prohibited without prior written permission from the copyright holder.** This includes use within a commercial organisation, integration into a paid product or service, and redistribution as part of a commercial system. To enquire about a commercial licence, contact [dev@powersync.cc](mailto:dev@powersync.cc).

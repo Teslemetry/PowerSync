@@ -654,10 +654,20 @@ class OptimizationEnabledSwitch(SwitchEntity):
     @property
     def is_on(self) -> bool:
         """Return True if Smart Optimization is enabled."""
+        if manager := self.hass.data.get("power_sync_license_manager"):
+            return self._attr_is_on and manager.permits(self._entry.entry_id)
         return self._attr_is_on
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Enable Smart Optimization and select the built-in LP provider."""
+        from .licensing.runtime import DATA_KEY as _LICENSE_MANAGER_KEY
+        if manager := self.hass.data.get(_LICENSE_MANAGER_KEY):
+            await manager.maintain(force=True)
+            if manager.status(self._entry.entry_id)["requires_resume"]:
+                await manager.resume_entry(self._entry.entry_id)
+            if not manager.permits(self._entry.entry_id):
+                from homeassistant.exceptions import HomeAssistantError
+                raise HomeAssistantError("HA optimiser access is required; activate through integration options")
         _LOGGER.info("Enabling Smart Optimization from HA switch")
         self._attr_is_on = True
         new_data = {**self._entry.data}
