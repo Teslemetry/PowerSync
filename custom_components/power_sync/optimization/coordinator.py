@@ -19338,15 +19338,15 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     else 0.0
                 )
                 load_w += ev_load_w
-                display_export.append(
-                    round(
-                        max(0.0, solar_w + battery_export - load_w - battery_charge),
-                        1,
-                    )
+                # Total discharge includes energy serving the home/EV as well
+                # as battery-to-grid export. Use one site balance so home load
+                # is subtracted once and import/export stay mutually exclusive.
+                net_grid_w = (
+                    load_w + battery_charge - solar_w
+                    - battery_consume - battery_export
                 )
-                display_import.append(
-                    round(max(0.0, load_w + battery_charge - solar_w - battery_consume), 1)
-                )
+                display_export.append(round(max(0.0, -net_grid_w), 1))
+                display_import.append(round(max(0.0, net_grid_w), 1))
                 continue
 
             if battery_export <= 0:

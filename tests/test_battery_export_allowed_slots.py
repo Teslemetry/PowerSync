@@ -346,6 +346,7 @@ def _coordinator(
     **options,
 ):
     coordinator = object.__new__(opt_module.OptimizationCoordinator)
+    coordinator._battery_specs_source_by_field = {}
     coordinator.battery_system = "tesla"
     base_options = {"electricity_provider": provider}
     base_options.update(options)
@@ -11426,6 +11427,41 @@ def test_schedule_display_grid_export_uses_post_processed_battery_export(opt_mod
     )
 
     assert grid_export == [23000.0, 0.0, 1000.0]
+
+
+@pytest.mark.parametrize(
+    ("solar_kw", "house_kw", "ev_w", "consume_w", "export_w", "expected_export_w"),
+    [
+        (0.2627, 1.6063, 0.0, 1343.6, 5000.0, 5000.0),
+        (0.2627, 1.4610, 0.0, 1198.3, 5000.0, 5000.0),
+        (0.2627, 1.4610, 0.0, 1198.3, 198.4, 198.4),
+        (0.0, 2.0, 0.0, 2000.0, 5000.0, 5000.0),
+        (0.5, 1.0, 2000.0, 2500.0, 500.0, 500.0),
+    ],
+)
+def test_schedule_display_grid_export_includes_battery_serving_home(
+    opt_module, solar_kw, house_kw, ev_w, consume_w, export_w, expected_export_w,
+):
+    """Serving the home and EV must not subtract from battery-to-grid export."""
+    coordinator = _coordinator(opt_module, "amber")
+    coordinator._last_solar_forecast = [solar_kw]
+    coordinator._last_load_forecast = [house_kw]
+    api_response = {
+        "timestamps": ["2026-10-14T17:00:00+10:00"],
+        "charge_w": [0.0],
+        "ev_charging_w": [ev_w],
+        "battery_consume_w": [consume_w],
+        "battery_export_w": [export_w],
+    }
+
+    grid_import, grid_export = coordinator._display_grid_arrays_from_schedule(
+        api_response,
+        raw_grid_import_w=[0.0],
+        raw_grid_export_w=[expected_export_w],
+    )
+
+    assert grid_import == [0.0]
+    assert grid_export == pytest.approx([expected_export_w])
 
 
 def test_schedule_display_grid_import_includes_planned_ev_load(opt_module):
