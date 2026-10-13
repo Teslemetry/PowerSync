@@ -728,6 +728,130 @@ def test_greedy_charge_by_time_allows_solar_refill_before_deadline(
     assert result.schedule.actions[1].soc >= 0.995 - 1e-4
 
 
+@pytest.mark.parametrize("timeout", [False, True])
+@pytest.mark.parametrize("efficiency,solar_kw", [(1.0, 7.0), (0.92, 8.0)])
+@pytest.mark.parametrize("policy", ["cost_neutral", "solar_only"])
+def test_greedy_deadline_uses_unused_native_solar_after_self_consumption(
+    battery_optimizer_module, monkeypatch, timeout, efficiency, solar_kw, policy,
+):
+    """A fallback must use available PV before requiring an overnight hold."""
+    module = battery_optimizer_module
+    monkeypatch.setattr(module, "HIGHS_AVAILABLE", timeout)
+    if timeout:
+        monkeypatch.setattr(
+            module, "_solve_lp_highs",
+            lambda *args, **kwargs: types.SimpleNamespace(
+                success=False, x=None, fun=None, status=13,
+                message="Time limit reached",
+            ),
+        )
+    optimizer = module.BatteryOptimizer(
+        capacity_wh=10000, max_charge_w=solar_kw * 1000,
+        max_discharge_w=5000, efficiency=efficiency,
+        backup_reserve=0.20, hardware_reserve=0.05,
+        interval_minutes=60, horizon_hours=2, terminal_weight=0.0,
+    )
+    optimizer.pre_window_slot = 2
+    optimizer.pre_window_soc_target = 1.0
+    plan = module.CostNeutralPlan(
+        day_ids=["2026-10-13", "2026-10-14"],
+        earnings_caps_by_day={"2026-10-13": 11.9, "2026-10-14": 2.6},
+        forecast_import_costs_by_day={"2026-10-13": 0, "2026-10-14": 0},
+        fixed_cost_allowances_by_day={"2026-10-13": 11.9, "2026-10-14": 2.6},
+        settlement_import_prices=[0.4156444, 0.1],
+        settlement_export_prices=[0.1568616, 0.05],
+        current_day="2026-10-13",
+    )
+    result = optimizer.optimize(
+        import_prices=[0.4156444, 0.1], export_prices=[0.1568616, 0.05],
+        solar_forecast=[0.0, solar_kw], load_forecast=[1.0, 0.0],
+        current_soc=0.4, acquisition_cost_kwh=0.2627,
+        allow_battery_export=True, allow_grid_charge=policy == "cost_neutral",
+        cost_neutral_plan=plan if policy == "cost_neutral" else None,
+    )
+
+    assert result.solver_used == "greedy"
+    if timeout:
+        assert result.lp_stats["fallback_reason"] == "solver_failed"
+    first, refill = result.schedule.actions
+    assert first.action == "self_consumption"
+    assert first.battery_discharge_w == pytest.approx(1000.0)
+    assert first.soc == pytest.approx(0.4 - 0.1 / efficiency, abs=0.0001)
+    assert refill.action == "self_consumption"
+    assert refill.battery_charge_w == pytest.approx(
+        (0.6 + 0.1 / efficiency) * 10000 / efficiency,
+        abs=0.1,
+    )
+    assert refill.battery_discharge_w == 0.0
+    assert refill.soc == pytest.approx(1.0, abs=0.0001)
+    assert result.grid_import_w == pytest.approx([0.0, 0.0])
+    assert result.grid_export_w[1] == pytest.approx(
+        solar_kw * 1000 - refill.battery_charge_w, abs=0.1,
+    )
+
+
+@pytest.mark.parametrize("solar_kw,max_charge_w", [(6.0, 7000), (7.0, 6000)])
+def test_deadline_native_solar_hold_keeps_real_recharge_limits(
+    battery_optimizer_module, solar_kw, max_charge_w,
+):
+    """Unused grid capacity cannot replace missing PV or a charge-rate limit."""
+    optimizer = battery_optimizer_module.BatteryOptimizer(
+        capacity_wh=10000, max_charge_w=max_charge_w,
+        max_discharge_w=5000, efficiency=1.0,
+        backup_reserve=0.20, hardware_reserve=0.05,
+        interval_minutes=60, horizon_hours=2, terminal_weight=0.0,
+    )
+    optimizer.pre_window_slot = 2
+    optimizer.pre_window_soc_target = 1.0
+    schedule = optimizer._build_schedule(
+        n=2, grid_import=[1.0, 0.0], grid_export=[0.0, solar_kw - 6.0],
+        battery_charge=[0.0, 6.0], battery_discharge=[0.0, 0.0],
+        solar=[0.0, solar_kw], load=[1.0, 0.0], soc_0=0.4,
+        import_prices=[0.4156444, 0.1], export_prices=[0.1568616, 0.05],
+        allow_grid_charge=True,
+    )
+
+    assert schedule.actions[0].action == "idle"
+    assert schedule.actions[0].battery_discharge_w == 0.0
+    assert schedule.actions[1].battery_charge_w == pytest.approx(6000.0)
+    assert schedule.actions[1].soc == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("restriction", ["blocked", "manual_idle", "manual_charge", "solar_export"])
+def test_deadline_native_solar_respects_future_control_restrictions(
+    battery_optimizer_module, restriction,
+):
+    """A future forced hold or charging restriction cannot fund natural use."""
+    optimizer = battery_optimizer_module.BatteryOptimizer(
+        capacity_wh=10000, max_charge_w=7000, max_discharge_w=5000,
+        efficiency=1.0, backup_reserve=0.20, hardware_reserve=0.05,
+        interval_minutes=60, horizon_hours=2, terminal_weight=0.0,
+    )
+    optimizer.pre_window_slot = 2
+    optimizer.pre_window_soc_target = 1.0
+    charge_kw = 6.0 if restriction in ("blocked", "manual_charge") else 0.0
+    schedule = optimizer._build_schedule(
+        n=2, grid_import=[1.0, 0.0], grid_export=[0.0, 7.0 - charge_kw],
+        battery_charge=[0.0, charge_kw], battery_discharge=[0.0, 0.0],
+        solar=[0.0, 7.0], load=[1.0, 0.0], soc_0=0.4,
+        import_prices=[0.4156444, 0.1], export_prices=[0.1568616, 0.05],
+        allow_grid_charge=True,
+        block_battery_charge=[False, restriction == "blocked"],
+        manual_control_slots=[None, {
+            "manual_idle": "idle", "manual_charge": "charge",
+        }.get(restriction)],
+        profit_max_solar_export_slots=[False, restriction == "solar_export"],
+    )
+
+    assert schedule.actions[0].action == "idle"
+    assert schedule.actions[0].battery_discharge_w == 0.0
+    if restriction == "manual_charge":
+        assert schedule.actions[1].action == "charge"
+        assert schedule.actions[1].battery_charge_w == pytest.approx(6000.0)
+    else:
+        assert schedule.actions[1].battery_charge_w == 0.0
+
+
 def test_greedy_deadline_solar_projection_respects_charge_rate(
     battery_optimizer_module, monkeypatch
 ):

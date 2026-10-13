@@ -8218,6 +8218,10 @@ class BatteryOptimizer:
         )
         grid_charge_cap_active = allow_grid_charge and grid_charge_soc_cap < 0.999
 
+        # When native PV makes an earlier deadline hold unnecessary, carry
+        # that extra recharge into the emitted schedule as well as the check.
+        deadline_native_charge_slots: set[int] = set()
+
         def _future_grid_charge_planned(
             start_idx: int,
             *,
@@ -8267,6 +8271,7 @@ class BatteryOptimizer:
                 return False
 
             deadline = min(n, self.pre_window_slot)
+            expanded_native_charge_slots: set[int] = set()
 
             def _max_reachable_charge_kw(idx: int, projected_soc: float) -> float:
                 """Return charge available without changing the projected mode."""
@@ -8307,11 +8312,23 @@ class BatteryOptimizer:
                     and grid_import[idx] > net_load_kw + threshold_kw
                 )
                 if not planned_charge_mode:
-                    # A self-use or idle mode is not free to become a forced
-                    # grid-charge command on the next projection pass. Keep its
-                    # existing physical flow; only a charge-mode slot provides
-                    # concrete recharge headroom for replacing this hold.
-                    return max(0.0, battery_charge[idx])
+                    planned_charge_kw = max(0.0, battery_charge[idx])
+                    if (
+                        manual_control_slots[idx] is None
+                        and not profit_max_solar_export_slots[idx]
+                        and battery_discharge[idx] <= threshold_kw
+                    ):
+                        # Native self-consumption can absorb unused PV after
+                        # earlier household use creates more battery room.
+                        # It cannot acquire an unplanned grid-charge command.
+                        native_charge_kw = min(
+                            self._charge_limit_kw(load[idx], solar[idx], False),
+                            max(0.0, 1.0 - projected_soc) * cap / (eff * dt),
+                        )
+                        if native_charge_kw > planned_charge_kw + 1e-9:
+                            expanded_native_charge_slots.add(idx)
+                        return native_charge_kw
+                    return planned_charge_kw
 
                 charge_limit_kw = self._charge_limit_kw(
                     load[idx],
@@ -8429,7 +8446,10 @@ class BatteryOptimizer:
                     min(1.0, projected_soc),
                 )
 
-            return projected_soc < self.pre_window_soc_target - 0.0001
+            hold_required = projected_soc < self.pre_window_soc_target - 0.0001
+            if not hold_required:
+                deadline_native_charge_slots.update(expanded_native_charge_slots)
+            return hold_required
 
         for t in range(n):
             ts = (
@@ -8749,6 +8769,23 @@ class BatteryOptimizer:
                 # Export modes never charge the battery, but they retain the
                 # battery discharge selected by the LP and its reserve cap.
                 reported_charge_w = 0.0
+
+            if (
+                action == "self_consumption"
+                and t in deadline_native_charge_slots
+                and manual_mode is None
+                and not charge_blocked
+                and not profit_max_solar_export_slots[t]
+                and reported_discharge_w <= ACTION_THRESHOLD_W
+            ):
+                # Match the recharge that released the earlier hold. Keeping
+                # the old PV charge here would invent a reachable deadline.
+                reported_charge_w = min(
+                    self._charge_limit_kw(load[t], solar[t], False),
+                    max(0.0, 1.0 - soc) * cap / (eff * dt),
+                ) * 1000.0
+                reported_discharge_w = 0.0
+                power_w = reported_charge_w
 
             if action == "self_consumption" and reported_charge_w > 0:
                 # Self-consumption may charge only from native solar surplus;
