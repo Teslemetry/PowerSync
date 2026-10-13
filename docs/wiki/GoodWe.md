@@ -79,6 +79,31 @@ When the prefix is set, PowerSync routes force charge/discharge through those Ho
 Telemetry, backup reserve, and export-limit operations still use PowerSync's GoodWe connection.
 Hold SoC requires the EMS entity path; PowerSync does not issue an unverified direct-UDP hold command.
 
+## Whole-site solar for AC-coupled arrays
+
+If the property has solar on both the GoodWe hybrid and a separate AC-coupled
+array, select **Whole-site solar power sensor (all PV)** on **Battery connection
+method & sensors** during setup. Choose a sensor reporting the total instantaneous
+production of all arrays, including the GoodWe PV strings. The sensor can use W,
+kW or MW. Leave the field empty when all solar is connected to the GoodWe.
+
+Existing installations can select, replace or clear the sensor through the
+**Battery connection method & sensors** options form or the direct GoodWe
+connection options. Saving reloads the integration and applies the selection to
+both direct and Home Assistant entity telemetry.
+
+PowerSync uses the whole-site reading, with the inverter's own PV as a lower
+bound, and calculates household load from solar, grid and battery power. This
+also handles negative inverter house-consumption readings that can occur with
+AC-coupled generation. Corrected readings feed solar nowcasting, forecast
+learning and daily energy accumulation.
+
+If the selected sensor is missing, unavailable, non-numeric, non-finite or
+negative, the displayed readings remain inverter-only. PowerSync marks the solar
+sample invalid, skips solar nowcasting and forecast learning for that sample,
+and skips its daily energy accumulation. Clearing the optional field restores
+the normal inverter-only telemetry.
+
 ## Setup checklist
 
 1. Enable Modbus TCP on the GoodWe inverter or LAN / WiFiLAN Kit-20 module.
