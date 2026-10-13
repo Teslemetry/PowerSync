@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 
 MODULE_PATH = (
@@ -45,3 +47,14 @@ def test_parse_charger_state_uses_zaptec_observation_ids():
     assert parsed["phase_b_current"] == 7.2
     assert parsed["phase_c_current"] == 8.3
     assert parsed["firmware_version"] == "1.2.3"
+
+
+def test_deauthorize_and_stop_targets_the_charger_command():
+    client = zaptec_api.ZaptecCloudClient("user@example.com", "password")
+    client._request = AsyncMock(return_value={})
+
+    assert asyncio.run(client.deauthorize_and_stop("charger-1")) == {}
+    client._request.assert_awaited_once_with(
+        "POST",
+        "/api/chargers/charger-1/SendCommand/10001",
+    )

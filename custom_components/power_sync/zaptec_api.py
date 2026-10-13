@@ -28,6 +28,7 @@ _MIN_CURRENT_UPDATE_INTERVAL = 900.0  # 15 minutes for installation current upda
 # Zaptec charger commands
 ZAPTEC_CMD_RESUME_CHARGING = 507
 ZAPTEC_CMD_STOP_CHARGING = 506
+ZAPTEC_CMD_DEAUTHORIZE_AND_STOP = 10001
 
 
 class ZaptecCloudClient:
@@ -292,6 +293,14 @@ class ZaptecCloudClient:
         return await self._request(
             "POST",
             f"/api/chargers/{charger_id}/SendCommand/{ZAPTEC_CMD_STOP_CHARGING}",
+        )
+
+    async def deauthorize_and_stop(self, charger_id: str) -> dict:
+        """End the current charger session and require fresh authorization."""
+        _LOGGER.info("Zaptec Cloud: deauthorizing and stopping charging on %s", charger_id)
+        return await self._request(
+            "POST",
+            f"/api/chargers/{charger_id}/SendCommand/{ZAPTEC_CMD_DEAUTHORIZE_AND_STOP}",
         )
 
     async def set_installation_current(

@@ -2185,6 +2185,9 @@ class _ZaptecClient:
     async def stop_charging(self, charger_id: str):
         self.calls.append(("stop_charging", charger_id))
 
+    async def deauthorize_and_stop(self, charger_id: str):
+        self.calls.append(("deauthorize_and_stop", charger_id))
+
 
 class _SessionManager:
     def __init__(self) -> None:
@@ -10672,6 +10675,43 @@ def test_zaptec_waiting_sets_current_without_resume():
 
     assert result is True
     assert client.calls == [("set_installation_current", "installation-1", 16)]
+
+
+def test_zaptec_waiting_start_records_pending_authorization():
+    hass, _client = _zaptec_hass({"charger_operation_mode": "connected_waiting"})
+    params = {"charger_type": "zaptec"}
+
+    result = asyncio.run(
+        actions._start_zaptec_charging(
+            hass,
+            _zaptec_entry("installation-1"),
+            amps=16,
+            params=params,
+        )
+    )
+
+    assert result is True
+    assert params["_zaptec_pending_start"] is True
+
+
+def test_zaptec_waiting_pending_start_deauthorizes_exact_charger():
+    hass, client = _zaptec_hass({"charger_operation_mode": "connected_waiting"})
+
+    result = asyncio.run(
+        actions._set_vehicle_amps_unchecked(
+            hass,
+            _zaptec_entry("installation-1"),
+            "zaptec_standalone",
+            0,
+            {
+                "charger_type": "zaptec",
+                "_zaptec_pending_start": True,
+            },
+        )
+    )
+
+    assert result is True
+    assert client.calls == [("deauthorize_and_stop", "charger-1")]
 
 
 def test_zaptec_already_charging_updates_current_without_resume():

@@ -2659,6 +2659,91 @@ async def _no_vehicles(*args, **kwargs):
     return []
 
 
+def test_price_level_keeps_zaptec_pending_and_late_charge_owned(monkeypatch):
+    class ZaptecEntry(_FakeConfigEntry):
+        options = {
+            "zaptec_standalone_enabled": True,
+            "zaptec_username": "user@example.com",
+            "zaptec_charger_id": "charger-1",
+        }
+
+    hass = _FakeHass(price_settings={"preserve_home_battery": True})
+    hass.data["power_sync"]["entry-1"]["zaptec_cached_state"] = {
+        "charger_operation_mode": "connected_waiting",
+        "total_charge_power_w": 0,
+    }
+    monkeypatch.setattr(ev_planner, "discover_all_tesla_vehicles", _no_vehicles)
+
+    executor = ev_planner.PriceLevelChargingExecutor(hass, ZaptecEntry())
+    state = executor._get_or_create_vehicle_state("zaptec_standalone")
+    state.start_pending = True
+    state.zaptec_owned = True
+    state.charging_mode = "price_level_opportunity"
+    executor.get_charging_decision = AsyncMock(
+        return_value=(False, "Price above threshold", "")
+    )
+    executor._stop_charging = AsyncMock(return_value=True)
+    executor.apply_preserve_home_battery = AsyncMock()
+
+    asyncio.run(executor.evaluate_all_vehicles(28))
+
+    executor._stop_charging.assert_awaited_once_with(
+        "Price above threshold",
+        vehicle_vin="zaptec_standalone",
+    )
+    executor.apply_preserve_home_battery.assert_awaited_with(
+        True,
+        "Price above threshold",
+    )
+
+    executor._stop_charging.reset_mock()
+    hass.data["power_sync"]["entry-1"]["zaptec_cached_state"] = {
+        "charger_operation_mode": "charging",
+        "total_charge_power_w": 7000,
+    }
+    state.start_pending = False
+    state.is_charging = False
+    state.zaptec_owned = True
+
+    asyncio.run(executor.evaluate_all_vehicles(28))
+
+    executor._stop_charging.assert_awaited_once_with(
+        "Price above threshold",
+        vehicle_vin="zaptec_standalone",
+    )
+
+
+def test_price_level_zaptec_stop_failure_keeps_pending_attribution(monkeypatch):
+    class ZaptecEntry(_FakeConfigEntry):
+        options = {
+            "zaptec_standalone_enabled": True,
+            "zaptec_username": "user@example.com",
+            "zaptec_charger_id": "charger-1",
+        }
+
+    executor = ev_planner.PriceLevelChargingExecutor(
+        _FakeHass(),
+        ZaptecEntry(),
+    )
+    state = executor._get_or_create_vehicle_state("zaptec_standalone")
+    state.start_pending = True
+    state.charging_mode = "price_level_opportunity"
+    guarded_stop = AsyncMock(return_value=False)
+    monkeypatch.setattr(ev_planner, "_stop_coordinated_charging", guarded_stop)
+
+    result = asyncio.run(
+        executor._stop_charging(
+            "Price above threshold",
+            vehicle_vin="zaptec_standalone",
+        )
+    )
+
+    assert result is False
+    assert state.start_pending is True
+    assert state.stop_pending is False
+    assert guarded_stop.await_args.kwargs["zaptec_pending_start"] is True
+
+
 def test_auto_schedule_tesla_helpers_use_powersync_proxy_base(monkeypatch):
     const = importlib.import_module("power_sync.const")
     fake_session = _FakeTeslaSession()
