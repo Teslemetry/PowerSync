@@ -8672,6 +8672,29 @@ class BatteryOptimizer:
                     power_w = natural_discharge_kw * 1000
                     reported_charge_w = 0.0
                     reported_discharge_w = natural_discharge_kw * 1000
+                    # An export witness can be clipped to zero at the
+                    # optimizer floor while native PV is still available.
+                    # Reclassifying that slot as self-consumption must retain
+                    # the native solar charge; otherwise the emitted action
+                    # exports the surplus that the inverter would absorb.
+                    charge_kw = 0.0
+                    discharge_kw = natural_discharge_kw
+                    native_solar_surplus_kw = max(0.0, solar[t] - load[t])
+                    if native_solar_surplus_kw > threshold_kw:
+                        charge_room_kw = (
+                            max(0.0, 1.0 - soc) * cap / (eff * dt)
+                            if cap > 0 and dt > 0
+                            else 0.0
+                        )
+                        charge_kw = min(
+                            self.max_charge_kw,
+                            native_solar_surplus_kw,
+                            charge_room_kw,
+                        )
+                        discharge_kw = 0.0
+                        reported_charge_w = charge_kw * 1000
+                        reported_discharge_w = 0.0
+                        power_w = reported_charge_w
                 elif discharge_kw > export_room_kw:
                     capped_discharge_w = export_room_kw * 1000
                     reported_charge_w = 0.0
