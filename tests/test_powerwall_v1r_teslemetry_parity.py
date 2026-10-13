@@ -243,9 +243,14 @@ async def test_common_api_diagnostics_are_read_only_and_credential_free():
             response = reply.common.get_system_info_response
             response.device_id.part_number = "1234567-00-A"
             response.device_id.serial_number = "TG123456789"
-            response.din = "DIN--1"
-            response.firmware_version.version = "24.44.0"
-            response.firmware_version.githash = b"\xaa\xbb"
+            if hasattr(response, "firmware_version"):
+                response.din = "DIN--1"
+                response.firmware_version.version = "24.44.0"
+                response.firmware_version.githash = b"\xaa\xbb"
+            else:
+                response.din.value = "DIN--1"
+                response.firmare_version.version = "24.44.0"
+                response.firmare_version.githash = b"\xaa\xbb"
             response.device_type = device_pb2.DEVICE_TYPE_SITECONTROLLER
         elif request_name == "get_networking_status_request":
             wifi = reply.common.get_networking_status_response.wifi
@@ -313,6 +318,34 @@ async def test_common_api_diagnostics_are_read_only_and_credential_free():
     assert internet["eth"]["connectivity"]["internet"] is True
     assert "ssid" not in repr(networking).lower()
     assert "password" not in repr(networking).lower()
+
+
+@async_test
+async def test_get_system_info_supports_legacy_tesla_protocol_shape():
+    transport = _transport_without_key()
+    transport._read_common = AsyncMock(
+        return_value=SimpleNamespace(
+            device_id=SimpleNamespace(
+                part_number="1234567-00-A",
+                serial_number="TG123456789",
+            ),
+            din=SimpleNamespace(value="DIN--1"),
+            firmare_version=SimpleNamespace(
+                version="24.44.0",
+                githash=b"\xaa\xbb",
+            ),
+            device_type=device_pb2.DEVICE_TYPE_SITECONTROLLER,
+        )
+    )
+
+    assert await transport.get_system_info("DIN--1") == {
+        "part_number": "1234567-00-A",
+        "serial_number": "TG123456789",
+        "din": "DIN--1",
+        "firmware_version": "24.44.0",
+        "firmware_githash": "aabb",
+        "device_type": "SITECONTROLLER",
+    }
 
 
 @async_test

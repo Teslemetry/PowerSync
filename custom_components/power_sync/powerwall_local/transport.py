@@ -62,6 +62,14 @@ def _enum_suffix(enum_type: Any, value: int, prefix: str) -> str:
     return name.removeprefix(prefix)
 
 
+def _protobuf_text(value: Any) -> str | None:
+    """Read text from either a scalar or a legacy protobuf wrapper."""
+    if isinstance(value, str):
+        return value or None
+    wrapped = getattr(value, "value", None)
+    return wrapped if isinstance(wrapped, str) and wrapped else None
+
+
 def _ipv4(value: int) -> str | None:
     """Render Tesla's fixed32 IPv4 value without leaking raw binary data."""
     if not value:
@@ -732,14 +740,20 @@ class TEDAPIv1rTransport:
         )
         if response is None:
             return None
+        firmware = getattr(response, "firmware_version", None)
+        if firmware is None:
+            # tesla-protocol <2.0.0 exposes the same wire field as the
+            # historical ``firmare_version`` spelling.
+            firmware = getattr(response, "firmare_version", None)
+        githash = getattr(firmware, "githash", None)
         return {
             "part_number": response.device_id.part_number or None,
             "serial_number": response.device_id.serial_number or None,
-            "din": response.din or None,
-            "firmware_version": response.firmware_version.version or None,
+            "din": _protobuf_text(response.din),
+            "firmware_version": getattr(firmware, "version", None) or None,
             "firmware_githash": (
-                response.firmware_version.githash.hex()
-                if response.firmware_version.githash
+                githash.hex()
+                if githash
                 else None
             ),
             "device_type": _enum_suffix(
