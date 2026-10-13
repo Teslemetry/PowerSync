@@ -386,6 +386,63 @@ def test_cost_neutral_values_executable_morning_solar_charge(
     assert 0 < result.lp_stats["cost_neutral_planned_earnings"] <= 2.04
 
 
+def test_cost_neutral_clipped_export_keeps_native_solar_charge(
+    optimizer_module,
+):
+    """A clipped export witness must not discard available native PV charge."""
+    if not optimizer_module.HIGHS_AVAILABLE:
+        pytest.skip("requires HiGHS LP solver")
+
+    optimizer = optimizer_module.BatteryOptimizer(
+        capacity_wh=24_180,
+        max_charge_w=12_600,
+        max_discharge_w=14_400,
+        max_grid_import_w=20_000,
+        max_grid_export_w=5_000,
+        efficiency=0.92,
+        backup_reserve=0.05,
+        hardware_reserve=0.02,
+        interval_minutes=5,
+        horizon_hours=1 / 12,
+        terminal_weight=0.0,
+    )
+    plan = optimizer_module.CostNeutralPlan(
+        day_ids=["2026-10-13"],
+        earnings_caps_by_day={"2026-10-13": 1.87},
+        forecast_import_costs_by_day={"2026-10-13": 0.0},
+        fixed_cost_allowances_by_day={"2026-10-13": 1.87},
+        settlement_import_prices=[0.28],
+        settlement_export_prices=[0.2247],
+        current_day="2026-10-13",
+    )
+
+    result = optimizer.optimize(
+        import_prices=[0.28],
+        export_prices=[0.2247],
+        solar_forecast=[3.0],
+        load_forecast=[2.0],
+        current_soc=0.05,
+        acquisition_cost_kwh=0.08833937,
+        allow_battery_export=[True],
+        allow_grid_charge=True,
+        cost_neutral_plan=plan,
+        schedule_timestamps=[
+            datetime(2026, 10, 13, 11, tzinfo=timezone(timedelta(hours=10)))
+        ],
+    )
+
+    action = result.schedule.actions[0]
+    assert result.feasible is True
+    assert result.lp_stats["mode_converged"] is True
+    assert action.action == "self_consumption"
+    assert action.battery_charge_w == pytest.approx(1_000.0)
+    assert action.battery_discharge_w == pytest.approx(0.0)
+    assert action.soc == pytest.approx(0.0532, abs=0.0001)
+    assert result.grid_import_w == pytest.approx([0.0])
+    assert result.grid_export_w == pytest.approx([0.0])
+    assert result.lp_stats["cost_neutral_planned_earnings"] == pytest.approx(0.0)
+
+
 def test_cost_neutral_ev_sources_match_settled_battery_export(
     optimizer_module,
 ):

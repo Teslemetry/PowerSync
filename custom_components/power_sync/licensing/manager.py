@@ -85,17 +85,25 @@ class HALicenseManager(LicenseRuntime):
         state = self.entries.setdefault(entry_id, {})
         state["generation"] = state.get("generation", 0) + 1
         state["unloaded"] = False
+        coordinator._licensing_entry_generation = state["generation"]
         if state.get("pre_idle_reserve") is not None:
-            coordinator._pre_idle_backup_reserve = state["pre_idle_reserve"]
+            configured = coordinator._configured_startup_backup_reserve()[0]
+            if "reserve_config_at_journal" in state and configured == state["reserve_config_at_journal"]:
+                coordinator._pre_idle_backup_reserve = state["pre_idle_reserve"]
+            else:
+                # A newer persisted manual reserve takes precedence over an older journal.
+                state.pop("pre_idle_reserve", None)
         executor = getattr(coordinator, "_executor", None)
         if executor and executor.battery_controller and not isinstance(executor.battery_controller, LicensedBatteryController):
             from ..optimization.battery_controller import BatteryControllerWrapper
             if isinstance(executor.battery_controller, BatteryControllerWrapper):
                 executor.battery_controller.entry_id = entry_id
             executor.battery_controller = LicensedBatteryController(self, entry_id, executor.battery_controller)
+            executor.battery_controller._licensing_entry_generation = state["generation"]
         ev = getattr(coordinator, "_ev_coordinator", None)
         if ev:
             ev.entry_id = entry_id
+            ev._licensing_entry_generation = state["generation"]
         if not self._task:
             self._task = self.hass.async_create_background_task(self._loop(), "powersync_ha_licensing")
             self._stop_unsub = self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self._stop)
@@ -107,6 +115,7 @@ class HALicenseManager(LicenseRuntime):
         state["unloaded"] = True
 
     def _stop(self, _event):
+        self.admission.suspend()  # Fence queued commands before HA shuts down.
         if self._task:
             self._task.cancel()
 
@@ -115,8 +124,33 @@ class HALicenseManager(LicenseRuntime):
         if coordinator:
             reserve = getattr(coordinator, "_pre_idle_backup_reserve", None)
             if type(reserve) is int and 0 <= reserve <= 100:
-                self.entries.setdefault(entry_id, {})["pre_idle_reserve"] = reserve
+                state = self.entries.setdefault(entry_id, {})
+                state["pre_idle_reserve"] = reserve
+                state["reserve_config_at_journal"] = coordinator._configured_startup_backup_reserve()[0]
         await super().journal(entry_id)
+
+    async def relinquish(self, entry_id):
+        await LicenseRuntime.relinquish(self, entry_id)
+        coordinator = self.coordinators.get(entry_id)
+        if coordinator:
+            coordinator._pre_idle_backup_reserve = None
+            coordinator._idle_hold_reserve = None
+            coordinator._last_optimizer_self_consumption_reserve_target = None
+            coordinator._last_optimizer_result = None
+            coordinator._current_schedule = None
+
+    def finish_manual_command(self, entry_id):
+        coordinator = self.coordinators.get(entry_id)
+        if not coordinator:
+            return
+        generation = self.entries.get(entry_id, {}).get("generation", 0)
+        coordinator._licensing_entry_generation = generation
+        executor = getattr(coordinator, "_executor", None)
+        if executor and isinstance(executor.battery_controller, LicensedBatteryController):
+            executor.battery_controller._licensing_entry_generation = generation
+        ev = getattr(coordinator, "_ev_coordinator", None)
+        if ev:
+            ev._licensing_entry_generation = generation
 
     async def journal_ev(self, entry_id, config):
         async with self._journal_lock:
@@ -157,6 +191,7 @@ class HALicenseManager(LicenseRuntime):
                 reserve = getattr(coordinator, "_pre_idle_backup_reserve", None)
                 if type(reserve) is int and 0 <= reserve <= 100:
                     state["pre_idle_reserve"] = reserve
+                    state["reserve_config_at_journal"] = coordinator._configured_startup_backup_reserve()[0]
                 try:
                     await self.persist()
                 except Exception:
@@ -195,6 +230,7 @@ class HALicenseManager(LicenseRuntime):
             raise ValueError("optimizer_external_control_active")
         await self.resume(entry_id)
         coordinator._last_optimizer_result = None
+        coordinator._current_schedule = None
         if not await coordinator.enable():
             self.entries.setdefault(entry_id, {})["resume_required"] = True
             await self.persist()

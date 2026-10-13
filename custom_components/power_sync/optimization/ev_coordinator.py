@@ -12,7 +12,7 @@ Strategy:
 """
 from __future__ import annotations
 
-from ..licensing.guard import optimizer_work, optimizer_command
+from ..licensing.guard import optimizer_work, optimizer_command, background_work, OptimizerAccessLost
 
 import asyncio
 import logging
@@ -250,6 +250,7 @@ class EVCoordinator:
                 await manager.persist()
         return not targets
 
+    @background_work
     async def _coordination_loop(self) -> None:
         """Main coordination loop - runs every 5 minutes."""
         while self._running:
@@ -260,6 +261,8 @@ class EVCoordinator:
 
                 await asyncio.sleep(300)  # 5 minutes
 
+            except OptimizerAccessLost:
+                await asyncio.sleep(30)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -941,6 +944,8 @@ class EVCoordinator:
                 self._record_loadpoint_failure(config, "start_ev_coordinator", reason)
                 return False
 
+            if not self._can_control_loadpoint(config, "confirm_ev_coordinator_start"):
+                return False  # A newer manual/Boost owner appeared during the request.
             self._current_charge_amps[entity_id] = target_amps
             self._claim_loadpoint(
                 config,
@@ -1005,6 +1010,8 @@ class EVCoordinator:
         if await self._release_if_tesla_away(config):
             return True
 
+        if not self._owns_loadpoint(config):
+            return False  # Ownership may have changed during the away check.
         _LOGGER.info(f"Stopping EV charging: {config.name}")
 
         try:

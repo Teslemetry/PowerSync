@@ -272,8 +272,8 @@ def manager_method(name):
     source=ROOT/'custom_components/power_sync/licensing/manager.py'
     tree=ast.parse(source.read_text())
     cls=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='HALicenseManager')
-    function=next(n for n in cls.body if isinstance(n,ast.AsyncFunctionDef) and n.name==name)
-    namespace={'asyncio':asyncio,'json':json,'Path':Path,'recovery_scope':guard.recovery_scope,'_LOGGER':logging.getLogger(__name__)}
+    function=next(n for n in cls.body if isinstance(n,(ast.AsyncFunctionDef,ast.FunctionDef)) and n.name==name)
+    namespace={'asyncio':asyncio,'json':json,'Path':Path,'LicenseRuntime':runtime.LicenseRuntime,'recovery_scope':guard.recovery_scope,'_LOGGER':logging.getLogger(__name__)}
     exec(compile(ast.fix_missing_locations(ast.Module(body=[function],type_ignores=[])),str(source),'exec'),namespace)
     return namespace[name]
 
@@ -372,4 +372,109 @@ def test_manual_takeover_fences_read_only_solve_before_first_control():
         task=asyncio.create_task(solve(owner));await waiting.wait()
         await h.client.relinquish('one');release.set()
         with pytest.raises(guard.OptimizerAccessLost):await task
+    asyncio.run(run())
+
+def test_storage_outage_does_not_block_free_manual_takeover():
+    async def run():
+        h=Harness();await h.activate();await h.client.journal('one')
+        h.client.entries['one']['pre_idle_reserve']=20
+        async def failed(_data):raise OSError('disk unavailable')
+        h.client._save=failed
+        await h.client.relinquish('one')
+        assert not h.client.permits('one')
+        assert 'pre_idle_reserve' not in h.client.entries['one']
+    asyncio.run(run())
+
+def test_manager_manual_takeover_clears_old_reserve_and_keeps_manual_available():
+    async def run():
+        h=Harness();await h.activate();await h.client.journal('one')
+        h.client.entries['one'].update(pre_idle_reserve=20,reserve_config_at_journal=20)
+        c=types.SimpleNamespace(_pre_idle_backup_reserve=20,_idle_hold_reserve=70,_last_optimizer_self_consumption_reserve_target=70)
+        h.client.coordinators={'one':c}
+        async def failed(_data):raise OSError('disk unavailable')
+        h.client._save=failed
+        await manager_method('relinquish')(h.client,'one')
+        assert c._pre_idle_backup_reserve is None and c._idle_hold_reserve is None
+        assert guard.service_allowed(types.SimpleNamespace(data={runtime.DATA_KEY:h.client}),{'source':'user'},'handle_force_charge')
+        assert not h.client.permits('one')
+    asyncio.run(run())
+
+
+def test_restart_does_not_restore_an_old_reserve_over_newer_manual_preferences():
+    import ast
+    source=ROOT/'custom_components/power_sync/licensing/manager.py'
+    cls=next(n for n in ast.parse(source.read_text()).body if isinstance(n,ast.ClassDef) and n.name=='HALicenseManager')
+    function=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='attach')
+    namespace={}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[function],type_ignores=[])),str(source),'exec'),namespace)
+    manager=types.SimpleNamespace(entries={'one':{'pre_idle_reserve':20,'reserve_config_at_journal':20,'recovery_pending':True}},coordinators={},_task=True)
+    c=types.SimpleNamespace(entry_id='one',_pre_idle_backup_reserve=None,_configured_startup_backup_reserve=lambda:(65,'manual'),_executor=None,_ev_coordinator=None)
+    namespace['attach'](manager,c)
+    assert c._pre_idle_backup_reserve is None
+    assert 'pre_idle_reserve' not in manager.entries['one']
+    assert manager.entries['one']['recovery_pending']
+
+def test_active_owned_control_journal_does_not_report_a_paused_optimiser():
+    async def run():
+        h=Harness();await h.activate();await h.client.journal('one')
+        assert h.stored['entries']['one']['recovery_pending']
+        assert h.client.status('one')['can_optimize']
+        assert not h.client.status('one')['recovery_pending']
+        h.denied=True;h.revision=2;await h.client.maintain(force=True)
+        assert h.client.status('one')['recovery_pending']
+    asyncio.run(run())
+
+def test_long_lived_loop_starts_fresh_work_after_manual_generation_changes():
+    async def run():
+        h=Harness();await h.activate();first=asyncio.Event();next_tick=asyncio.Event();events=[]
+        owner=types.SimpleNamespace(hass=types.SimpleNamespace(data={runtime.DATA_KEY:h.client}),entry_id='one',_licensing_entry_generation=0,_executor=None,_ev_coordinator=None)
+        h.client.coordinators={'one':owner}
+        @guard.optimizer_work
+        async def decide(owner):events.append(guard.control_entry_generation())
+        @guard.background_work
+        async def loop(owner):
+            await decide(owner);first.set();await next_tick.wait();await decide(owner)
+        @guard.optimizer_work
+        async def enable(owner):return asyncio.create_task(loop(owner))
+        task=await enable(owner);await first.wait()
+        await h.client.relinquish('one')
+        manager_method('finish_manual_command')(h.client,'one')
+        next_tick.set();await task
+        assert events==[0,1],'the producer keeps running, while each decision captures its own current generation'
+    asyncio.run(run())
+
+
+def test_unloaded_object_cannot_start_new_work_in_a_reloaded_entry():
+    async def run():
+        h=Harness();await h.activate();h.client.entries={'one':{'generation':2}}
+        old=types.SimpleNamespace(hass=types.SimpleNamespace(data={runtime.DATA_KEY:h.client}),entry_id='one',_licensing_entry_generation=1)
+        new=types.SimpleNamespace(hass=old.hass,entry_id='one',_licensing_entry_generation=2)
+        @guard.optimizer_work
+        async def decision(owner):return True
+        assert await decision(old) is False
+        assert await decision(new) is True
+    asyncio.run(run())
+
+
+def test_superseded_solve_cannot_leave_a_cached_schedule_for_later_dispatch():
+    async def run():
+        h=Harness();await h.activate();ready=asyncio.Event();release=asyncio.Event()
+        owner=types.SimpleNamespace(hass=types.SimpleNamespace(data={runtime.DATA_KEY:h.client}),entry_id='one',_last_optimizer_result=None,_current_schedule=None)
+        @guard.optimizer_work
+        async def _run_optimization(owner):
+            ready.set();await release.wait();owner._last_optimizer_result=owner._current_schedule='old plan'
+        task=asyncio.create_task(_run_optimization(owner));await ready.wait()
+        await h.client.relinquish('one');release.set()
+        with pytest.raises(guard.OptimizerAccessLost):await task
+        assert owner._last_optimizer_result is None and owner._current_schedule is None
+    asyncio.run(run())
+
+
+def test_shadow_subscription_denial_does_not_invent_a_future_resume_requirement():
+    async def run():
+        h=Harness();h.policy=rollout(rollout_mode='shadow',activation_at=None,legacy_access_until=None);h.denied=True
+        await h.activate();assert not h.client.admission.suspended
+        h.denied=False;h.revision=2;await h.client.maintain(force=True)
+        h.policy=rollout();await h.client.maintain(force=True)
+        assert h.client.permits('one') and not h.client.status('one')['requires_resume']
     asyncio.run(run())

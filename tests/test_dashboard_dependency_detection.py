@@ -1050,7 +1050,7 @@ def test_energy_history_overlays_battery_soc_on_a_secondary_axis():
         source.index("function _demandCharge")
     ]
 
-    assert "_combinedEnergyChart(e, hasE('home_load'), hasE('battery_level'))" in source
+    assert "_combinedEnergyChart(e, hasE('home_load'), hasE('battery_level'), hass)" in source
     assert "axis: 'right'" in energy_chart
     assert "entity: e('battery_level')" in energy_chart
     assert "name: 'Battery SOC'" in energy_chart
@@ -1059,7 +1059,7 @@ def test_energy_history_overlays_battery_soc_on_a_secondary_axis():
     assert "rightYMax: 100" in energy_chart
     assert "const rightAxisSeries = chartSeries.filter" in chart_source
     assert "const primaryAxisSeries = chartSeries.filter" in chart_source
-    assert "const seriesYScale = series.axis === 'right' ? rightYScale : yScale;" in chart_source
+    assert "const seriesYScale = series.axis === 'price' ? priceYScale : series.axis === 'right' ? rightYScale : yScale;" in chart_source
     assert 'text-anchor="start"' in chart_source
 
     prelude = """
@@ -1944,3 +1944,90 @@ def test_daily_cost_rows_survive_an_unknown_monetary_value():
       if (absent.length !== 0) throw new Error('rows emitted for entities that do not exist');
     """
     subprocess.run(["node", "-e", runtime], check=True)
+
+
+def test_energy_day_prices_are_optional_signed_history_with_independent_axes():
+    """#352: users can compare today's observed prices with power and SOC."""
+    source = STRATEGY_PATH.read_text()
+    chart = source[source.index('class PowerSyncChart extends HTMLElement'):source.index("if (!customElements.get('power-sync-chart'))")]
+    builder = source[source.index('function _combinedEnergyChart'):source.index('function _demandCharge')]
+    runtime = r"""
+      const assert = require('node:assert/strict');
+      global.requestAnimationFrame = () => {};
+      global.HTMLElement = class {
+        attachShadow() {
+          this.shadowRoot = {
+            innerHTML: '', buttons: [],
+            querySelector() { return null; },
+            querySelectorAll() { return this.buttons; },
+          };
+        }
+        getBoundingClientRect() { return {width: this.testWidth || 640}; }
+      };
+      function _priceMeta() { return {minorPriceUnit: 'p/kWh', minorUnit: 'p'}; }
+    """ + chart + builder + r"""
+      const e = name => `sensor.${name}`;
+      const now = Date.now();
+      const hass = {config: {time_zone: 'Australia/Brisbane'}, states: {}};
+      for (const [name, state] of Object.entries({solar_power: '4', grid_power: '-2',
+          battery_power: '1', battery_level: '55', current_import_price: '0.325', current_export_price: '-0.02'})) {
+        hass.states[e(name)] = {state, last_updated: new Date(now - 1800000).toISOString()};
+      }
+      const config = _combinedEnergyChart(e, false, true, hass);
+      const prices = config.series.filter(s => s.axis === 'price');
+      assert.deepEqual(prices.map(s => s.name), ['Buy Price', 'Sell Price']);
+      assert.equal(prices.every(s => s.hiddenByDefault), true);
+      assert.equal(_combinedEnergyChart(e, false, false, {states: {}}).series.length, 3);
+      assert.equal(_combinedEnergyChart(e, false, false, {states: {[e('current_export_price')]: {state: '0'}}}).series.length, 4);
+      for (const width of [320, 360, 640]) {
+        const card = new PowerSyncChart();
+        card.testWidth = width;
+        card._hass = hass;
+        card.setConfig(config);
+        for (const s of config.series) card._historyCache.set(s.entity, [[now-3600000, Number(hass.states[s.entity].state)], [now, Number(hass.states[s.entity].state)]]);
+        card._render();
+        let html = card.shadowRoot.innerHTML;
+        assert.equal(html.includes('stroke="#FF9800"'), false);
+        assert.equal(html.includes('stroke="#E91E63"'), false);
+        assert.equal(html.includes('100%'), true);
+        assert.match(html, /data-series-key="sensor.current_import_price" aria-pressed="false"/);
+        const button = {dataset: {seriesKey: e('current_import_price')}, addEventListener(event, handler) {this.click = handler;}};
+        card.shadowRoot.buttons = [button];
+        card._attachLegendToggles();
+        button.click();
+        card._hiddenSeries.delete(e('current_export_price'));
+        card._render();
+        html = card.shadowRoot.innerHTML;
+        assert.equal(html.includes('stroke="#FF9800"'), true);
+        assert.equal(html.includes('stroke="#E91E63"'), true);
+        assert.equal(html.includes('100%'), true);
+        assert.equal(html.includes('32.50p/kWh'), true);
+        assert.equal(html.includes('-2.00p/kWh'), true);
+        assert.equal(/NaN|Infinity/.test(html), false);
+        for (const [, x] of html.matchAll(/<text x="([0-9.]+)"[^>]*text-anchor="start"/g)) assert.ok(Number(x) < width - 35);
+        // A config refresh and HA updates must keep an enabled price enabled.
+        card.setConfig(config);
+        assert.equal(card._hiddenSeries.has(e('current_import_price')), false);
+        button.click();
+        assert.equal(card._hiddenSeries.has(e('current_import_price')), true);
+      }
+      const card = new PowerSyncChart();
+      card._hass = hass;
+      const window = card._historyWindow(config);
+      assert.equal(new Date(window.startMs).toISOString().slice(11), '14:00:00.000Z');
+      const observed = now - 1800000;
+      const point = {state: '-0.02', last_updated: new Date(observed).toISOString()};
+      assert.deepEqual(card._priceHistoryPoints([], point, window), [[observed, -0.02], [window.nowMs, -0.02]]);
+      assert.deepEqual(card._priceHistoryPoints([], {state: '0.2'}, window), []);
+      for (const state of ['unknown', 'unavailable', '', null]) {
+        assert.deepEqual(card._priceHistoryPoints([], {state, last_updated: point.last_updated}, window), []);
+      }
+      assert.deepEqual(card._priceHistoryPoints([[now+60000, 99]], {state: 'unknown'}, window), []);
+      assert.deepEqual(card._priceHistoryPoints([[observed, -0.02]], {state: 'unknown'}, window), [[observed, -0.02]]);
+      // Each midnight is resolved independently across daylight-saving changes.
+      const spring = Date.UTC(2026, 9, 4);
+      const autumn = Date.UTC(2026, 3, 5);
+      assert.equal(card._localMidnight(spring+86400000, 'Australia/Sydney') - card._localMidnight(spring, 'Australia/Sydney'), 23*3600000);
+      assert.equal(card._localMidnight(autumn+86400000, 'Australia/Sydney') - card._localMidnight(autumn, 'Australia/Sydney'), 25*3600000);
+    """
+    subprocess.run(['node', '-e', runtime], check=True)

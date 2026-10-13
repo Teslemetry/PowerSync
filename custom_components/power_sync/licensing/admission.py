@@ -18,11 +18,14 @@ class OptimizerAdmission:
         previous = self.permission
         if previous and (permission.epoch, permission.revision) < (previous.epoch, previous.revision):
             raise ValueError("stale_revision")
-        if previous and previous.entitled and permission.issued_at >= previous.expires_at:
+        if self.enforced and previous and previous.entitled and permission.issued_at >= previous.expires_at:
             self.suspend()
         self.permission = permission
         if not permission.entitled:
-            self.suspend()
+            if self.enforced:
+                self.suspend()
+            elif previous is None or previous.entitled:
+                self.generation += 1  # Shadow observations fence old work without inventing an access gap.
 
     def suspend(self) -> None:
         if self.suspended:

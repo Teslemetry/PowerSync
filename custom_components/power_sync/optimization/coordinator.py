@@ -6,7 +6,7 @@ to produce a schedule, which the execution layer then applies.
 """
 from __future__ import annotations
 
-from ..licensing.guard import optimizer_work, optimizer_command, fenced_call, restoration_work
+from ..licensing.guard import optimizer_work, optimizer_command, fenced_call, restoration_work, background_work, OptimizerAccessLost
 
 import asyncio
 import calendar
@@ -5456,6 +5456,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         return True
 
+    @background_work
     async def _run_initial_optimization_after_startup_delay(self) -> None:
         """Run the first optimizer pass once HA has finished starting.
 
@@ -8245,6 +8246,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         return True
 
+    @background_work
     async def _schedule_polling_loop(self) -> None:
         """Periodically re-optimize and execute current action.
 
@@ -8300,6 +8302,8 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # Re-optimize on each interval (executes the resulting action internally)
                 await self._run_optimization(execution_trigger="poll")
 
+            except OptimizerAccessLost:
+                continue  # A superseded plan must not kill the producer of fresh plans.
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -19373,15 +19377,15 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     else 0.0
                 )
                 load_w += ev_load_w
-                display_export.append(
-                    round(
-                        max(0.0, solar_w + battery_export - load_w - battery_charge),
-                        1,
-                    )
+                # Total discharge includes energy serving the home/EV as well
+                # as battery-to-grid export. Use one site balance so home load
+                # is subtracted once and import/export stay mutually exclusive.
+                net_grid_w = (
+                    load_w + battery_charge - solar_w
+                    - battery_consume - battery_export
                 )
-                display_import.append(
-                    round(max(0.0, load_w + battery_charge - solar_w - battery_consume), 1)
-                )
+                display_export.append(round(max(0.0, -net_grid_w), 1))
+                display_import.append(round(max(0.0, net_grid_w), 1))
                 continue
 
             if battery_export <= 0:

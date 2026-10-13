@@ -499,3 +499,15 @@ def test_licence_recovery_stops_owned_charger_and_preserves_manual_owner():
         assert hass.services.calls==[('switch','turn_off',{'entity_id':'switch.owned'})]
         assert ev_ownership.get_active_ev_owner_mode(hass,entry,'switch.manual')=='manual'
     asyncio.run(run())
+
+def test_delayed_optimizer_start_does_not_reclaim_newer_boost_owner():
+    async def run():
+        hass=_Hass();entry=_Entry();config=ev_coordinator.EVConfig(entity_id='switch.garage_ev',name='Garage EV')
+        c=ev_coordinator.EVCoordinator(hass,[config],config_entry=entry)
+        async def accepted(_config,amps):
+            ev_ownership.claim_ev_ownership(hass,entry,'switch.garage_ev',owner_mode='boost')
+            return True
+        c._set_shared_action_amps=accepted
+        assert await c._start_charging(config) is False
+        assert ev_ownership.get_active_ev_owner_mode(hass,entry,'switch.garage_ev')=='boost'
+    asyncio.run(run())

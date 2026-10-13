@@ -23,6 +23,14 @@ def routed_handler(hass, entry_id, service, handler):
             target = hass.data.get("power_sync", {}).get(requested, {}).get("licensing_control_handlers", {}).get(service)
             if target is None:
                 raise ValueError("control_entry_not_available")
+        else:
+            target = handler
+        try:
             return await target(call)
-        return await handler(call)
+        finally:
+            manager = hass.data.get("power_sync_license_manager")
+            if manager and call.data.get("source") != "optimizer" and service != "restore_normal":
+                finish = getattr(manager, "finish_manual_command", None)
+                if finish:
+                    finish(requested or entry_id)
     return routed

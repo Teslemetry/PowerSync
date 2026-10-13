@@ -37,6 +37,20 @@ def scope_for(owner):
     return scope[:2] if scope else (getattr(owner, "entry_id", None), None)
 
 
+def background_work(function):
+    """Long-lived loops start each new decision without inheriting a stale caller scope."""
+    @wraps(function)
+    async def fresh(self, *args, **kwargs):
+        token = _scope.set(None)
+        recovery = _recovering.set(False)
+        try:
+            return await function(self, *args, **kwargs)
+        finally:
+            _recovering.reset(recovery)
+            _scope.reset(token)
+    return fresh
+
+
 def optimizer_work(function):
     @wraps(function)
     async def guarded(self, *args, **kwargs):
@@ -48,14 +62,19 @@ def optimizer_work(function):
             generation = manager.admission.generation
         epoch = control_entry_generation()
         if epoch is None:
-            epoch = manager.entries.get(entry_id, {}).get("generation", 0)
+            epoch = getattr(self, "_licensing_entry_generation", manager.entries.get(entry_id, {}).get("generation", 0))
         if manager.admission.enforced and not entry_id:
             return False
         if not manager.permits(entry_id, generation, epoch):
             return False
         token = _scope.set((entry_id, generation, epoch))
         try:
-            return await function(self, *args, **kwargs)
+            result = await function(self, *args, **kwargs)
+            if function.__name__ == "_run_optimization" and not manager.permits(entry_id, generation, epoch):
+                self._last_optimizer_result = None
+                self._current_schedule = None
+                raise OptimizerAccessLost("optimizer_plan_superseded")
+            return result
         finally:
             _scope.reset(token)
     return guarded

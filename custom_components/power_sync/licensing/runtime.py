@@ -86,8 +86,13 @@ class LicenseRuntime:
                 self.admission.suspend()
 
     def _update_enforcement(self):
+        previous = self.admission.enforced
         self.admission.enforced = (self.policy is None or self.policy.enforces(self.now())
             or self.policy.mode == "shadow" and self.now() >= self.policy.expires_at)
+        if self.admission.enforced and not previous:
+            self.admission.generation += 1
+            if not self.admission.permission or not self.admission.permission.allows_optimization(self.now()):
+                self.admission.suspend()
 
     def permits(self, entry_id=None, generation=None, entry_generation=None):
         self._update_enforcement()
@@ -205,7 +210,14 @@ class LicenseRuntime:
         state["generation"] = state.get("generation", 0) + 1
         async with self.control_lock(entry_id):
             state["recovery_pending"] = bool(state.get("ev_targets"))
-            await self.persist()
+            state.pop("pre_idle_reserve", None)
+            state.pop("reserve_config_at_journal", None)
+            try:
+                await self.persist()
+            except Exception:
+                # persist() already closes paid admission. A local storage outage must
+                # never prevent the user's own manual hardware command.
+                pass
 
     async def resume(self, entry_id):
         if not self.storage_ok or not self.admission.permission or not self.admission.permission.allows_optimization(self.now()):
@@ -236,7 +248,7 @@ class LicenseRuntime:
         result = self.admission.api_status(self.now())
         result["can_optimize"] = self.permits(entry_id)
         result["requires_resume"] = result["requires_resume"] or bool(self.entries.get(entry_id, {}).get("resume_required"))
-        result["recovery_pending"] = bool(self.entries.get(entry_id, {}).get("recovery_pending"))
+        result["recovery_pending"] = bool(self.entries.get(entry_id, {}).get("recovery_pending") and not result["can_optimize"])
         result["paired"] = self.paired
         result["entry_id"] = entry_id
         result["verification_error"] = self.error
