@@ -779,3 +779,38 @@ def test_fresh_recovered_powersync_session_blocks_external_claim():
 
     assert claimed is False
     assert ev_ownership.get_ev_ownership(hass, _Entry(), vehicle_id) == (None, None)
+
+
+def test_anonymous_non_tesla_policy_maps_only_the_configured_loadpoint():
+    for charger_type, loadpoint, options in (
+        ("generic", "generic_ev", {"generic_charger_enabled": True, "generic_charger_switch_entity": "switch.garage"}),
+        ("ocpp", "ocpp_garage", {"ocpp_enabled": True, "ocpp_charger_id": "garage"}),
+    ):
+        hass = _Hass()
+        store = _set_external_policy(hass, "_default", "yield")
+        profile = store._data["vehicle_charging_configs"][0]
+        profile["charger_type"] = charger_type
+        entry = _Entry()
+        entry.options = options
+        assert ev_ownership.get_external_control_policy(hass, entry, loadpoint) == "yield"
+        assert ev_ownership.get_external_control_policy(hass, entry, "ocpp_other") == "override"
+        assert ev_ownership.get_external_control_policy(hass, entry, "VIN123") == "override"
+        store._data["vehicle_charging_configs"].append({"vehicle_id": "other", "charger_type": charger_type})
+        assert ev_ownership.get_external_control_policy(hass, entry, loadpoint) == "override"
+
+
+def test_anonymous_non_tesla_policy_does_not_cross_charger_mapping():
+    for charger_type, loadpoint, options, profile_key in (
+        ("generic", "generic_ev", {"generic_charger_enabled": True, "generic_charger_switch_entity": "switch.garage"}, "charger_switch_entity"),
+        ("ocpp", "ocpp_garage", {"ocpp_enabled": True, "ocpp_charger_id": "garage"}, "ocpp_charger_id"),
+    ):
+        hass = _Hass()
+        store = _set_external_policy(hass, "_default", "yield")
+        profile = store._data["vehicle_charging_configs"][0]
+        profile.update({"charger_type": charger_type, profile_key: "other"})
+        entry = _Entry()
+        entry.options = options
+        assert ev_ownership.get_external_control_policy(hass, entry, loadpoint) == "override"
+        profile.pop(profile_key)
+        profile["charger_type"] = "tesla"
+        assert ev_ownership.get_external_control_policy(hass, entry, loadpoint) == "override"

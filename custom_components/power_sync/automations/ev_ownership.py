@@ -234,6 +234,43 @@ def get_external_control_policy(
             )
         ]
 
+        # Older non-Tesla profiles can store the anonymous id while Price-Level
+        # uses the configured charger's synthetic id. Preserve an explicit
+        # policy only when one profile and the exact configured backend agree.
+        if not matches and len(configs) == 1:
+            config = configs[0]
+            options = {
+                **getattr(config_entry, "data", {}),
+                **getattr(config_entry, "options", {}),
+            }
+            configured_type = None
+            if vid == "generic_ev" and options.get("generic_charger_enabled"):
+                configured_type = "generic"
+            elif (
+                options.get("ocpp_enabled")
+                and vid == f"ocpp_{options.get('ocpp_charger_id') or 'ocpp_charger'}"
+            ):
+                configured_type = "ocpp"
+            entity_keys = (
+                ("charger_switch_entity", "generic_charger_switch_entity"),
+                ("charger_amps_entity", "generic_charger_amps_entity"),
+                ("charger_status_entity", "generic_charger_status_entity"),
+                ("charger_power_entity", "generic_charger_power_entity"),
+            ) if configured_type == "generic" else (("ocpp_charger_id", "ocpp_charger_id"),)
+            mappings_agree = all(
+                not config.get(profile_key)
+                or not options.get(option_key)
+                or str(config[profile_key]).strip() == str(options[option_key]).strip()
+                for profile_key, option_key in entity_keys
+            )
+            if (
+                configured_type is not None
+                and mappings_agree
+                and normalize_vehicle_id(config.get("vehicle_id")) == DEFAULT_VEHICLE_ID
+                and str(config.get("charger_type") or "").lower() == configured_type
+            ):
+                matches = [config]
+
     if len(matches) != 1:
         return EXTERNAL_CONTROL_POLICY_OVERRIDE
     return normalize_external_control_policy(

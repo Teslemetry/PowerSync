@@ -8772,3 +8772,32 @@ def test_price_level_cancels_pending_generic_start_when_price_becomes_ineligible
 
     fake_actions._action_stop_ev_charging_dynamic.assert_awaited_once()
     assert fake_actions._action_stop_ev_charging_dynamic.call_args.args[2]["vehicle_id"] == "generic_ev"
+
+
+@pytest.mark.parametrize("charger_type,loadpoint", [("generic", "generic_ev"), ("ocpp", "ocpp_garage")])
+@pytest.mark.parametrize("should_charge", [False, True])
+def test_price_level_preserves_unique_default_profile_hands_off_policy(
+    monkeypatch, fake_actions, charger_type, loadpoint, should_charge
+):
+    """A legacy anonymous profile must keep its explicitly saved hands-off policy."""
+    hass = _FakeHass()
+    _set_external_policy(hass, "_default", policy="yield")
+    hass.data["power_sync"]["entry-1"]["automation_store"]._data["vehicle_charging_configs"][0]["charger_type"] = charger_type
+    entry = SimpleNamespace(entry_id="entry-1", data={}, options={
+        "generic_charger_enabled": charger_type == "generic", "ocpp_enabled": charger_type == "ocpp",
+        "ocpp_charger_id": "garage", "generic_charger_status_entity": "sensor.zeekr_status",
+    })
+    status = "sensor.zeekr_status" if charger_type == "generic" else "sensor.garage_status_connector"
+    hass.states._states[status] = SimpleNamespace(entity_id=status, state="Charging", attributes={}, last_reported=datetime.now(timezone.utc))
+    monkeypatch.setattr(ev_planner, "discover_all_tesla_vehicles", _no_vehicles)
+    executor = ev_planner.PriceLevelChargingExecutor(hass, entry)
+    executor.get_charging_decision = AsyncMock(return_value=(should_charge, "Price policy", "price_level_opportunity" if should_charge else ""))
+    executor.apply_preserve_home_battery = AsyncMock()
+    executor._start_charging = AsyncMock()
+    fake_actions._action_stop_ev_charging_dynamic = AsyncMock(return_value=True)
+
+    asyncio.run(executor.evaluate_all_vehicles(5 if should_charge else 28))
+
+    executor._start_charging.assert_not_awaited()
+    fake_actions._action_stop_ev_charging_dynamic.assert_not_awaited()
+    assert executor._get_or_create_vehicle_state(loadpoint).last_decision == "external"
