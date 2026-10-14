@@ -19557,6 +19557,7 @@ class EVLoadpointStatusView(HomeAssistantView):
                 zaptec_connected = zaptec_mode in (
                     "charging",
                     "connected_waiting",
+                    "connected_finished",
                     "connected_finishing",
                 )
                 observed_vehicles.append({
@@ -41641,9 +41642,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 _LOGGER.warning("Zaptec state poll skipped: no charger_id configured")
                 return
             try:
+                poll_started_at = time.monotonic()
                 raw_state = await zaptec_client.get_charger_state(charger_id)
                 parsed = zaptec_client.parse_charger_state(raw_state)
-                hass.data[DOMAIN][entry.entry_id]["zaptec_cached_state"] = parsed
+                entry_data = hass.data[DOMAIN][entry.entry_id]
+                entry_data["zaptec_cached_state"] = parsed
+                entry_data["zaptec_state_poll"] = {
+                    "started_at": poll_started_at,
+                    "completed_at": time.monotonic(),
+                }
                 _LOGGER.debug(
                     "Zaptec state poll OK: mode=%s (raw=%s), power=%sW, "
                     "phase_a=%.1fA, phase_b=%.1fA, phase_c=%.1fA, cable_locked=%s",

@@ -8142,6 +8142,9 @@ class PriceLevelChargingState:
     # the physical charging flag so a price rejection can cancel it exactly.
     start_pending: bool = False
     stop_pending: bool = False
+    # Monotonic boundary after the accepted stop command. A cached noncharging
+    # sample is not a stop readback unless its poll began after this boundary.
+    stop_requested_at: float = 0.0
     zaptec_owned: bool = False
 
 
@@ -9368,6 +9371,7 @@ async def _start_coordinated_charging(
             cooldown_state.start_retry_reason = ""
             cooldown_state.start_pending = bool(params.get("_zaptec_pending_start"))
             cooldown_state.stop_pending = False
+            cooldown_state.stop_requested_at = 0.0
             cooldown_state.zaptec_owned = True
             if hasattr(cooldown_state, "managed_by_powersync"):
                 cooldown_state.managed_by_powersync = False
@@ -10468,6 +10472,7 @@ class PriceLevelChargingExecutor:
             state.is_charging = False
             state.start_pending = False
             state.stop_pending = False
+            state.stop_requested_at = 0.0
             state.charging_mode = ""
             state.last_decision = "waiting"
             if state.start_cooldown_until > time.time():
@@ -10557,6 +10562,7 @@ class PriceLevelChargingExecutor:
         state.start_pending = False
         if is_zaptec:
             state.stop_pending = True
+            state.stop_requested_at = time.monotonic()
             cached_state = (
                 self.hass.data.get(self._domain, {})
                 .get(self.config_entry.entry_id, {})
@@ -10571,6 +10577,7 @@ class PriceLevelChargingExecutor:
             state.is_charging = charger_mode == "charging" or power_w > 50
         else:
             state.stop_pending = False
+            state.stop_requested_at = 0.0
             state.is_charging = False
 
         if vehicle_vin:
@@ -10863,6 +10870,24 @@ class PriceLevelChargingExecutor:
         """Return current Zaptec charging evidence from the exact configured charger."""
         return self._zaptec_cached_charge_state() is True
 
+    def _zaptec_cached_readback_after(self, boundary: float) -> Optional[bool]:
+        """Return cached state only when its poll began after ``boundary``."""
+        if not boundary:
+            return None
+        entry_data = (
+            self.hass.data.get(self._domain, {})
+            .get(self.config_entry.entry_id, {})
+            or {}
+        )
+        poll_meta = entry_data.get("zaptec_state_poll", {}) or {}
+        try:
+            poll_started_at = float(poll_meta.get("started_at"))
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(poll_started_at) or poll_started_at < boundary:
+            return None
+        return self._zaptec_cached_charge_state()
+
     async def evaluate_all_vehicles(
         self,
         current_price_cents: Optional[float]
@@ -10910,9 +10935,12 @@ class PriceLevelChargingExecutor:
 
                 # A successful deauthorize/stop command is not itself a
                 # physical readback.  Keep the policy lifecycle pending until
-                # the cached charger state shows that charging has ceased.
+                # a poll begun after the command shows that charging has ceased.
                 if vehicle_state.stop_pending:
-                    if zaptec_charge_state is not False:
+                    stop_readback = self._zaptec_cached_readback_after(
+                        vehicle_state.stop_requested_at
+                    )
+                    if stop_readback is not False:
                         vehicle_state.is_charging = True
                         vehicle_state.last_decision = "stopping"
                         vehicle_state.last_decision_reason = (
@@ -10921,6 +10949,7 @@ class PriceLevelChargingExecutor:
                         await self.apply_preserve_home_battery(True, reason)
                         return results
                     vehicle_state.stop_pending = False
+                    vehicle_state.stop_requested_at = 0.0
                     vehicle_state.is_charging = False
                     vehicle_state.charging_mode = ""
                     vehicle_state.zaptec_owned = False

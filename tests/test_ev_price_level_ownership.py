@@ -2691,6 +2691,7 @@ def test_price_level_keeps_zaptec_pending_and_late_charge_owned(monkeypatch):
         "Price above threshold",
         vehicle_vin="zaptec_standalone",
     )
+
     executor.apply_preserve_home_battery.assert_awaited_with(
         True,
         "Price above threshold",
@@ -2711,6 +2712,73 @@ def test_price_level_keeps_zaptec_pending_and_late_charge_owned(monkeypatch):
         "Price above threshold",
         vehicle_vin="zaptec_standalone",
     )
+
+
+def test_price_level_zaptec_stop_requires_fresh_post_command_poll(monkeypatch):
+    class ZaptecEntry(_FakeConfigEntry):
+        options = {
+            "zaptec_standalone_enabled": True,
+            "zaptec_username": "user@example.com",
+            "zaptec_charger_id": "charger-1",
+        }
+
+    clock = [200.0]
+    monkeypatch.setattr(ev_planner.time, "monotonic", lambda: clock[0])
+    hass = _FakeHass(price_settings={"preserve_home_battery": True})
+    entry_data = hass.data["power_sync"]["entry-1"]
+    entry_data["zaptec_cached_state"] = {
+        "charger_operation_mode": "connected_waiting",
+        "total_charge_power_w": 0,
+    }
+    # This response completed after the stop, but the poll began before it.
+    entry_data["zaptec_state_poll"] = {
+        "started_at": 199.0,
+        "completed_at": 202.0,
+    }
+    monkeypatch.setattr(ev_planner, "discover_all_tesla_vehicles", _no_vehicles)
+    monkeypatch.setattr(
+        ev_planner,
+        "_stop_coordinated_charging",
+        AsyncMock(return_value=True),
+    )
+
+    executor = ev_planner.PriceLevelChargingExecutor(hass, ZaptecEntry())
+    state = executor._get_or_create_vehicle_state("zaptec_standalone")
+    state.start_pending = True
+    state.zaptec_owned = True
+    state.charging_mode = "price_level_opportunity"
+    executor.get_charging_decision = AsyncMock(
+        return_value=(False, "Price above threshold", "")
+    )
+
+    assert asyncio.run(
+        executor._stop_charging(
+            "Price above threshold",
+            vehicle_vin="zaptec_standalone",
+        )
+    ) is True
+    assert state.stop_pending is True
+    assert state.stop_requested_at == 200.0
+    assert entry_data["scheduled_ev_preserve_state"]["active"] is True
+
+    asyncio.run(executor.evaluate_all_vehicles(28))
+
+    assert state.stop_pending is True
+    assert state.zaptec_owned is True
+    assert state.last_decision == "stopping"
+    assert entry_data["scheduled_ev_preserve_state"]["active"] is True
+
+    clock[0] = 203.0
+    entry_data["zaptec_state_poll"] = {
+        "started_at": 203.0,
+        "completed_at": 204.0,
+    }
+    asyncio.run(executor.evaluate_all_vehicles(28))
+
+    assert state.stop_pending is False
+    assert state.stop_requested_at == 0.0
+    assert state.zaptec_owned is False
+    assert entry_data["scheduled_ev_preserve_state"]["active"] is False
 
 
 def test_price_level_zaptec_stop_failure_keeps_pending_attribution(monkeypatch):
