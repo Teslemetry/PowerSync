@@ -40,6 +40,7 @@ def _load_module():
         const.CONF_OPTIMIZATION_AI_SUMMARY_AUTO_REFRESH = "optimization_ai_summary_auto_refresh"
         const.CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_ENDPOINT = "optimization_ai_summary_local_endpoint"
         const.CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_MODEL = "optimization_ai_summary_local_model"
+        const.CONF_OPTIMIZATION_AI_SUMMARY_OPENAI_MODEL = "optimization_ai_summary_openai_model"
         const.CONF_OPTIMIZATION_AI_SUMMARY_OPENROUTER_MODEL = "optimization_ai_summary_openrouter_model"
         const.CONF_OPTIMIZATION_AI_SUMMARY_PROVIDER = "optimization_ai_summary_provider"
         const.DEFAULT_OPTIMIZATION_AI_SUMMARY_PROVIDER = "gemini"
@@ -510,7 +511,7 @@ def test_write_only_settings_replace_preserve_clear_and_isolate_provider_key():
     switched, changes = module.apply_ai_summary_settings(
         options, {"ai_summary_provider": "grok"}
     )
-    assert switched == {provider_name: "grok"}
+    assert switched == {provider_name: "grok", key_name: ""}
     assert changes == [
         "updated AI summary provider",
         "cleared AI summary API key",
@@ -526,14 +527,19 @@ def test_write_only_settings_replace_preserve_clear_and_isolate_provider_key():
     cleared, changes = module.apply_ai_summary_settings(
         changed, {"clear_ai_summary_api_key": True}
     )
-    assert key_name not in cleared
+    assert cleared[key_name] == ""
     assert changes == ["cleared AI summary API key"]
 
     public = module.ai_summary_settings(SimpleNamespace(data={}, options=changed))
     assert public == {
         "ai_summary_provider": "grok",
+        "ai_summary_api_key_configured": True,
         "ai_summary_key_configured": True,
         "ai_summary_model": "grok-4.5",
+        "ai_summary_local_endpoint": "",
+        "ai_summary_local_model": "",
+        "ai_summary_openrouter_model": "",
+        "ai_summary_openai_model": "gpt-6.1-sol",
         "ai_summary_auto_refresh": False,
     }
     assert "grok-secret" not in json.dumps(public)
@@ -575,7 +581,7 @@ def test_openrouter_settings_require_model_preserve_it_and_isolate_key():
     switched, changes = module.apply_ai_summary_settings(
         options, {"ai_summary_provider": "gemini"}
     )
-    assert module.CONF_OPTIMIZATION_AI_SUMMARY_API_KEY not in switched
+    assert switched[module.CONF_OPTIMIZATION_AI_SUMMARY_API_KEY] == ""
     assert switched[module.CONF_OPTIMIZATION_AI_SUMMARY_OPENROUTER_MODEL] == "openai/gpt-4.1-mini"
     assert changes == ["updated AI summary provider", "cleared AI summary API key"]
 
@@ -792,10 +798,10 @@ def test_local_settings_are_write_only_and_provider_switch_invalidates_values():
     assert options[module.CONF_OPTIMIZATION_AI_SUMMARY_AUTO_REFRESH] is True
     public = module.ai_summary_settings(SimpleNamespace(data={}, options=options))
     assert "local-secret" not in json.dumps(public)
-    assert "127.0.0.1" not in json.dumps(public)
+    assert public["ai_summary_local_endpoint"] == "http://127.0.0.1:3000/v1/chat/completions"
     switched, _ = module.apply_ai_summary_settings(options, {"ai_summary_provider": "gemini"})
     assert module.CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_ENDPOINT not in switched
-    assert module.CONF_OPTIMIZATION_AI_SUMMARY_API_KEY not in switched
+    assert switched[module.CONF_OPTIMIZATION_AI_SUMMARY_API_KEY] == ""
 
 
 @pytest.mark.parametrize(
@@ -900,6 +906,72 @@ def test_service_cache_refresh_deduplication_and_plan_change_guard():
     with pytest.raises(module.AISummaryError) as caught:
         asyncio.run(service.generate(provider="gemini", api_key="key", refresh=False))
     assert caught.value.code == "plan_changed"
+
+
+def test_invalidated_manual_explanation_cannot_reappear_in_fresh_status():
+    module = _load_module()
+    snapshot = _snapshot()
+
+    async def exercise():
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        class DeferredAdapter:
+            async def generate(self, **kwargs):
+                entered.set()
+                await release.wait()
+                return {**_model_output(), "headline": "Explanation from the old account."}
+
+        module.PROVIDER_ADAPTERS["gemini"] = DeferredAdapter()
+        service = module.AISummaryService(object(), lambda: snapshot)
+        pending = asyncio.create_task(service.generate(provider="gemini", api_key="old-key", refresh=False))
+        await entered.wait()
+        service.invalidate()
+        release.set()
+        result = (await asyncio.gather(pending, return_exceptions=True))[0]
+        status = service.status(snapshot=snapshot, provider="gemini", api_key="new-key")
+        assert status["summary"] is None, "An old account's result must not survive invalidation in fresh status"
+        assert status["state"] == "not_generated" and status["last_error"] is None
+        assert isinstance(result, module.AISummaryError) and result.code == "settings_changed"
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("old_failure", [False, True])
+def test_new_generation_does_not_join_or_publish_old_credentials_work(old_failure):
+    module = _load_module()
+    snapshot = _snapshot()
+
+    async def exercise():
+        old_entered, old_release = asyncio.Event(), asyncio.Event()
+
+        class DeferredAdapter:
+            async def generate(self, **kwargs):
+                if kwargs["api_key"] == "old-key":
+                    old_entered.set()
+                    await old_release.wait()
+                    if old_failure:
+                        raise module.AISummaryError("provider_timeout", "The old provider request timed out.")
+                    return {**_model_output(), "headline": "Explanation from the old account."}
+                return {**_model_output(), "headline": "Explanation from the new account."}
+
+        module.PROVIDER_ADAPTERS["gemini"] = DeferredAdapter()
+        service = module.AISummaryService(object(), lambda: snapshot)
+        old_request = asyncio.create_task(service.generate(provider="gemini", api_key="old-key", refresh=False))
+        await old_entered.wait()
+        service.invalidate()
+        new_request = asyncio.create_task(service.generate(provider="gemini", api_key="new-key", refresh=False))
+        new_started = asyncio.Event()
+        asyncio.get_running_loop().call_soon(new_started.set)
+        await new_started.wait()
+        old_release.set()
+        old_result, new_result = await asyncio.gather(old_request, new_request, return_exceptions=True)
+        assert isinstance(new_result, dict), "Current settings must not join the retired generation's request"
+        assert new_result["summary"]["headline"] == "Explanation from the new account."
+        assert isinstance(old_result, module.AISummaryError) and old_result.code == "settings_changed"
+        fresh_status = service.status(snapshot=snapshot, provider="gemini", api_key="new-key")
+        assert fresh_status["summary"] == new_result["summary"] and fresh_status["last_error"] is None
+        cached = await service.generate(provider="gemini", api_key="new-key", refresh=False)
+        assert cached["cache_hit"] and cached["summary"] == new_result["summary"]
+    asyncio.run(exercise())
 
 
 def test_service_sends_feedback_against_last_successfully_explained_plan():
@@ -1068,3 +1140,399 @@ def test_optimizer_snapshot_exposes_verified_currency_soc_and_solar_context():
     assert 'data["battery_soc_percent"]' in api_source
     assert '"solar_next_24h_kwh"' in api_source
     assert '"solar_peak_kw"' in api_source
+
+
+def test_openai_and_chatgpt_settings_use_explicit_auth_and_bounded_model():
+    module = _load_module()
+    options, _ = module.apply_ai_summary_settings({}, {
+        "ai_summary_provider": "openai", "ai_summary_api_key": "api-secret",
+        "ai_summary_openai_model": "gpt-6.1-sol",
+    })
+    entry = SimpleNamespace(data={}, options=options)
+    assert module.configured_openai_model(entry) == "gpt-6.1-sol"
+    assert module.ai_summary_settings(entry)["ai_summary_key_configured"] is True
+    options, _ = module.apply_ai_summary_settings(options, {"ai_summary_provider": "chatgpt"})
+    entry.options = options
+    assert module.configured_api_key(entry) == ""
+    assert module.ai_summary_settings(entry)["ai_summary_key_configured"] is False
+    public = module.ai_summary_settings(entry, chatgpt_status={"connected": True, "access_token": "oauth-secret"})
+    assert public["ai_summary_key_configured"] is True
+    assert public["ai_summary_api_key_configured"] is False
+    assert public["ai_summary_model"] == "gpt-6.1-sol"
+    assert "oauth-secret" not in json.dumps(public)
+    for value in ("", "bad model", "x" * 129, 123, "bad\x00id"):
+        with pytest.raises(module.AISummaryError) as caught:
+            module.apply_ai_summary_settings(options, {"ai_summary_openai_model": value})
+        assert caught.value.code == "invalid_openai_model"
+
+
+class _SSEContent:
+    def __init__(self, chunks):
+        self.chunks = chunks
+
+    async def iter_chunked(self, size):
+        for chunk in self.chunks:
+            if isinstance(chunk, Exception):
+                raise chunk
+            yield chunk
+
+
+class _SSEResponse(_FakeResponse):
+    def __init__(self, events=(), *, chunks=None, status=200, content_type="text/event-stream"):
+        super().__init__(status, {})
+        self.headers = {"Content-Type": content_type}
+        if chunks is None:
+            data = "".join(f"data: {json.dumps(event, ensure_ascii=False)}\r\n\r\n" for event in events).encode()
+            chunks = [data[i:i + 3] for i in range(0, len(data), 3)]
+        self.content = _SSEContent(chunks)
+
+
+def _completed_events(output=None):
+    value = _model_output() if output is None else output
+    return [
+        {"type": "response.output_text.delta", "delta": json.dumps(value, ensure_ascii=False)},
+        {"type": "response.completed", "response": {"status": "completed"}},
+    ]
+
+
+def test_responses_adapters_use_public_route_with_distinct_request_contracts():
+    module = _load_module()
+    output = {**_model_output(), "headline": "Charge at £0.10 — then export."}
+    context = module.build_compact_context(_snapshot())
+    api = _FakeSession(_SSEResponse(_completed_events(output)))
+    assert asyncio.run(module.OpenAIResponsesAISummaryProvider().generate(
+        session=api, api_key="api-secret", model="gpt-6.1-sol", context=context)) == output
+    url, request = api.calls[0]
+    assert url == "https://api.openai.com/v1/responses"
+    assert request["headers"]["Authorization"] == "Bearer api-secret"
+    assert request["allow_redirects"] is False
+    assert request["json"]["text"]["format"]["strict"] is True
+    assert request["json"]["instructions"] == module.SYSTEM_PROMPT
+    assert request["json"]["stream"] is True
+    assert request["json"]["store"] is False
+    assert "api-secret" not in json.dumps(request["json"])
+    token_calls = []
+    async def token(**kwargs):
+        token_calls.append(kwargs)
+        return "oauth-secret"
+    subscription = _FakeSession(_SSEResponse(_completed_events(output), content_type=""))
+    assert asyncio.run(module.ChatGPTResponsesAISummaryProvider().generate(
+        session=subscription, model="gpt-6.1-sol", context=context, access_token=token)) == output
+    payload = subscription.calls[0][1]["json"]
+    assert token_calls == [{}]
+    assert set(payload) == {"model", "instructions", "input", "stream", "store"}
+    assert "OUTPUT_SCHEMA_JSON" in payload["input"][0]["content"]
+    assert "oauth-secret" not in json.dumps(payload)
+    assert "OpenAI-Project" not in subscription.calls[0][1]["headers"]
+
+
+def test_chatgpt_retries_only_one_http_401_with_fresh_credentials():
+    module = _load_module()
+    class Sessions:
+        def __init__(self, responses):
+            self.responses = list(responses)
+            self.calls = []
+        def post(self, url, **kwargs):
+            self.calls.append(kwargs)
+            return self.responses.pop(0)
+    token_calls = []
+    async def token(**kwargs):
+        token_calls.append(kwargs)
+        return "new-token" if kwargs.get("force_refresh") else "old-token"
+    session = Sessions([_SSEResponse(status=401), _SSEResponse(_completed_events())])
+    assert asyncio.run(module.ChatGPTResponsesAISummaryProvider().generate(
+        session=session, model="gpt-6.1-sol", context={}, access_token=token)) == _model_output()
+    assert token_calls == [{}, {"force_refresh": True, "rejected_token": "old-token"}]
+    assert [call["headers"]["Authorization"] for call in session.calls] == ["Bearer old-token", "Bearer new-token"]
+    token_calls.clear()
+    session = Sessions([_SSEResponse(status=401), _SSEResponse(status=401)])
+    with pytest.raises(module.AISummaryError) as caught:
+        asyncio.run(module.ChatGPTResponsesAISummaryProvider().generate(
+            session=session, model="gpt-6.1-sol", context={}, access_token=token))
+    assert caught.value.code == "chatgpt_reconnect_required"
+    assert len(session.calls) == 2
+
+
+@pytest.mark.parametrize("events, code", [
+    ([{"type": "response.output_text.delta", "delta": "partial secret"}], "provider_stream_interrupted"),
+    ([{"type": "response.incomplete"}], "provider_response_truncated"),
+    ([{"type": "response.failed", "response": {"error": {"message": "secret"}}}], "provider_unavailable"),
+    ([{"type": "error", "error": {"code": "usage_limit_reached", "message": "secret"}}], "chatgpt_usage_limit"),
+])
+def test_chatgpt_stream_failures_are_sanitized_and_never_replayed(events, code):
+    module = _load_module()
+    session = _FakeSession(_SSEResponse(events))
+    async def token(**kwargs):
+        assert kwargs == {}
+        return "oauth-secret"
+    with pytest.raises(module.AISummaryError) as caught:
+        asyncio.run(module.ChatGPTResponsesAISummaryProvider().generate(
+            session=session, model="gpt-6.1-sol", context={}, access_token=token))
+    assert caught.value.code == code
+    assert "secret" not in caught.value.message
+    assert len(session.calls) == 1
+
+
+@pytest.mark.parametrize("status, code", [(403, "chatgpt_not_enabled"), (429, "chatgpt_usage_limit"), (500, "provider_unavailable")])
+def test_chatgpt_http_failures_are_safe_and_not_retried(status, code):
+    module = _load_module()
+    session = _FakeSession(_SSEResponse(status=status))
+    async def token(**kwargs):
+        return "oauth-secret"
+    with pytest.raises(module.AISummaryError) as caught:
+        asyncio.run(module.ChatGPTResponsesAISummaryProvider().generate(
+            session=session, model="gpt-6.1-sol", context={}, access_token=token))
+    assert caught.value.code == code
+    assert len(session.calls) == 1
+
+
+def test_responses_stream_requires_completion_and_bounds_output_and_events(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(module, "MAX_RESPONSES_OUTPUT_CHARS", 10)
+    session = _FakeSession(_SSEResponse(_completed_events()))
+    with pytest.raises(module.AISummaryError) as caught:
+        asyncio.run(module.OpenAIResponsesAISummaryProvider().generate(
+            session=session, api_key="key", model="gpt-6.1-sol", context={}))
+    assert caught.value.code == "invalid_provider_response"
+    monkeypatch.setattr(module, "MAX_RESPONSES_OUTPUT_CHARS", 64 * 1024)
+    monkeypatch.setattr(module, "MAX_RESPONSES_EVENTS", 1)
+    session = _FakeSession(_SSEResponse(_completed_events()))
+    with pytest.raises(module.AISummaryError) as caught:
+        asyncio.run(module.OpenAIResponsesAISummaryProvider().generate(
+            session=session, api_key="key", model="gpt-6.1-sol", context={}))
+    assert caught.value.code == "invalid_provider_response"
+    session = _FakeSession(_SSEResponse(chunks=[b'data: {broken}\n\n']))
+    with pytest.raises(module.AISummaryError):
+        asyncio.run(module.OpenAIResponsesAISummaryProvider().generate(
+            session=session, api_key="key", model="gpt-6.1-sol", context={}))
+
+
+def test_chatgpt_service_and_auto_refresh_do_not_require_or_queue_a_token(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(module, "AUTO_REFRESH_DEBOUNCE_SECONDS", 0)
+    monkeypatch.setattr(module, "AUTO_REFRESH_COOLDOWN_SECONDS", 0)
+    class Auth:
+        calls = 0
+        connected = True
+        def status(self):
+            return {"connected": self.connected}
+        async def async_access_token(self, **kwargs):
+            self.calls += 1
+            return "oauth-secret"
+    auth = Auth()
+    session = _FakeSession(_SSEResponse(_completed_events()))
+    service = module.AISummaryService(session, _snapshot, chatgpt_auth=auth)
+    assert service.status(snapshot=_snapshot(), provider="chatgpt", api_key="")["configured"] is True
+    assert auth.calls == 0
+    async def run():
+        service.schedule_auto_refresh(provider="chatgpt", api_key="ignored-api-key", openai_model="gpt-6.1-sol")
+        assert auth.calls == 0
+        assert service._auto_pending[2] == ""
+        await service._auto_task
+        result = await service.generate(provider="chatgpt", api_key="", refresh=False)
+        assert result["cache_hit"] is True
+        await service.async_shutdown()
+    asyncio.run(run())
+    assert auth.calls == 1
+    assert service.status(snapshot=_snapshot(), provider="chatgpt", api_key="")["state"] == "ready"
+    auth.connected = False
+    assert service.status(snapshot=_snapshot(), provider="chatgpt", api_key="api-secret")["configured"] is False
+    with pytest.raises(module.AISummaryError) as caught:
+        asyncio.run(service.generate(provider="chatgpt", api_key="api-secret", refresh=False))
+    assert caught.value.code == "chatgpt_reconnect_required"
+
+
+def test_responses_final_only_completion_and_stream_byte_limit(monkeypatch):
+    module = _load_module()
+    final = {"type": "response.completed", "response": {"status": "completed", "output": [
+        {"type": "message", "content": [{"type": "output_text", "text": json.dumps(_model_output())}]}]}}
+    assert asyncio.run(module._read_responses_stream(_SSEResponse([final]), subscription=False)) == _model_output()
+    monkeypatch.setattr(module, "MAX_RESPONSES_STREAM_BYTES", 8)
+    with pytest.raises(module.AISummaryError) as caught:
+        asyncio.run(module._read_responses_stream(_SSEResponse([final]), subscription=False))
+    assert caught.value.code == "invalid_provider_response"
+    monkeypatch.setattr(module, "MAX_RESPONSES_STREAM_BYTES", 1024)
+    with pytest.raises(module.AISummaryError) as caught:
+        asyncio.run(module._read_responses_stream(_SSEResponse(chunks=[b'\xff']), subscription=False))
+    assert caught.value.code == "invalid_provider_response"
+
+
+def test_chatgpt_service_maps_auth_failures_without_leaking_error_details(monkeypatch):
+    module = _load_module()
+    auth_module = ModuleType("custom_components.power_sync.optimization.chatgpt_auth")
+    class ChatGPTAuthError(Exception):
+        def __init__(self, code):
+            self.code = code
+            super().__init__("private-refresh-token")
+    auth_module.ChatGPTAuthError = ChatGPTAuthError
+    auth_module._TERMINAL_ERRORS = {"invalid_grant", "invalid_client", "unauthorized_client", "access_denied", "future_terminal_error"}
+    monkeypatch.setitem(sys.modules, auth_module.__name__, auth_module)
+    class Auth:
+        def status(self):
+            return {"connected": True}
+        async def async_access_token(self, **kwargs):
+            raise ChatGPTAuthError("chatgpt_not_enabled")
+    service = module.AISummaryService(_FakeSession(_SSEResponse()), _snapshot, chatgpt_auth=Auth())
+    with pytest.raises(module.AISummaryError) as caught:
+        asyncio.run(service.generate(provider="chatgpt", api_key="", refresh=False))
+    assert caught.value.code == "chatgpt_not_enabled"
+    assert "private-refresh-token" not in caught.value.message
+    assert service._last_error["code"] == "chatgpt_not_enabled"
+
+
+def test_config_flow_keeps_chatgpt_selection_and_uses_server_auth_readiness():
+    """Execute the options metadata block without loading the unrelated HA flows."""
+    import textwrap
+    module = _load_module()
+    source = (ROOT / "custom_components" / "power_sync" / "config_flow.py").read_text()
+    block = source[source.index("        current_ai_provider = str("):source.index("        current_form_values: dict[str, Any] = {", source.index("        current_ai_provider = str("))]
+    options = {
+        module.CONF_OPTIMIZATION_AI_SUMMARY_PROVIDER: "chatgpt",
+        module.CONF_OPTIMIZATION_AI_SUMMARY_API_KEY: "unrelated-api-key",
+        module.CONF_OPTIMIZATION_AI_SUMMARY_OPENAI_MODEL: "gpt-6.1-sol",
+    }
+    entry = SimpleNamespace(data={}, options=options, entry_id="entry")
+    auth = SimpleNamespace(status=lambda: {"connected": False})
+    flow = SimpleNamespace(config_entry=entry, hass=SimpleNamespace(data={"power_sync": {"entry": {}}}), _get_option=lambda key, default: options.get(key, default))
+    globals_ = {name: getattr(module, name) for name in dir(module) if name.startswith("CONF_OPTIMIZATION_AI_")}
+    globals_.update(DEFAULT_OPTIMIZATION_AI_SUMMARY_PROVIDER="gemini", DOMAIN="power_sync", self=flow,
+                    configured_openai_model=module.configured_openai_model,
+                    get_chatgpt_auth=lambda hass, entry_id: auth)
+    exec(textwrap.dedent(block), globals_)
+    assert globals_["current_ai_provider"] == "chatgpt"
+    assert globals_["current_ai_key_configured"] is False
+    assert globals_["current_ai_openai_model"] == "gpt-6.1-sol"
+    auth.status = lambda: {"connected": True}
+    exec(textwrap.dedent(block), globals_)
+    assert globals_["current_ai_key_configured"] is True
+    flow.hass.data.clear()
+    exec(textwrap.dedent(block), globals_)
+    assert globals_["current_ai_key_configured"] is False
+
+
+def test_config_flow_model_field_is_migrated_saved_and_translated():
+    import ast
+    path = ROOT / "custom_components" / "power_sync" / "config_flow.py"
+    source = path.read_text()
+    tree = ast.parse(source)
+    # Both auth modes are explicit selector options; each model marker has only
+    # one positional field key, guarding accidental mixed selector fields.
+    choices = {keyword.value.value for call in ast.walk(tree) if isinstance(call, ast.Call)
+               and isinstance(call.func, ast.Name) and call.func.id == "SelectOptionDict"
+               for keyword in call.keywords if keyword.arg == "value" and isinstance(keyword.value, ast.Constant)}
+    assert {"openai", "chatgpt"}.issubset(choices)
+    model_markers = [call for call in ast.walk(tree) if isinstance(call, ast.Call)
+                     and isinstance(call.func, ast.Attribute) and call.func.attr in {"Optional", "Required"}
+                     and any(isinstance(arg, ast.Name) and arg.id == "CONF_OPTIMIZATION_AI_SUMMARY_OPENAI_MODEL" for arg in call.args)]
+    assert len(model_markers) == 1
+    assert len(model_markers[0].args) == 1
+    assert '"ai_summary_openai_model": user_input.get(' in source
+    assert "new_data.pop(CONF_OPTIMIZATION_AI_SUMMARY_OPENAI_MODEL, None)" in source
+    assert "CONF_OPTIMIZATION_AI_SUMMARY_OPENAI_MODEL: current_ai_openai_model" in source
+    for name in ("strings.json", "translations/en.json"):
+        data = json.loads((ROOT / "custom_components" / "power_sync" / name).read_text())
+        section = data["options"]["step"]["optimization"]["sections"]["ai_explanations"]
+        assert "optimization_ai_summary_openai_model" in section["data"]
+        assert "gpt-6.1-sol" in section["data_description"]["optimization_ai_summary_openai_model"]
+        assert "dashboard AI explanation card" in section["description"]
+
+
+@pytest.mark.parametrize("payload", [
+    {"clear_ai_summary_api_key": True},
+    {"ai_summary_provider": "grok"},
+])
+def test_clear_and_switch_suppress_inherited_key_with_persistent_empty_option(payload):
+    module = _load_module()
+    key = module.CONF_OPTIMIZATION_AI_SUMMARY_API_KEY
+    provider = module.CONF_OPTIMIZATION_AI_SUMMARY_PROVIDER
+    entry = SimpleNamespace(data={key: "old-inherited-secret", provider: "gemini"}, options={})
+    assert module.configured_api_key(entry) == "old-inherited-secret"
+    # Clearing/switching must suppress entry.data even when the helper's options
+    # contain no key. The empty override also survives a blank-key save/reload.
+    entry.options, _ = module.apply_ai_summary_settings(entry.options, payload)
+    assert entry.options[key] == ""
+    assert module.configured_api_key(entry) == ""
+    public = module.ai_summary_settings(entry)
+    assert public["ai_summary_api_key_configured"] is False
+    assert public["ai_summary_key_configured"] is False
+    entry.options, changes = module.apply_ai_summary_settings(entry.options, {"ai_summary_api_key": " "})
+    assert changes == []
+    assert module.configured_api_key(entry) == ""
+    # An explicit replacement overrides both the sentinel and inherited data.
+    entry.options, _ = module.apply_ai_summary_settings(entry.options, {"ai_summary_api_key": "new-replacement"})
+    assert module.configured_api_key(entry) == "new-replacement"
+    assert module.ai_summary_settings(entry)["ai_summary_api_key_configured"] is True
+    assert entry.data[key] == "old-inherited-secret"
+
+
+def test_clearing_an_empty_override_is_idempotent():
+    module = _load_module()
+    key = module.CONF_OPTIMIZATION_AI_SUMMARY_API_KEY
+    options, changes = module.apply_ai_summary_settings({key: ""}, {"clear_ai_summary_api_key": True})
+    assert options[key] == ""
+    assert changes == []
+
+
+def test_public_settings_preload_provider_models_without_echoing_credentials():
+    module = _load_module()
+    entry = SimpleNamespace(data={}, options={
+        module.CONF_OPTIMIZATION_AI_SUMMARY_PROVIDER: "local_openai_compatible",
+        module.CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_ENDPOINT: "http://127.0.0.1:11434/v1",
+        module.CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_MODEL: "llama3.2",
+        module.CONF_OPTIMIZATION_AI_SUMMARY_OPENROUTER_MODEL: "anthropic/claude-sonnet-4",
+        module.CONF_OPTIMIZATION_AI_SUMMARY_API_KEY: "SECRET-api-key",
+    })
+    public = module.ai_summary_settings(entry)
+    assert public["ai_summary_local_endpoint"] == "http://127.0.0.1:11434/v1/chat/completions"
+    assert public["ai_summary_local_model"] == "llama3.2"
+    assert public["ai_summary_openrouter_model"] == "anthropic/claude-sonnet-4"
+    assert "SECRET" not in json.dumps(public) and "ai_summary_api_key" not in public
+    # Legacy malformed URLs must not expose embedded credentials when preloaded.
+    entry.options[module.CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_ENDPOINT] = "http://user:SECRET-password@127.0.0.1"
+    public = module.ai_summary_settings(entry)
+    assert public["ai_summary_local_endpoint"] == ""
+    assert public["ai_summary_key_configured"] is False
+    assert "SECRET" not in json.dumps(public)
+
+
+@pytest.mark.parametrize("failure, expected_code, expected_status", [
+    ("network_error", "provider_unavailable", 503),
+    ("provider_unavailable", "provider_unavailable", 503),
+    ("storage_unavailable", "storage_unavailable", 503),
+    ("discovery_failed", "provider_unavailable", 503),
+    ("identity_verification_unavailable", "provider_unavailable", 503),
+    ("invalid_response", "provider_unavailable", 503),
+    ("integration_unavailable", "provider_unavailable", 503),
+    (None, "provider_unavailable", 503),
+    ("invalid_grant", "chatgpt_reconnect_required", 400),
+    ("invalid_client", "chatgpt_reconnect_required", 400),
+    ("unauthorized_client", "chatgpt_reconnect_required", 400),
+    ("not_connected", "chatgpt_reconnect_required", 400),
+    ("future_terminal_error", "chatgpt_reconnect_required", 400),
+    ("access_denied", "chatgpt_reconnect_required", 400),
+    ("account_mismatch", "chatgpt_reconnect_required", 400),
+    ("missing_scope", "chatgpt_reconnect_required", 400),
+    ("invalid_id_token", "chatgpt_reconnect_required", 400),
+    ("invalid_token_response", "chatgpt_reconnect_required", 400),
+])
+def test_chatgpt_refresh_distinguishes_retryable_and_auth_errors(monkeypatch, failure, expected_code, expected_status):
+    module = _load_module()
+    auth_module = ModuleType("custom_components.power_sync.optimization.chatgpt_auth")
+    class ChatGPTAuthError(Exception):
+        def __init__(self, code):
+            self.code = code
+            super().__init__("SECRET-refresh-token")
+    auth_module.ChatGPTAuthError = ChatGPTAuthError
+    auth_module._TERMINAL_ERRORS = {"invalid_grant", "invalid_client", "unauthorized_client", "access_denied", "future_terminal_error"}
+    monkeypatch.setitem(sys.modules, auth_module.__name__, auth_module)
+    class Auth:
+        async def async_access_token(self, **kwargs):
+            raise ChatGPTAuthError(failure) if failure else OSError("SECRET-storage-path")
+    service = module.AISummaryService(None, _snapshot, chatgpt_auth=Auth())
+    with pytest.raises(module.AISummaryError) as caught:
+        asyncio.run(service._chatgpt_access_token())
+    assert caught.value.code == expected_code
+    assert caught.value.http_status == expected_status
+    assert "SECRET" not in caught.value.message
+    if expected_code == "provider_unavailable":
+        assert "reconnect" not in caught.value.message.lower()

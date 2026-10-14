@@ -1267,7 +1267,7 @@
       "season_month_overlap": "Tariff seasons overlap. Each month can belong to only one season.",
       "season_month_gap": "Tariff seasons must cover all 12 months before continuing.",
       "cannot_connect": "Cannot reach the provider portal. Check your internet connection and that Home Assistant has outbound HTTPS access.",
-      "invalid_ai_summary_settings": "Choose either Clear saved provider key or enter a replacement key, not both.",
+      "invalid_ai_summary_settings": "Check the AI provider and model settings. Clear the saved provider key or enter a replacement, not both.",
       "invalid_grid_charge_blackout_windows": "Enter one or more valid HH:MM blackout ranges with different start and end times.",
       "alphaess_cloud_required": "AlphaESS Cloud monitoring requires both an App ID and App Secret.",
       "goodwe_entity_prefix_required": "Enter the GoodWe Experimental entity prefix, for example goodwe.",
@@ -1855,7 +1855,7 @@
           },
           "ai_explanations": {
             "name": "AI Plan Explanation",
-            "description": "Configure optional descriptive explanations of the existing plan. Saved key status: {ai_summary_key_status}. Automatic refresh is off by default. AI cannot change or execute the optimizer plan.",
+            "description": "Configure optional explanations of the existing plan. AI provider status: {ai_summary_key_status}. Sign in to ChatGPT from the dashboard AI explanation card. Automatic refresh is off by default. AI cannot change or execute the optimizer plan.",
             "data": {
               "optimization_ai_summary_provider": "AI provider",
               "optimization_ai_summary_api_key": "Provider API key",
@@ -1863,15 +1863,17 @@
               "optimization_ai_summary_local_endpoint": "Local OpenAI-compatible URL",
               "optimization_ai_summary_local_model": "Local model identifier",
               "optimization_ai_summary_openrouter_model": "OpenRouter model identifier",
+              "optimization_ai_summary_openai_model": "OpenAI / ChatGPT model identifier",
               "optimization_ai_summary_auto_refresh": "Automatically refresh explanations"
             },
             "data_description": {
-              "optimization_ai_summary_provider": "Choose Gemini, Grok, OpenRouter, or a local OpenAI-compatible server such as Open WebUI. OpenRouter sends the compact verified plan context to OpenRouter and the selected upstream model provider. Changing providers without entering a replacement key clears the previous provider's key.",
-              "optimization_ai_summary_api_key": "Write-only optional bearer key. This field always opens blank; leave it blank to keep the current key, or enter a value to replace it.",
+              "optimization_ai_summary_provider": "Choose ChatGPT subscription login, OpenAI with an API key, Gemini, Grok, OpenRouter, or a local OpenAI-compatible server. Sign in to ChatGPT from the dashboard AI explanation card. OpenRouter shares context with the selected upstream model provider. Changing providers without a replacement key clears the previous provider's key.",
+              "optimization_ai_summary_api_key": "For API key providers, enter the provider key. ChatGPT subscription login does not use this field. This write-only field always opens blank; leave it blank to keep the saved key, or enter a replacement.",
               "optimization_ai_summary_clear_api_key": "Remove the saved provider key when you select Save. Do not enter a replacement key at the same time.",
               "optimization_ai_summary_local_endpoint": "For the local provider, enter a private or loopback HTTP(S) base URL or its /v1/chat/completions endpoint. HTTP sends household plan data and any bearer key without transport encryption.",
               "optimization_ai_summary_local_model": "For the local provider, enter the server's model identifier.",
               "optimization_ai_summary_openrouter_model": "For OpenRouter, enter the required model identifier. The selected model and its upstream provider receive the compact verified plan context.",
+              "optimization_ai_summary_openai_model": "For OpenAI or ChatGPT, choose a model available to your API account or subscription. The default is gpt-6.1-sol.",
               "optimization_ai_summary_auto_refresh": "Off by default. When enabled, PowerSync may generate after a materially changed committed plan, with debounce and cooldown. It runs in the background and can use local CPU/GPU, memory, power, and network resources."
             }
           }

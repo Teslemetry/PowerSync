@@ -3645,9 +3645,38 @@ class PowerSyncAIPlanExplanation extends HTMLElement {
     this._meta = {};
     this._errorCode = null;
     this._statusRequested = false;
+    this._statusToken = 0;
     this._requestToken = 0;
     this._connected = false;
     this._expanded = true;
+    this._connectionRequested = false;
+    this._connectionOpen = false;
+    this._connectionTouched = false;
+    this._connectionBusy = false;
+    this._connectionActionName = null;
+    this._connectionRequests = new Set();
+    this._connectionTimeoutMs = 90000;
+    this._activity = [];
+    this._connectionError = null;
+    this._connectionUncertain = false;
+    this._connectionUncertainAction = null;
+    this._disconnectWarning = false;
+    this._disconnectWarningAcknowledged = false;
+    this._connectionToken = 0;
+    this._chatgpt = null;
+    this._aiSettings = {};
+    this._settingsTouched = new Set();
+    this._login = null;
+    this._callbackUrl = '';
+    this._apiKey = '';
+    this._apiModel = '';
+    this._showApiKey = false;
+    this._models = [];
+    this._selectedProvider = null;
+    this._providerTouched = false;
+    this._localEndpoint = '';
+    this._localModel = '';
+    this._openrouterModel = '';
   }
 
   setConfig(config) {
@@ -3656,18 +3685,55 @@ class PowerSyncAIPlanExplanation extends HTMLElement {
   }
 
   set hass(hass) {
+    const adminChanged = !!this._hass?.user?.is_admin !== !!hass?.user?.is_admin;
+    const userChanged = this._hass?.user?.id !== hass?.user?.id;
     this._hass = hass;
-    if (this._connected) this._loadStatusOnce();
+    if (adminChanged || userChanged) {
+      this._invalidateSummaryRequests();
+      ++this._connectionToken;
+      this._connectionBusy = false;
+      this._connectionActionName = null;
+      this._cancelConnectionRequests();
+      this._activity = [];
+      this._selectedProvider = null;
+      this._providerTouched = false;
+      this._aiSettings = {};
+      this._settingsTouched = new Set();
+      this._models = [];
+      this._clearConnectionInputs();
+      this._connectionRequested = false;
+      this._chatgpt = null;
+      this._render();
+    }
+    if (this._connected) {
+      this._loadStatusOnce();
+      this._loadConnectionOnce();
+    }
   }
 
   connectedCallback() {
     this._connected = true;
     this._render();
-    this._loadStatusOnce();
+    if (this._hass?.user?.is_admin) this._loadConnectionOnce();
+    else this._loadStatusOnce();
   }
 
   disconnectedCallback() {
+    const uncertainAction = this._connectionUncertainAction
+      || (this._connectionBusy && ['complete', 'logout', 'settings'].includes(this._connectionActionName) ? this._connectionActionName : null);
     this._connected = false;
+    this._invalidateSummaryRequests();
+    ++this._connectionToken;
+    this._connectionRequested = false;
+    this._connectionBusy = false;
+    this._connectionActionName = null;
+    this._cancelConnectionRequests();
+    this._activity = [];
+    this._clearConnectionInputs();
+    if (uncertainAction) {
+      this._connectionUncertain = true;
+      this._connectionUncertainAction = uncertainAction;
+    }
   }
 
   getCardSize() {
@@ -3682,13 +3748,637 @@ class PowerSyncAIPlanExplanation extends HTMLElement {
     return this._config.summaryPath || 'power_sync/optimization/ai_summary';
   }
 
+  _connectionPath() {
+    return 'power_sync/optimization/chatgpt';
+  }
+
+  _invalidateSummaryRequests() {
+    ++this._requestToken;
+    ++this._statusToken;
+    this._statusRequested = false;
+    this._summary = null;
+    this._meta = {};
+    this._errorCode = null;
+    this._state = this._aiSettings.ai_summary_key_configured ? 'ready' : 'not_configured';
+  }
+
+  _summaryTransitioning() {
+    return (this._connectionBusy && ['complete', 'logout', 'settings'].includes(this._connectionActionName))
+      || (this._connectionUncertain && ['complete', 'logout', 'settings'].includes(this._connectionUncertainAction));
+  }
+
+  _clearConnectionInputs() {
+    this._callbackUrl = '';
+    this._apiKey = '';
+    this._login = null;
+    this._connectionUncertain = false;
+    this._connectionUncertainAction = null;
+    for (const id of ['chatgpt-callback', 'openai-key', 'provider-key']) {
+      const input = this.shadowRoot?.getElementById(id);
+      if (input) input.value = '';
+    }
+  }
+
+  _applyConnectionStatus(response, hydrateSettings = false) {
+    if (!this._disconnectWarningAcknowledged && response.warning === 'Local credentials were removed. Remote disconnection could not be confirmed; disconnect PowerSync in ChatGPT Settings.') this._disconnectWarning = true;
+    this._chatgpt = {
+      connected: !!response.connected,
+      status: response.status || 'disconnected',
+      account: response.account || null,
+      pending: response.pending || null,
+    };
+    if (!response.connected) this._models = [];
+    this._aiSettings = response.settings || this._aiSettings;
+    if (hydrateSettings) this._settingsTouched.clear();
+    for (const [field, setting] of [
+      ['_apiModel', 'ai_summary_openai_model'],
+      ['_localEndpoint', 'ai_summary_local_endpoint'],
+      ['_localModel', 'ai_summary_local_model'],
+      ['_openrouterModel', 'ai_summary_openrouter_model'],
+    ]) {
+      if (!this._settingsTouched.has(field)) this[field] = this._aiSettings[setting] || '';
+    }
+    if (!this._providerTouched) this._selectedProvider = this._aiSettings.ai_summary_provider || 'chatgpt';
+    if (Array.isArray(response.models)) this._models = response.models;
+  }
+
+  _reconcileConnectionStatus(response) {
+    const pendingLogin = this._login?.login_id;
+    const uncertain = this._connectionUncertain;
+    const action = this._connectionUncertainAction;
+    const usablePending = !!pendingLogin && response.pending?.login_id === pendingLogin;
+    this._applyConnectionStatus(response, uncertain && action === 'settings');
+    this._connectionRequested = true;
+    this._connectionUncertain = false;
+    this._connectionUncertainAction = null;
+    this._connectionError = null;
+    this._invalidateSummaryRequests();
+    this._loadStatusOnce();
+    if (uncertain && ['logout', 'settings'].includes(action)) {
+      this._clearConnectionInputs();
+      if (action === 'settings' && this._aiSettings.ai_summary_key_configured && this._selectedProvider === this._aiSettings.ai_summary_provider) {
+        this._connectionTouched = true;
+        this._connectionOpen = false;
+        this._activity = [];
+      }
+      return;
+    }
+    if (!pendingLogin && !uncertain) return;
+    if (!usablePending) this._clearConnectionInputs();
+    if (response.connected && !usablePending) {
+      if (uncertain && action === 'complete') {
+        this._disconnectWarning = false;
+        this._disconnectWarningAcknowledged = false;
+      }
+      this._connectionTouched = true;
+      this._connectionOpen = false;
+      this._activity = [];
+    } else if (pendingLogin && !usablePending) {
+      this._connectionError = 'login_ended';
+    }
+  }
+
+  async _loadConnectionOnce() {
+    if (this._connectionBusy || this._connectionRequested || !this._hass?.user?.is_admin || typeof this._hass.callApi !== 'function') return;
+    this._connectionRequested = true;
+    const token = ++this._connectionToken;
+    try {
+      const response = await this._callConnectionApi('GET');
+      if (token !== this._connectionToken) return;
+      if (!response?.success) throw new Error('connection_status_failed');
+      this._reconcileConnectionStatus(response);
+    } catch (_) {
+      if (token !== this._connectionToken) return;
+      this._connectionError = 'connection_status_failed';
+      this._loadStatusOnce();
+    }
+    this._render();
+  }
+
+  _connectionErrorText(code) {
+    const messages = {
+      connection_status_failed: 'Unable to check the account connection. Try again.',
+      login_expired: 'This sign-in expired. Start again with Continue with ChatGPT.',
+      login_ended: 'This sign-in has ended. Continue with ChatGPT to start a fresh sign-in.',
+      oauth_expired: 'This sign-in expired. Start again with Continue with ChatGPT.',
+      invalid_callback: 'Paste the full address beginning http://127.0.0.1:1455/auth/callback, then try again.',
+      invalid_callback_url: 'Paste the full address beginning http://127.0.0.1:1455/auth/callback, then try again.',
+      invalid_auth_url: 'The OpenAI sign-in link could not be verified. Try starting sign-in again.',
+      sign_in_link: 'This is the sign-in link. Finish signing in, then copy the final address beginning http://127.0.0.1:1455/auth/callback.',
+      client_timeout: 'Home Assistant is taking too long. Check the connection again before retrying; it may still finish in the background.',
+      oauth_state_mismatch: 'This address belongs to a different sign-in. Start again with Continue with ChatGPT.',
+      reconnect_required: 'Your ChatGPT connection needs to be renewed. Continue with ChatGPT to reconnect.',
+      chatgpt_reconnect_required: 'Your ChatGPT connection needs to be renewed. Continue with ChatGPT to reconnect.',
+      provider_auth_failed: 'OpenAI rejected the saved credentials. Reconnect or check your API key.',
+      provider_rate_limited: 'OpenAI has reached a usage limit. Check your usage or try again later.',
+      invalid_settings: 'Check the model and API key, then try saving again.',
+      login_owned: 'Another administrator is signing in to ChatGPT. Wait for them to finish, then try again.',
+      login_mismatch: 'This sign-in belongs to a different session. Start again with Continue with ChatGPT.',
+      authorization_denied: 'OpenAI sign-in was cancelled. Continue with ChatGPT to try again.',
+      registration_incomplete: 'OpenAI sign-in was not completed. Start again with Continue with ChatGPT.',
+      account_mismatch: 'Sign in with the ChatGPT account already connected here, or log out before connecting another account.',
+      missing_scope: 'OpenAI did not grant the required access. Continue with ChatGPT and approve the requested access.',
+      invalid_grant: 'Your ChatGPT connection is no longer valid. Continue with ChatGPT to reconnect.',
+      not_connected: 'Continue with ChatGPT to connect your account first.',
+      network_error: 'Home Assistant could not reach OpenAI. Try again shortly. If this sign-in ended, continue with ChatGPT to start again.',
+      invalid_local_ai_endpoint: 'Enter the local server’s HTTP or HTTPS base address.',
+      invalid_local_ai_model: 'Enter the model installed on your local server.',
+      invalid_openrouter_model: 'Enter an OpenRouter model identifier, such as anthropic/claude-sonnet-4.',
+      provider_unavailable: 'OpenAI is temporarily unavailable. Try again shortly.',
+      discovery_failed: 'OpenAI sign-in is temporarily unavailable. Try again shortly.',
+      storage_unavailable: 'Home Assistant could not save the connection securely. Try again or check the integration logs.',
+      identity_verification_unavailable: 'OpenAI account verification is temporarily unavailable. Try again shortly.',
+      invalid_token_response: 'OpenAI returned incomplete sign-in details. Start again with Continue with ChatGPT.',
+      invalid_id_token: 'OpenAI account details could not be verified. Start again with Continue with ChatGPT.',
+    };
+    return messages[code] || 'The account action failed. Try again.';
+  }
+
+  _recordActivity(message) {
+    // Fixed product messages only: never include keys, URLs or provider payloads.
+    if (!this._login && !['start', 'complete'].includes(this._connectionActionName)) return;
+    this._activity.push({ time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }), message });
+    this._activity = this._activity.slice(-24);
+  }
+
+  _cancelConnectionRequests() {
+    for (const cancel of this._connectionRequests) cancel();
+  }
+
+  async _callConnectionApi(method, values) {
+    let timer, cancel;
+    const timeout = new Promise((_, reject) => {
+      cancel = () => { const error = new Error('Request cancelled'); error.code = 'cancelled'; reject(error); };
+      timer = setTimeout(() => { const error = new Error('Request timed out'); error.code = 'client_timeout'; reject(error); }, method === 'GET' ? 15000 : this._connectionTimeoutMs);
+    });
+    this._connectionRequests.add(cancel);
+    try {
+      return await Promise.race([this._hass.callApi(method, this._connectionPath(), values), timeout]);
+    } finally {
+      clearTimeout(timer);
+      this._connectionRequests.delete(cancel);
+    }
+  }
+
+  _callbackError(value) {
+    try {
+      const url = new URL(value);
+      if (url.origin === 'https://auth.openai.com') return 'sign_in_link';
+      const rawAddress = value.match(/^[^:]+:\/\/([^/?#]*)([^?#]*)/);
+      if (url.protocol !== 'http:' || rawAddress?.[1] !== '127.0.0.1:1455' || rawAddress?.[2] !== '/auth/callback' || url.username || url.password || url.hash) return 'invalid_callback';
+      if (url.searchParams.getAll('state').length !== 1 || !url.searchParams.get('state')) return 'invalid_callback';
+      if (url.searchParams.getAll('code').length === 1 && url.searchParams.get('code')) return null;
+      if (url.searchParams.get('error')) return null;
+    } catch (_) { /* Keep the entered address in the field for correction. */ }
+    return 'invalid_callback';
+  }
+
+  async _connectionAction(action, values = {}) {
+    if (!this._hass?.user?.is_admin || this._connectionBusy || typeof this._hass.callApi !== 'function') return;
+    if (this._connectionUncertain) return;
+    if (action === 'complete' && (!this._login?.login_id || !this._callbackUrl.trim())) return;
+    if (action === 'complete') {
+      const code = this._callbackError(this._callbackUrl.trim());
+      if (code) {
+        this._connectionError = code;
+        this._recordActivity('The redirect address needs correcting before connecting.');
+        this._render();
+        this.shadowRoot.getElementById('chatgpt-callback')?.focus({ preventScroll: true });
+        return;
+      }
+    }
+    const token = ++this._connectionToken;
+    if (['complete', 'logout', 'settings'].includes(action)) this._invalidateSummaryRequests();
+    this._connectionBusy = true;
+    this._connectionActionName = action;
+    this._connectionError = null;
+    if (action === 'start') this._activity = [];
+    this._recordActivity({ start: 'Preparing your OpenAI sign-in…', complete: 'Sending your sign-in result to OpenAI…', cancel: 'Cancelling sign-in…', logout: 'Logging out of ChatGPT…', models: 'Loading the models available to your account…', settings: 'Saving your AI provider settings…' }[action] || 'Updating AI settings…');
+    this._render();
+    const waitTimer = setTimeout(() => {
+      if (token !== this._connectionToken || !this._connectionBusy) return;
+      this._recordActivity('Still waiting for Home Assistant to finish. You can leave this page open.');
+      this._renderActivity(this.shadowRoot.getElementById('activity-host'));
+    }, 10000);
+    try {
+      const response = await this._callConnectionApi('POST', { action, ...values });
+      if (token !== this._connectionToken) return;
+      if (!response?.success) {
+        const error = new Error('account_action_failed');
+        error.code = response?.code;
+        error.login_restart_required = response?.login_restart_required;
+        throw error;
+      }
+      if (action === 'start') {
+        // Only the OpenAI authorization origin is allowed into this link.
+        const invalidAuthUrl = new Error('invalid_auth_url');
+        invalidAuthUrl.code = 'invalid_auth_url';
+        let authUrl;
+        try { authUrl = new URL(response.auth_url); } catch (_) { throw invalidAuthUrl; }
+        if (authUrl.origin !== 'https://auth.openai.com' || authUrl.username || authUrl.password || !response.login_id) throw invalidAuthUrl;
+        this._callbackUrl = '';
+        this._apiKey = '';
+        this._showApiKey = false;
+        this._selectedProvider = 'chatgpt';
+        this._login = { login_id: response.login_id, auth_url: authUrl.href, expires_at: response.expires_at };
+      } else if (action === 'cancel') {
+        this._clearConnectionInputs();
+        if (this._chatgpt) this._chatgpt.pending = null;
+      } else if (action === 'models') {
+        this._models = Array.isArray(response.models) ? response.models : [];
+      } else {
+        if (action === 'logout') {
+          if (response.warning === 'Local credentials were removed. Remote disconnection could not be confirmed; disconnect PowerSync in ChatGPT Settings.') {
+            this._disconnectWarning = true;
+            this._disconnectWarningAcknowledged = false;
+          }
+        }
+        this._providerTouched = false;
+        this._applyConnectionStatus(response, action === 'settings');
+        if (action === 'complete' && response.connected) {
+          this._disconnectWarning = false;
+          this._disconnectWarningAcknowledged = false;
+        }
+        this._connectionRequested = true;
+        this._clearConnectionInputs();
+        if (action === 'complete') this._showApiKey = false;
+        this._loadStatusOnce();
+        if (action === 'complete' || (action === 'settings' && this._aiSettings.ai_summary_key_configured)) {
+          this._connectionTouched = true;
+          this._connectionOpen = false;
+          this._activity = [];
+        }
+      }
+      this._recordActivity({ start: 'Sign-in is ready. Open OpenAI sign-in in a new tab.', complete: 'ChatGPT connected. You can now generate an explanation.', cancel: 'Sign-in cancelled.', logout: 'ChatGPT disconnected.', models: 'Available models loaded.', settings: 'AI settings saved.' }[action] || 'AI settings updated.');
+    } catch (error) {
+      if (token !== this._connectionToken) return;
+      this._connectionError = error?.body?.code || error?.code || 'account_action_failed';
+      this._recordActivity(this._connectionErrorText(this._connectionError));
+      const restartRequired = error?.body?.login_restart_required ?? error?.login_restart_required;
+      if (['complete', 'cancel'].includes(action) && restartRequired === true) {
+        this._clearConnectionInputs();
+        if (this._chatgpt) this._chatgpt.pending = null;
+      } else if (typeof restartRequired !== 'boolean' && (['complete', 'cancel'].includes(action) || (['start', 'logout', 'settings'].includes(action) && ['client_timeout', 'network_error', 'account_action_failed'].includes(this._connectionError)))) {
+        this._connectionUncertain = true;
+        this._connectionUncertainAction = action;
+        this._recordActivity('Checking whether Home Assistant finished the account action…');
+        this._render();
+        try {
+          const response = await this._callConnectionApi('GET');
+          if (token !== this._connectionToken) return;
+          if (!response?.success) throw new Error('connection_status_failed');
+          this._reconcileConnectionStatus(response);
+        } catch (_) {
+          if (token !== this._connectionToken) return;
+          this._connectionError = 'client_timeout';
+        }
+      }
+    } finally {
+      clearTimeout(waitTimer);
+      if (token === this._connectionToken) {
+        this._connectionBusy = false;
+        this._connectionActionName = null;
+        if (['complete', 'logout', 'settings'].includes(action)) {
+          this._invalidateSummaryRequests();
+          this._loadStatusOnce();
+        }
+        if (!this._login) this._activity = [];
+        this._render();
+        const focusTarget = action === 'complete' && this._connectionError && this._login ? 'chatgpt-callback' : action === 'start' && this._login ? 'openai-sign-in' : 'connection-toggle';
+        this.shadowRoot.getElementById(focusTarget)?.focus({ preventScroll: true });
+      }
+    }
+  }
+
+  _connectionButton(parent, label, handler, secondary = true) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = label;
+    button.className = secondary ? 'secondary' : '';
+    button.disabled = this._connectionBusy || this._connectionUncertain;
+    button.classList.toggle('busy', this._connectionBusy && !secondary);
+    button.addEventListener('click', handler);
+    parent.append(button);
+    return button;
+  }
+
+  _connectionLink(parent, label, href) {
+    const link = document.createElement('a');
+    link.textContent = label;
+    link.href = href;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    parent.append(link);
+    return link;
+  }
+
+  _renderActivity(parent) {
+    if (!parent) return;
+    parent.innerHTML = '';
+    const active = this._connectionOpen && (this._login || (this._connectionBusy && ['start', 'complete'].includes(this._connectionActionName)));
+    if (!active || !this._activity.length) return;
+    const title = document.createElement('h4');
+    title.textContent = 'Activity';
+    const log = document.createElement('div');
+    log.className = 'activity-log';
+    log.id = 'connection-activity';
+    log.setAttribute('role', 'log');
+    log.setAttribute('aria-label', 'AI activity');
+    log.setAttribute('aria-live', 'polite');
+    log.setAttribute('aria-relevant', 'additions');
+    log.tabIndex = 0;
+    for (const entry of this._activity) {
+      const row = document.createElement('p');
+      const time = document.createElement('time');
+      time.textContent = entry.time;
+      const message = document.createElement('span');
+      message.textContent = entry.message;
+      row.append(time, message);
+      log.append(row);
+    }
+    parent.append(title, log);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  _renderProviderForm(details, provider, message) {
+    const form = document.createElement('form');
+    form.className = 'connection-form';
+    const current = provider === this._aiSettings.ai_summary_provider;
+    const savedKey = current && this._aiSettings.ai_summary_api_key_configured;
+    const fields = [];
+    if (provider === 'openai') {
+      message('OpenAI API usage is billed separately from your ChatGPT plan.');
+      fields.push(['openai-model', 'OpenAI model', 'text', this._apiModel || (this._settingsTouched.has('_apiModel') ? '' : 'gpt-6.1-sol'), 'gpt-6.1-sol', value => { this._apiModel = value; this._settingsTouched.add('_apiModel'); }]);
+    } else if (provider === 'openrouter') {
+      message('Choose any supported OpenRouter model, including Anthropic Claude.');
+      fields.push(['openrouter-model', 'OpenRouter model', 'text', this._openrouterModel, 'provider/model', value => { this._openrouterModel = value; this._settingsTouched.add('_openrouterModel'); }]);
+    } else if (provider === 'local_openai_compatible') {
+      message('Use your Ollama, Open WebUI, or other local OpenAI-compatible server.');
+      fields.push(['local-endpoint', 'Local server address', 'text', this._localEndpoint, 'http://192.168.1.10:11434/v1', value => { this._localEndpoint = value; this._settingsTouched.add('_localEndpoint'); }]);
+      fields.push(['local-model', 'Installed model', 'text', this._localModel, 'Model name on your server', value => { this._localModel = value; this._settingsTouched.add('_localModel'); }]);
+    }
+    const keyId = provider === 'openai' ? 'openai-key' : 'provider-key';
+    fields.push([keyId, provider === 'local_openai_compatible' ? 'API key (optional)' : 'API key', 'password', this._apiKey, savedKey ? 'Saved key — leave blank to keep it' : 'Enter your provider API key', value => this._apiKey = value]);
+    for (const [id, title, type, value, placeholder, update] of fields) {
+      const label = document.createElement('label');
+      label.htmlFor = id;
+      label.textContent = title;
+      const input = document.createElement('input');
+      input.id = id;
+      input.type = type;
+      input.value = value;
+      input.placeholder = placeholder;
+      input.autocomplete = 'off';
+      input.spellcheck = false;
+      input.disabled = this._connectionBusy;
+      input.required = type !== 'password' || (!savedKey && provider !== 'local_openai_compatible');
+      input.addEventListener('input', () => update(input.value));
+      form.append(label, input);
+    }
+    if (savedKey) message('A key is saved for this provider. Leave the field blank to keep it.');
+    const controls = document.createElement('div');
+    controls.className = 'actions';
+    const save = this._connectionButton(controls, this._connectionBusy && this._connectionActionName === 'settings' ? 'Saving AI settings…' : 'Save AI settings', () => {}, false);
+    save.type = 'submit';
+    if (savedKey) this._connectionButton(controls, 'Remove saved key', () => this._connectionAction('settings', { ai_summary_provider: provider, clear_ai_summary_api_key: true }));
+    form.append(controls);
+    form.addEventListener('submit', event => {
+      event.preventDefault();
+      const values = { ai_summary_provider: provider };
+      if (provider === 'openai') values.ai_summary_openai_model = this._apiModel.trim() || 'gpt-6.1-sol';
+      if (provider === 'openrouter') values.ai_summary_openrouter_model = this._openrouterModel.trim();
+      if (provider === 'local_openai_compatible') {
+        values.ai_summary_local_endpoint = this._localEndpoint.trim();
+        values.ai_summary_local_model = this._localModel.trim();
+      }
+      if (this._apiKey.trim()) values.ai_summary_api_key = this._apiKey.trim();
+      this._connectionAction('settings', values);
+    });
+    details.append(form);
+  }
+
+  _renderConnection(parent) {
+    if (!this._hass?.user?.is_admin) return;
+    if (this._disconnectWarning) {
+      const notice = document.createElement('div');
+      notice.className = 'notice';
+      notice.id = 'disconnect-notice';
+      const message = document.createElement('p');
+      message.setAttribute('role', 'alert');
+      message.textContent = 'Local credentials were removed. Remote disconnection could not be confirmed; disconnect PowerSync in ChatGPT Settings.';
+      const actions = document.createElement('div');
+      actions.className = 'actions';
+      this._connectionLink(actions, 'Open ChatGPT', 'https://chatgpt.com/');
+      this._connectionButton(actions, 'Dismiss disconnection notice', () => {
+        this._disconnectWarning = false;
+        this._disconnectWarningAcknowledged = true;
+        this._render();
+        this.shadowRoot.getElementById('connection-toggle')?.focus({ preventScroll: true });
+      }).disabled = false;
+      notice.append(message, actions);
+      parent.append(notice);
+    }
+    if (!this._connectionTouched) {
+      if (this._aiSettings.ai_summary_key_configured) this._connectionOpen = false;
+      else if (this._state === 'not_configured') this._connectionOpen = true;
+    }
+    const panel = document.createElement('section');
+    panel.className = 'connection';
+    panel.id = 'connection-panel';
+    panel.hidden = !this._connectionOpen;
+    const disclosure = this._connectionButton(this.shadowRoot.getElementById('header'), '', () => {
+      this._connectionTouched = true;
+      this._connectionOpen = !this._connectionOpen;
+      panel.hidden = !this._connectionOpen;
+      details.hidden = !this._connectionOpen;
+      disclosure.setAttribute('aria-expanded', String(this._connectionOpen));
+      disclosure.setAttribute('aria-label', this._connectionOpen ? 'Close AI settings' : 'AI settings');
+      disclosure.title = this._connectionOpen ? 'Close AI settings' : 'AI settings';
+      this._renderActivity(activityHost);
+    });
+    disclosure.disabled = false;
+    disclosure.id = 'connection-toggle';
+    disclosure.className = 'settings-toggle';
+    disclosure.setAttribute('aria-label', this._connectionOpen ? 'Close AI settings' : 'AI settings');
+    disclosure.title = this._connectionOpen ? 'Close AI settings' : 'AI settings';
+    const icon = document.createElement('ha-icon');
+    icon.setAttribute('icon', 'mdi:cog-outline');
+    disclosure.append(icon);
+    disclosure.setAttribute('aria-expanded', String(this._connectionOpen));
+    disclosure.setAttribute('aria-controls', 'connection-details');
+    parent.append(panel);
+    const details = document.createElement('div');
+    details.id = 'connection-details';
+    details.hidden = !this._connectionOpen;
+    panel.append(details);
+    const activityHost = document.createElement('div');
+    activityHost.id = 'activity-host';
+    const message = (text, className = 'status') => {
+      const p = document.createElement('p');
+      p.className = className;
+      p.textContent = text;
+      details.append(p);
+    };
+    const providers = [
+      ['chatgpt', 'ChatGPT (sign in)'], ['openai', 'OpenAI (API key)'],
+      ['gemini', 'Gemini'], ['grok', 'Grok'],
+      ['openrouter', 'OpenRouter (Claude and other models)'],
+      ['local_openai_compatible', 'Ollama / Open WebUI (local)'],
+    ];
+    const provider = this._selectedProvider || this._aiSettings.ai_summary_provider || 'chatgpt';
+    const label = document.createElement('label');
+    label.htmlFor = 'ai-provider';
+    label.textContent = 'AI provider';
+    const select = document.createElement('select');
+    select.id = 'ai-provider';
+    select.disabled = this._connectionBusy || this._connectionUncertain;
+    for (const [id, title] of providers) {
+      const option = document.createElement('option');
+      option.value = id;
+      option.textContent = title;
+      option.selected = id === provider;
+      select.append(option);
+    }
+    select.value = provider;
+    select.addEventListener('change', () => {
+      this._invalidateSummaryRequests();
+      ++this._connectionToken;
+      this._cancelConnectionRequests();
+      this._connectionRequested = false;
+      this._selectedProvider = select.value;
+      this._providerTouched = true;
+      this._apiKey = '';
+      this._callbackUrl = '';
+      this._connectionError = null;
+      this._render();
+      this.shadowRoot.getElementById('ai-provider')?.focus({ preventScroll: true });
+    });
+    details.append(label, select);
+    const configured = this._aiSettings.ai_summary_provider;
+    if (configured && provider !== configured && this._aiSettings.ai_summary_key_configured) message('Your current provider stays active until you save these settings or finish connecting ChatGPT.');
+    if (provider !== 'chatgpt') {
+      this._renderProviderForm(details, provider, message);
+    } else {
+      const connected = this._chatgpt?.connected;
+      if (connected) {
+        const account = this._chatgpt.account;
+        message(`Connected to ChatGPT${account?.email || account?.name ? ` as ${account.email || account.name}` : ''}.`);
+        message(configured === 'chatgpt' ? 'Using ChatGPT plan for explanations.' : 'ChatGPT is connected. Select Use ChatGPT plan to use it for explanations.');
+        this._connectionLink(details, 'Manage ChatGPT usage', 'https://chatgpt.com/codex/settings/usage');
+      } else if (this._chatgpt?.status === 'reconnect_required') {
+        message('Reconnect ChatGPT to generate explanations.');
+        message('Reset the saved account connection before signing in with a different ChatGPT account.');
+      } else {
+        message('Sign in to use your ChatGPT plan for explanations.');
+      }
+      const loginActions = document.createElement('div');
+      loginActions.className = 'actions';
+      details.append(loginActions);
+      if (this._login) {
+        this._connectionLink(loginActions, 'Open OpenAI sign-in', this._login.auth_url).id = 'openai-sign-in';
+        message('Finish signing in in the new tab. When it redirects to http://127.0.0.1:1455/auth/callback, copy the full final address here, even if that tab cannot connect.');
+        const form = document.createElement('form');
+        form.className = 'connection-form';
+        form.setAttribute('aria-busy', String(this._connectionBusy));
+        const label = document.createElement('label');
+        label.htmlFor = 'chatgpt-callback';
+        label.textContent = 'Final redirect address';
+        const input = document.createElement('textarea');
+        input.id = 'chatgpt-callback';
+        input.rows = 3;
+        input.autocomplete = 'off';
+        input.spellcheck = false;
+        input.placeholder = 'http://127.0.0.1:1455/auth/callback?…';
+        input.value = this._callbackUrl;
+        input.disabled = this._connectionBusy;
+        input.setAttribute('aria-describedby', 'callback-help');
+        input.addEventListener('input', () => {
+          this._callbackUrl = input.value;
+          complete.disabled = this._connectionBusy || this._connectionUncertain || !input.value.trim();
+        });
+        form.append(label, input);
+        const controls = document.createElement('div');
+        controls.className = 'actions';
+        const complete = this._connectionButton(controls, this._connectionBusy && this._connectionActionName === 'complete' ? this._connectionUncertain ? 'Checking connection…' : 'Connecting to ChatGPT…' : 'Complete connection', () => {}, false);
+        complete.type = 'submit';
+        complete.disabled = this._connectionBusy || this._connectionUncertain || !this._callbackUrl.trim();
+        this._connectionButton(controls, 'Cancel sign-in', () => this._connectionAction('cancel', { login_id: this._login.login_id })).disabled ||= this._connectionUncertain;
+        form.append(controls);
+        form.addEventListener('submit', event => {
+          event.preventDefault();
+          this._connectionAction('complete', { login_id: this._login.login_id, callback_url: this._callbackUrl.trim() });
+        });
+        details.append(form);
+        const help = document.createElement('p');
+        help.id = 'callback-help';
+        help.className = 'status';
+        help.textContent = this._connectionUncertain
+          ? this._connectionBusy ? 'Home Assistant is checking whether the sign-in finished. Wait for the connection status before trying again.' : 'Check connection again to find out whether the sign-in finished before trying again.'
+          : this._connectionBusy ? 'Home Assistant is completing the sign-in with OpenAI. The activity below will show the result.' : 'Paste the final redirect address here, then select Complete connection.';
+        details.append(help);
+      } else {
+        if (this._chatgpt?.pending) message('A previous sign-in is unfinished. Continue with ChatGPT to start a fresh sign-in.');
+        this._connectionButton(loginActions, this._connectionBusy && this._connectionActionName === 'start' ? 'Preparing sign-in…' : connected ? 'Reconnect ChatGPT' : 'Continue with ChatGPT', () => this._connectionAction('start'), false).disabled ||= this._connectionUncertain;
+        if (this._chatgpt?.pending?.login_id) this._connectionButton(loginActions, 'Cancel unfinished sign-in', () => this._connectionAction('cancel', { login_id: this._chatgpt.pending.login_id })).disabled ||= this._connectionUncertain;
+        if (connected) {
+          if (configured !== 'chatgpt') this._connectionButton(loginActions, 'Use ChatGPT plan', () => this._connectionAction('settings', { ai_summary_provider: 'chatgpt' }));
+          this._connectionButton(loginActions, 'Log out of ChatGPT', () => this._connectionAction('logout'));
+          if (!this._models.length) this._connectionButton(loginActions, 'Choose ChatGPT model', () => this._connectionAction('models'));
+        } else if (this._chatgpt?.status === 'reconnect_required') {
+          this._connectionButton(loginActions, 'Reset ChatGPT account', () => this._connectionAction('logout'));
+        }
+      }
+      if (connected && this._models.length && !this._login) {
+        const label = document.createElement('label');
+        label.htmlFor = 'chatgpt-model';
+        label.textContent = 'ChatGPT model';
+        const select = document.createElement('select');
+        select.id = 'chatgpt-model';
+        select.disabled = this._connectionBusy || this._connectionUncertain;
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = 'Choose a model';
+        select.append(placeholder);
+        for (const model of this._models) {
+          if (typeof model?.id !== 'string') continue;
+          const option = document.createElement('option');
+          option.value = model.id;
+          option.textContent = model.name || model.id;
+          option.selected = model.id === this._aiSettings.ai_summary_openai_model;
+          select.append(option);
+        }
+        select.addEventListener('change', () => {
+          if (select.value) this._connectionAction('settings', { ai_summary_provider: 'chatgpt', ai_summary_openai_model: select.value });
+        });
+        details.append(label, select);
+      }
+    }
+    if (this._connectionError) {
+      const error = document.createElement('p');
+      error.className = 'notice';
+      error.setAttribute('role', 'alert');
+      error.textContent = this._connectionErrorText(this._connectionError);
+      details.append(error);
+    }
+    if (['connection_status_failed', 'client_timeout'].includes(this._connectionError)) {
+      this._connectionButton(details, 'Check connection again', () => {
+        this._connectionRequested = false;
+        this._loadConnectionOnce();
+      }).disabled = this._connectionBusy;
+    }
+    details.append(activityHost);
+    this._renderActivity(activityHost);
+  }
+
   async _loadStatusOnce() {
-    if (this._statusRequested || !this._hass || typeof this._hass.callApi !== 'function') return;
+    if (this._summaryTransitioning() || this._statusRequested || !this._hass || typeof this._hass.callApi !== 'function') return;
     this._statusRequested = true;
+    const token = ++this._statusToken;
     this._state = 'checking_status';
     this._render();
     try {
       const response = await this._hass.callApi('GET', this._optimizationPath());
+      if (token !== this._statusToken) return;
       const status = response?.ai_summary;
       if (response?.features?.ai_summary === false || !status) {
         this._state = 'unavailable';
@@ -3713,6 +4403,7 @@ class PowerSyncAIPlanExplanation extends HTMLElement {
         this._state = 'ready';
       }
     } catch (_) {
+      if (token !== this._statusToken) return;
       this._state = 'unavailable';
     }
     this._render();
@@ -3730,7 +4421,7 @@ class PowerSyncAIPlanExplanation extends HTMLElement {
   }
 
   async _generate(refresh) {
-    if (!this._hass || typeof this._hass.callApi !== 'function' || this._state === 'loading') return;
+    if (!this._hass || typeof this._hass.callApi !== 'function' || this._state === 'loading' || this._summaryTransitioning()) return;
     const requestToken = ++this._requestToken;
     this._expanded = true;
     this._state = 'loading';
@@ -3781,15 +4472,20 @@ class PowerSyncAIPlanExplanation extends HTMLElement {
 
   _errorText(code) {
     const messages = {
-      ai_not_configured: 'Add a Gemini or Grok API key in Smart Optimization settings first.',
+      ai_not_configured: 'Choose and connect an AI provider in AI settings below.',
       optimizer_unavailable: 'Smart Optimization is unavailable, so there is no plan to explain.',
       plan_stale: 'The optimizer plan is not ready yet. Try again after the next optimization cycle.',
       plan_changed: 'The plan changed while the explanation was generated. Try again.',
-      provider_auth_failed: 'The selected provider rejected the saved API key.',
+      provider_auth_failed: 'The selected provider rejected the saved credentials. Check your AI account settings.',
+      chatgpt_reconnect_required: 'Reconnect ChatGPT in AI settings to generate explanations.',
+      chatgpt_not_enabled: 'Enable ChatGPT plan sharing in your ChatGPT settings, then try again.',
+      chatgpt_usage_limit: 'Your ChatGPT plan has reached a usage limit. Check usage in AI settings or try again later.',
+      reconnect_required: 'Reconnect ChatGPT in AI settings to generate explanations.',
       provider_rate_limited: 'The selected provider rate-limited this request. Try again later.',
       provider_timeout: 'The selected provider timed out. Try again later.',
       client_timeout: 'PowerSync did not receive the explanation response in time. Try again.',
       provider_unavailable: 'The selected provider is currently unavailable.',
+      storage_unavailable: 'Home Assistant could not access or save the ChatGPT connection securely. Check the integration logs and try again.',
       invalid_provider_response: 'The provider returned an explanation PowerSync could not safely display.',
       request_failed: 'The explanation request failed. Try again.',
     };
@@ -3963,6 +4659,10 @@ class PowerSyncAIPlanExplanation extends HTMLElement {
         .header.open { margin-bottom:12px; }
         .header ha-icon { color:var(--cyan-color, #00bcd4); }
         .toggle { margin-left:auto; width:36px; height:36px; padding:0; border-radius:50%; display:flex; align-items:center; justify-content:center; background:transparent; color:var(--primary-text-color); }
+        .settings-toggle { margin-inline-start:auto; flex:none; width:36px; height:36px; padding:0; display:flex; align-items:center; justify-content:center; background:transparent; color:var(--secondary-text-color); }
+        .settings-toggle:hover { background:var(--secondary-background-color); color:var(--primary-text-color); }
+        .header:has(.settings-toggle) .toggle { margin-left:0; }
+        .header .settings-toggle ha-icon { color:inherit; }
         .toggle:hover { background:var(--secondary-background-color); }
         .toggle ha-icon { color:inherit; }
         h3 { margin:0; font-size:18px; }
@@ -3976,10 +4676,29 @@ class PowerSyncAIPlanExplanation extends HTMLElement {
         .headline { font-size:16px; font-weight:700; line-height:1.4; }
         .status { color:var(--secondary-text-color); }
         .generated { margin-top:13px; color:var(--secondary-text-color); font-size:12px; }
-        .actions { display:flex; gap:9px; margin-top:14px; }
+        .actions { display:flex; gap:9px; flex-wrap:wrap; margin-top:14px; }
         button { border:0; border-radius:9px; padding:9px 13px; cursor:pointer; background:var(--primary-color); color:var(--text-primary-color, white); font-weight:600; }
         button.secondary { background:var(--secondary-background-color); color:var(--primary-text-color); }
         button:disabled { opacity:.55; cursor:default; }
+        button.busy:disabled { opacity:1; cursor:progress; }
+        button, a, input, textarea, select { font:inherit; }
+        button, a { min-height:40px; overflow-wrap:anywhere; }
+        button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible { outline:2px solid var(--primary-color); outline-offset:3px; }
+        a { color:var(--primary-color); text-underline-offset:3px; display:inline-flex; align-items:center; }
+        .connection { margin-top:14px; padding-top:12px; border-top:1px solid var(--divider-color); }
+        .connection p, .connection form, .connection > div > button { margin-top:12px; }
+        .connection p { overflow-wrap:anywhere; }
+        .connection-form { display:grid; gap:8px; }
+        .connection label { display:block; margin-top:12px; font-size:14px; }
+        .activity-log { max-height:140px; overflow-y:auto; scrollbar-width:thin; scrollbar-color:var(--divider-color) transparent; border-top:1px solid var(--divider-color); padding-top:4px; }
+        .activity-log p { display:flex; gap:10px; margin:6px 0; font-size:14px; }
+        .activity-log time { color:var(--secondary-text-color); font-variant-numeric:tabular-nums; flex:none; }
+        .activity-log span { min-width:0; overflow-wrap:anywhere; }
+        .activity-log:focus-visible { outline:2px solid var(--primary-color); outline-offset:3px; }
+        input, textarea, select { box-sizing:border-box; display:block; width:100%; min-width:0; padding:10px; border:1px solid var(--divider-color); border-radius:6px; color:var(--primary-text-color); background:var(--card-background-color); caret-color:var(--primary-color); }
+        textarea { resize:vertical; }
+        input::placeholder, textarea::placeholder { color:var(--secondary-text-color); opacity:1; }
+        @media (max-width:400px) { ha-card { padding:14px; } .header h3 { font-size:16px; } .actions button { flex:1 1 auto; } }
         [hidden] { display:none !important; }
         .boundary { margin-top:12px; color:var(--secondary-text-color); font-size:12px; }
       </style>
@@ -3987,6 +4706,7 @@ class PowerSyncAIPlanExplanation extends HTMLElement {
         <div class="header" id="header"><ha-icon icon="mdi:creation-outline"></ha-icon><h3>AI Plan Explanation</h3><button class="toggle" id="toggle" type="button" hidden></button></div>
         <div id="body" aria-live="polite"></div>
         <div class="actions" id="actions"></div>
+        <div id="connection" aria-live="polite"></div>
         <p class="boundary" id="boundary">Descriptive only. AI cannot change or execute the optimizer plan.</p>
       </ha-card>`;
     const header = this.shadowRoot.getElementById('header');
@@ -4019,7 +4739,7 @@ class PowerSyncAIPlanExplanation extends HTMLElement {
         initial: 'Checking AI explanation availability…',
         checking_status: 'Checking AI explanation availability…',
         ready: 'Generate a plain-language explanation of the current deterministic plan.',
-        not_configured: 'Configure Gemini, Grok, or a local OpenAI-compatible provider under Smart Optimization settings to enable explanations.',
+        not_configured: this._hass?.user?.is_admin ? 'Choose an AI provider in AI settings below to generate explanations.' : 'Ask a Home Assistant administrator to connect an AI provider for explanations.',
         loading: 'Generating the explanation…',
         unavailable: this._errorText(this._errorCode || 'optimizer_unavailable'),
         error: this._errorText(this._errorCode),
@@ -4030,7 +4750,7 @@ class PowerSyncAIPlanExplanation extends HTMLElement {
     if (this._state === 'ready' || this._state === 'error' || this._state === 'loading') {
       const generate = document.createElement('button');
       generate.textContent = this._state === 'loading' ? 'Generating…' : 'Generate explanation';
-      generate.disabled = this._state === 'loading';
+      generate.disabled = this._state === 'loading' || this._summaryTransitioning();
       generate.addEventListener('click', () => this._generate(false));
       actions.append(generate);
     }
@@ -4048,6 +4768,7 @@ class PowerSyncAIPlanExplanation extends HTMLElement {
       checkAgain.addEventListener('click', () => this._retryStatus());
       actions.append(checkAgain);
     }
+    this._renderConnection(this.shadowRoot.getElementById('connection'));
   }
 }
 
