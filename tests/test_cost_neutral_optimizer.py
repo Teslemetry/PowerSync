@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import json
 import sys
 import types
 from datetime import datetime, timedelta, timezone
@@ -78,6 +79,147 @@ def _optimizer(module):
 def _timestamps(n: int) -> list[datetime]:
     start = datetime(2026, 8, 1, 20, 0, tzinfo=timezone.utc)
     return [start + timedelta(hours=idx) for idx in range(n)]
+
+
+@pytest.mark.parametrize("disable_idle", [False, True])
+def test_cost_neutral_waits_for_free_window_without_paid_topups(
+    optimizer_module, disable_idle,
+):
+    """A protected export must not invent a later need for paid recharge."""
+    if not optimizer_module.HIGHS_AVAILABLE:
+        pytest.skip("requires HiGHS LP solver")
+    inputs = json.loads(
+        (ROOT / "tests/fixtures/cost_neutral_free_window_paid_topups.json").read_text()
+    )
+    start = datetime.fromisoformat(inputs["start"])
+    timestamps = [
+        start + timedelta(minutes=inputs["interval_minutes"] * idx)
+        for idx in range(len(inputs["import_prices"]))
+    ]
+    allowances = inputs["cost_neutral_fixed_allowances"]
+    plan = optimizer_module.CostNeutralPlan(
+        day_ids=[timestamp.date().isoformat() for timestamp in timestamps],
+        earnings_caps_by_day=allowances,
+        forecast_import_costs_by_day={day: 0.0 for day in allowances},
+        fixed_cost_allowances_by_day=allowances,
+        current_day=start.date().isoformat(),
+        timezone="Australia/Brisbane",
+        settlement_import_prices=inputs["import_prices"],
+        settlement_export_prices=inputs["export_prices"],
+    )
+    optimizer = optimizer_module.BatteryOptimizer(
+        capacity_wh=54_000,
+        max_charge_w=14_700,
+        max_discharge_w=21_000,
+        max_grid_import_w=15_000,
+        max_grid_export_w=10_000,
+        efficiency=0.92,
+        backup_reserve=0.38,
+        hardware_reserve=0.0,
+        interval_minutes=5,
+        horizon_hours=48,
+    )
+    result = optimizer.optimize(
+        import_prices=inputs["import_prices"],
+        export_prices=inputs["export_prices"],
+        solar_forecast=inputs["solar_forecast"],
+        load_forecast=inputs["load_forecast"],
+        current_soc=inputs["initial_soc"],
+        allow_battery_export=[price > 0 for price in inputs["export_prices"]],
+        schedule_timestamps=timestamps,
+        disable_idle=disable_idle,
+        cost_neutral_plan=plan,
+    )
+
+    assert result.solver_used == "highs"
+    assert result.feasible
+    assert result.lp_stats["mode_converged"] is True
+    assert not [
+        action.timestamp
+        for idx, action in enumerate(result.schedule.actions)
+        if action.action == "charge" and inputs["import_prices"][idx] > 0.001
+    ]
+    assert any(action.action == "export" for action in result.schedule.actions)
+    assert any(
+        action.action == "charge" and inputs["import_prices"][idx] == 0.0
+        for idx, action in enumerate(result.schedule.actions)
+    )
+    assert all(
+        action.soc >= 0.38 - 0.0001
+        for action in result.schedule.actions
+        if action.action == "export"
+    )
+
+
+@pytest.mark.parametrize("secondary_timeout", [False, True])
+def test_cost_neutral_keeps_paid_charging_for_deadline_before_free_window(
+    optimizer_module, monkeypatch, secondary_timeout,
+):
+    """Free charging preferences must not prevent a necessary earlier top-up."""
+    if not optimizer_module.HIGHS_AVAILABLE:
+        pytest.skip("requires HiGHS LP solver")
+    optimizer = _optimizer(optimizer_module)
+    optimizer.pre_window_slot = 2
+    optimizer.pre_window_soc_target = 1.0
+    if secondary_timeout:
+        real_solve = optimizer_module._solve_lp_highs
+        calls = 0
+
+        def timeout_preference(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                return optimizer_module._HighsResult(
+                    None, False, "Time limit reached", 13, None,
+                )
+            return real_solve(*args, **kwargs)
+
+        monkeypatch.setattr(optimizer_module, "_solve_lp_highs", timeout_preference)
+    result = optimizer.optimize(
+        import_prices=[0.31, 0.31, 0.0, 0.0],
+        export_prices=[0.0] * 4,
+        solar_forecast=[0.0] * 4,
+        load_forecast=[0.0, 0.0, 0.5, 0.5],
+        current_soc=0.2,
+        allow_battery_export=False,
+        schedule_timestamps=_timestamps(4),
+        cost_neutral_earnings_cap=0.2,
+        cost_neutral_slots=[True] * 4,
+    )
+
+    assert result.feasible
+    assert result.solver_used == "highs"
+    assert result.lp_stats["cost_neutral_charging_tiebreak_used"] is True
+    assert result.schedule.actions[1].soc >= 0.995
+    assert sum(result.schedule.charge_w[:2]) / 1000.0 == pytest.approx(7.95, abs=0.01)
+    assert any(action.action == "charge" for action in result.schedule.actions[:2])
+
+
+@pytest.mark.parametrize("free_price", [0.0, -0.05])
+def test_cost_neutral_keeps_paid_charge_that_avoids_expensive_home_import(
+    optimizer_module, free_price,
+):
+    """A later free window does not prohibit useful earlier price arbitrage."""
+    if not optimizer_module.HIGHS_AVAILABLE:
+        pytest.skip("requires HiGHS LP solver")
+    result = _optimizer(optimizer_module).optimize(
+        import_prices=[0.10, 0.50, free_price, 0.30],
+        export_prices=[0.0] * 4,
+        solar_forecast=[0.0] * 4,
+        load_forecast=[0.0, 5.0, 0.0, 0.0],
+        current_soc=0.0,
+        allow_battery_export=False,
+        schedule_timestamps=_timestamps(4),
+        cost_neutral_earnings_cap=0.2,
+        cost_neutral_slots=[True] * 4,
+    )
+
+    assert result.feasible
+    assert result.solver_used == "highs"
+    assert result.schedule.actions[0].action == "charge"
+    assert result.schedule.charge_w[0] == pytest.approx(5_000.0, abs=0.01)
+    assert result.grid_import_w[1] <= 0.01
+    assert result.schedule.actions[2].action == "charge"
 
 
 def _charge_by_time_cost_neutral_optimizer(module):
