@@ -628,6 +628,74 @@ def extract_most_recent_actual_interval(
     return None
 
 
+def extract_current_price_interval(
+    price_data: list[dict[str, Any]],
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    """Return a currently covering Amber ``CurrentInterval`` by channel.
+
+    The current-price endpoint and the cached five-minute forecast have the
+    same interval shape, but only the former is authoritative for a refreshed
+    TOU sync.  An interval ending at or before ``now`` must not be promoted to
+    the current half-hour period by the rolling tariff builder.
+    """
+    if not price_data:
+        return None
+
+    reference_now = now or dt_util.now()
+    candidates: dict[tuple[datetime, float], dict[str, Any]] = {}
+
+    for interval in price_data:
+        if not isinstance(interval, dict):
+            continue
+        if interval.get("type") != "CurrentInterval":
+            continue
+        channel = interval.get("channelType")
+        if channel not in ("general", "feedIn"):
+            continue
+
+        try:
+            duration_minutes = float(interval.get("duration", 0))
+            if duration_minutes != 5:
+                continue
+            interval_end = datetime.fromisoformat(
+                str(interval.get("nemTime", "")).replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError):
+            continue
+
+        compare_now = reference_now
+        if interval_end.tzinfo is None and compare_now.tzinfo is not None:
+            interval_end = interval_end.replace(tzinfo=compare_now.tzinfo)
+        elif interval_end.tzinfo is not None and compare_now.tzinfo is None:
+            compare_now = compare_now.replace(tzinfo=interval_end.tzinfo)
+        elif interval_end.tzinfo is not None and compare_now.tzinfo is not None:
+            compare_now = compare_now.astimezone(interval_end.tzinfo)
+
+        interval_start = interval_end - timedelta(minutes=duration_minutes)
+        if not interval_start <= compare_now < interval_end:
+            continue
+
+        key = (interval_end, duration_minutes)
+        candidates.setdefault(key, {})[channel] = interval
+
+    if not candidates:
+        _LOGGER.warning("No currently covering Amber CurrentInterval found")
+        return None
+
+    _, channels = max(candidates.items(), key=lambda item: item[0][0])
+    result = {
+        "general": channels.get("general"),
+        "feedIn": channels.get("feedIn"),
+    }
+    _LOGGER.info(
+        "Using refreshed Amber CurrentInterval at %s (channels: %s)",
+        max(candidates)[0].isoformat(),
+        ", ".join(channel for channel, value in result.items() if value),
+    )
+    return result if result["general"] or result["feedIn"] else None
+
+
 def compare_forecast_types(
     forecast_data: list[dict[str, Any]],
     threshold: float = 10.0,
