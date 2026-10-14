@@ -38965,7 +38965,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 foxess_coord = entry_data.get("foxess_coordinator")
                 if not foxess_coord:
                     _LOGGER.error("Self-consumption: FoxESS coordinator not available")
-                    return
+                    raise HomeAssistantError("FoxESS coordinator unavailable")
 
                 if (
                     source == "optimizer"
@@ -38986,10 +38986,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     _LOGGER.info("✅ FoxESS self-consumption mode set (Self Use)")
                 else:
                     _LOGGER.error("Failed to set FoxESS self-consumption mode")
+                    raise HomeAssistantError(
+                        "FoxESS self-consumption restore failed; check control health"
+                    )
                 return
+            except HomeAssistantError:
+                raise
             except Exception as e:
                 _LOGGER.error(f"Error setting FoxESS self-consumption: {e}", exc_info=True)
-                return
+                raise HomeAssistantError(
+                    "FoxESS self-consumption restore failed; check control health"
+                ) from e
 
         # Check if this is a GoodWe system
         is_goodwe = bool(entry.data.get(CONF_GOODWE_HOST))
