@@ -46,6 +46,29 @@ AEMO_SETTLED_SYNC_DELAY_SECONDS = 5.0
 DEMAND_GRID_CHARGING_MAX_RESTORE_ATTEMPTS = 3
 
 
+async def _tesla_grid_export_write_result(
+    response: Any,
+) -> tuple[bool, str | None]:
+    """Return whether Tesla explicitly accepted a grid-export write.
+
+    Tesla can return HTTP 200 while reporting an application-level rejection
+    in ``response.result``.  Treat only an explicit ``True`` as delivery
+    success so callers do not promote a requested rule into live status.
+    """
+    try:
+        payload = await response.json()
+    except Exception:
+        return False, "Tesla returned an unreadable grid export response"
+
+    if not isinstance(payload, dict):
+        return False, "Tesla returned an invalid grid export response"
+    result = payload.get("response")
+    if not isinstance(result, dict) or result.get("result") is not True:
+        reason = result.get("reason") if isinstance(result, dict) else None
+        return False, str(reason or "Tesla rejected the grid export rule")
+    return True, None
+
+
 def _should_sync_sigenergy_static_tariff_on_startup(
     electricity_provider: str,
     battery_system: str,
@@ -40589,6 +40612,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         timeout=aiohttp.ClientTimeout(total=30),
                     ) as response:
                         if response.status == 200:
+                            accepted, reason = await _tesla_grid_export_write_result(response)
+                            if not accepted:
+                                _LOGGER.error(
+                                    "Tesla rejected grid export rule %s for site %s: %s",
+                                    rule,
+                                    site_id,
+                                    reason,
+                                )
+                                continue
                             _LOGGER.info("Grid export rule set to %s for site %s", rule, site_id)
                             any_ok = True
                         else:
@@ -40602,43 +40634,47 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 cloud_call=_cloud,
                 label="set_grid_export",
             )
-            if success:
-                entry_data = hass.data.setdefault(DOMAIN, {}).setdefault(
-                    entry.entry_id, {}
+            if not success:
+                raise HomeAssistantError(
+                    f"Tesla did not accept grid export rule {rule}"
                 )
-                local_coord = (entry_data.get("powerwall_local") or {}).get(
-                    "coordinator"
-                )
-                local_snapshot = getattr(local_coord, "data", None)
-                if local_snapshot is not None:
-                    local_snapshot.grid_export_rule = rule
-                _tesla_coord_for_cache = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("tesla_coordinator")
-                if _tesla_coord_for_cache is not None:
-                    _tesla_coord_for_cache.invalidate_site_info_cache()
-                solar_curtailment_enabled = entry.options.get(
-                    CONF_BATTERY_CURTAILMENT_ENABLED,
-                    entry.data.get(CONF_BATTERY_CURTAILMENT_ENABLED, False)
-                )
-                if solar_curtailment_enabled:
-                    entry_data["manual_export_override"] = True
-                    entry_data["manual_export_rule"] = rule
-                    _LOGGER.info("Manual export override enabled: %s", rule)
-                await update_cached_export_rule(rule)
-                hass.async_create_task(refresh_powerwall_local_after_settings_write("set_grid_export"))
-                if solar_curtailment_enabled:
-                    # Persist so the override survives HA restarts / config reloads
-                    try:
-                        _store = entry_data.get("store")
-                        if _store:
-                            _sd = await _store.async_load() or {}
-                            _sd["manual_export_override"] = True
-                            _sd["manual_export_rule"] = rule
-                            await _store.async_save(_sd)
-                    except Exception as _persist_err:
-                        _LOGGER.debug("Could not persist manual_export_override: %s", _persist_err)
 
+            entry_data = hass.data.setdefault(DOMAIN, {}).setdefault(
+                entry.entry_id, {}
+            )
+            # A transport acknowledgement is not independent status readback.
+            # Leave the measured snapshot unchanged; the scheduled refresh may
+            # replace it with a fresh value from the Powerwall.
+            _tesla_coord_for_cache = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("tesla_coordinator")
+            if _tesla_coord_for_cache is not None:
+                _tesla_coord_for_cache.invalidate_site_info_cache()
+            solar_curtailment_enabled = entry.options.get(
+                CONF_BATTERY_CURTAILMENT_ENABLED,
+                entry.data.get(CONF_BATTERY_CURTAILMENT_ENABLED, False)
+            )
+            if solar_curtailment_enabled:
+                entry_data["manual_export_override"] = True
+                entry_data["manual_export_rule"] = rule
+                _LOGGER.info("Manual export override enabled: %s", rule)
+            await update_cached_export_rule(rule)
+            hass.async_create_task(refresh_powerwall_local_after_settings_write("set_grid_export"))
+            if solar_curtailment_enabled:
+                # Persist so the override survives HA restarts / config reloads
+                try:
+                    _store = entry_data.get("store")
+                    if _store:
+                        _sd = await _store.async_load() or {}
+                        _sd["manual_export_override"] = True
+                        _sd["manual_export_rule"] = rule
+                        await _store.async_save(_sd)
+                except Exception as _persist_err:
+                    _LOGGER.debug("Could not persist manual_export_override: %s", _persist_err)
+
+        except HomeAssistantError:
+            raise
         except Exception as e:
             _LOGGER.error(f"Error setting grid export rule: {e}", exc_info=True)
+            raise HomeAssistantError(f"Error setting grid export rule: {e}") from e
 
     async def handle_set_grid_export_auto(call: ServiceCall) -> None:
         """Clear manual export override and return to automatic control."""
