@@ -19825,6 +19825,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         dt_h = self._config.interval_minutes / 60
 
         if self._last_solar_forecast:
+            data["solar_forecast_hours"] = len(self._last_solar_forecast) * dt_h
             data["solar_forecast_kwh"] = sum(self._last_solar_forecast) * dt_h
             data["solar_peak_kw"] = max(self._last_solar_forecast)
             data["solar_forecast"] = self._last_solar_forecast
@@ -19841,6 +19842,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     data["solar_curtailment_forecast"] = curtailed
 
         if self._last_load_forecast:
+            data["load_forecast_hours"] = len(self._last_load_forecast) * dt_h
             data["load_forecast_kwh"] = sum(self._last_load_forecast) * dt_h
             data["load_peak_kw"] = max(self._last_load_forecast)
             data["load_forecast"] = self._last_load_forecast
@@ -19881,12 +19883,14 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         disp_export = self._last_display_export_prices or self._last_export_prices
 
         if disp_import:
+            data["import_price_forecast_hours"] = len(disp_import) * dt_h
             data["import_price_avg"] = sum(disp_import) / len(disp_import)
             data["import_price_min"] = min(disp_import)
             data["import_price_max"] = max(disp_import)
             data["import_prices"] = disp_import
 
         if disp_export:
+            data["export_price_forecast_hours"] = len(disp_export) * dt_h
             data["export_price_avg"] = sum(disp_export) / len(disp_export)
             data["export_price_min"] = min(disp_export)
             data["export_price_max"] = max(disp_export)

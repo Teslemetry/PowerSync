@@ -4198,6 +4198,7 @@ def _lp_solar_forecast_attributes(data: dict[str, Any]) -> dict[str, Any]:
     """Expose provenance atomically while preserving the legacy forecast."""
     attributes = {
         "peak_kw": data.get("solar_peak_kw"),
+        "forecast_hours": data.get("solar_forecast_hours"),
         "forecast_values_kw": data.get("solar_forecast"),
         "forecast_learning": data.get("solar_forecast_learning", {}),
     }
@@ -4242,6 +4243,7 @@ LP_FORECAST_SENSORS: tuple[PowerSyncSensorEntityDescription, ...] = (
         value_fn=lambda data: data.get("load_forecast_kwh") if data and data.get("available") else None,
         attr_fn=lambda data: {
             "peak_kw": data.get("load_peak_kw"),
+            "forecast_hours": data.get("load_forecast_hours"),
             "forecast_values_kw": data.get("load_forecast"),
             "planned_ev_load_peak_kw": data.get("planned_ev_load_peak_kw"),
             "planned_ev_load_kwh": data.get("planned_ev_load_kwh"),
@@ -4281,6 +4283,7 @@ LP_FORECAST_SENSORS: tuple[PowerSyncSensorEntityDescription, ...] = (
             "min_price": data.get("import_price_min"),
             "max_price": data.get("import_price_max"),
             "price_values": data.get("import_prices"),
+            "forecast_hours": data.get("import_price_forecast_hours"),
         } if data and data.get("available") else {},
     ),
     PowerSyncSensorEntityDescription(
@@ -4295,6 +4298,7 @@ LP_FORECAST_SENSORS: tuple[PowerSyncSensorEntityDescription, ...] = (
             "min_price": data.get("export_price_min"),
             "max_price": data.get("export_price_max"),
             "price_values": data.get("export_prices"),
+            "forecast_hours": data.get("export_price_forecast_hours"),
         } if data and data.get("available") else {},
     ),
     PowerSyncSensorEntityDescription(

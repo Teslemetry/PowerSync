@@ -1361,6 +1361,12 @@ class PowerSyncForecastSummary extends HTMLElement {
           margin-top: 10px;
           color: var(--primary-text-color);
         }
+        .forecast-window {
+          margin-top: 6px;
+          color: var(--secondary-text-color);
+          font-size: 12px;
+          line-height: 1.4;
+        }
         .value {
           flex: 0 1 auto;
           min-width: 0;
@@ -1413,12 +1419,17 @@ class PowerSyncForecastSummary extends HTMLElement {
   _renderMetric(item) {
     const stateObj = this._hass.states[item.entity];
     const reading = this._formatReading(item, stateObj);
+    const hours = stateObj?.attributes?.forecast_hours;
+    const windowLabel = typeof hours === 'number' && Number.isFinite(hours) && hours > 0
+      ? `Next ${Number(hours.toFixed(2))} ${hours === 1 ? 'hour' : 'hours'}`
+      : 'Optimizer forecast window';
     return `
       <div class="metric">
         <div class="header">
           <ha-icon icon="${this._escAttr(item.icon || 'mdi:chart-line')}"></ha-icon>
           <div class="name">${this._escHtml(item.name || stateObj?.attributes?.friendly_name || item.entity)}</div>
         </div>
+        <div class="forecast-window">${this._escHtml(windowLabel)}</div>
         <div class="reading">
           <span class="value">${this._escHtml(reading.value)}</span>
           <span class="unit">${this._escHtml(reading.unit)}</span>
