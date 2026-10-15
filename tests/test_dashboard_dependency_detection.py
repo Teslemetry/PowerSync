@@ -786,23 +786,25 @@ def test_dashboard_strategy_resource_uses_incremented_cache_buster():
 
     version = re.search(r'DASHBOARD_JS_VERSION = "(\d+)"', const_source)
     assert version is not None
-    assert version.group(1) == "52"
+    assert version.group(1) == "53"
     assert "url = f\"{base_path}?v={POWER_SYNC_VERSION}.{DASHBOARD_JS_VERSION}\"" in source
 
 
-def test_dashboard_ev_modes_start_expanded_and_can_be_collapsed_with_summary():
-    """Mode settings start visible but can roll up without hiding active automations."""
+def test_dashboard_ev_modes_start_collapsed_and_toggle_per_card_with_summary():
+    """Mode settings start collapsed and toggle locally without hiding active automations."""
     source = STRATEGY_PATH.read_text()
     panel_source = source[
         source.index("class PowerSyncEVPanel extends HTMLElement"):
         source.index("customElements.define('power-sync-ev-panel'")
     ]
 
-    assert "this._modesExpanded = true;" in panel_source
+    assert "this._modesExpanded = false;" in panel_source
+    assert panel_source.count("this._modesExpanded =") == 2
     assert 'data-action="toggle-modes"' in panel_source
     assert 'aria-expanded="${expanded ? \'true\' : \'false\'}"' in panel_source
     assert 'aria-controls="ev-mode-grid"' in panel_source
     assert 'id="ev-mode-grid" ${expanded ? \'\' : \'hidden\'}' in panel_source
+    assert 'ha-icon icon="mdi:chevron-${expanded ? \'up\' : \'down\'}"' in panel_source
     assert "this._modesExpanded = !this._modesExpanded;" in panel_source
     assert "if (grid) grid.hidden = !this._modesExpanded;" in panel_source
     assert "toggle?.setAttribute('aria-expanded'" in panel_source
@@ -834,26 +836,33 @@ def test_dashboard_ev_modes_start_expanded_and_can_be_collapsed_with_summary():
         setAttribute: (key, value) => {{ attrs[key] = value; }},
         querySelector: () => icon,
       }};
-      const grid = {{hidden: false}};
+      const createCard = () => {{
+        const grid = {{hidden: true}};
+        const card = {{
+          _modesExpanded: false,
+          _lastRenderSignature: '',
+          shadowRoot: {{querySelector: (selector) => selector === '#ev-mode-grid' ? grid : toggle}},
+          _renderSignature: () => 'collapsed-signature',
+          dispatchEvent: (event) => {{ resizeEvent = event; }},
+          toggle() {{{toggle_method.group('body')}\n  }},
+        }};
+        return {{card, grid}};
+      }};
       let resizeEvent = null;
       global.CustomEvent = class {{
         constructor(type, options) {{ this.type = type; this.options = options; }}
       }};
-      const card = {{
-        _modesExpanded: true,
-        _lastRenderSignature: '',
-        shadowRoot: {{querySelector: (selector) => selector === '#ev-mode-grid' ? grid : toggle}},
-        _renderSignature: () => 'expanded-signature',
-        dispatchEvent: (event) => {{ resizeEvent = event; }},
-        toggle() {{{toggle_method.group('body')}\n  }},
-      }};
-      card.toggle();
-      if (card._modesExpanded || !grid.hidden || attrs['aria-expanded'] !== 'false') throw new Error('collapse failed');
+      const first = createCard();
+      const second = createCard();
+      if (first.card._modesExpanded || !first.grid.hidden || second.card._modesExpanded || !second.grid.hidden) throw new Error('collapsed initialization failed');
+      first.card.toggle();
+      if (!first.card._modesExpanded || first.grid.hidden || attrs['aria-expanded'] !== 'true') throw new Error('expand failed');
+      if (second.card._modesExpanded || !second.grid.hidden) throw new Error('card instances are not independent');
+      if (iconAttrs.icon !== 'mdi:chevron-up') throw new Error('expand icon failed');
+      first.card.toggle();
+      if (first.card._modesExpanded || !first.grid.hidden || attrs['aria-expanded'] !== 'false') throw new Error('collapse failed');
       if (iconAttrs.icon !== 'mdi:chevron-down') throw new Error('collapse icon failed');
       if (resizeEvent?.type !== 'power-sync-card-resize' || !resizeEvent.options?.composed) throw new Error('resize event failed');
-      card.toggle();
-      if (!card._modesExpanded || grid.hidden || attrs['aria-expanded'] !== 'true') throw new Error('expand failed');
-      if (iconAttrs.icon !== 'mdi:chevron-up') throw new Error('expand icon failed');
     """
     subprocess.run(["node", "-e", runtime], check=True)
 
