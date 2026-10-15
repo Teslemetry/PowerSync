@@ -66,7 +66,8 @@ from .flow_power import (
     has_custom_export_tiers,
     validate_flow_power_plan_selection,
 )
-from .optimization.ai_summary import AISummaryError, apply_ai_summary_settings
+from .optimization.ai_summary import AISummaryError, apply_ai_summary_settings, configured_openai_model
+from .optimization.chatgpt_auth import get_chatgpt_auth
 from .const import (
     DOMAIN,
     CONF_DISPLAY_CURRENCY,
@@ -583,6 +584,7 @@ from .const import (
     CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_ENDPOINT,
     CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_MODEL,
     CONF_OPTIMIZATION_AI_SUMMARY_OPENROUTER_MODEL,
+    CONF_OPTIMIZATION_AI_SUMMARY_OPENAI_MODEL,
     CONF_OPTIMIZATION_AI_SUMMARY_AUTO_REFRESH,
     CONF_OPTIMIZATION_BACKUP_ENERGY_WH,
     CONF_OPTIMIZATION_BACKUP_ENERGY_MAX_POWER_W,
@@ -11977,6 +11979,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                 CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_ENDPOINT,
                 CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_MODEL,
                 CONF_OPTIMIZATION_AI_SUMMARY_OPENROUTER_MODEL,
+                CONF_OPTIMIZATION_AI_SUMMARY_OPENAI_MODEL,
                 CONF_OPTIMIZATION_AI_SUMMARY_AUTO_REFRESH,
             ):
                 if ai_key not in new_options and ai_key in new_data:
@@ -12006,6 +12009,9 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                         "ai_summary_openrouter_model": user_input.get(
                             CONF_OPTIMIZATION_AI_SUMMARY_OPENROUTER_MODEL, ""
                         ),
+                        "ai_summary_openai_model": user_input.get(
+                            CONF_OPTIMIZATION_AI_SUMMARY_OPENAI_MODEL, configured_openai_model(self.config_entry)
+                        ),
                         "ai_summary_auto_refresh": user_input.get(
                             CONF_OPTIMIZATION_AI_SUMMARY_AUTO_REFRESH, False
                         ),
@@ -12016,6 +12022,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                 new_data.pop(CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_ENDPOINT, None)
                 new_data.pop(CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_MODEL, None)
                 new_data.pop(CONF_OPTIMIZATION_AI_SUMMARY_OPENROUTER_MODEL, None)
+                new_data.pop(CONF_OPTIMIZATION_AI_SUMMARY_OPENAI_MODEL, None)
                 new_data.pop(CONF_OPTIMIZATION_AI_SUMMARY_AUTO_REFRESH, None)
             except AISummaryError:
                 return await self._async_step_optimization(
@@ -12858,7 +12865,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                 ),
             )
         ).strip().lower()
-        if current_ai_provider not in {"gemini", "grok", "openrouter", "local_openai_compatible"}:
+        if current_ai_provider not in {"gemini", "grok", "openrouter", "openai", "chatgpt", "local_openai_compatible"}:
             current_ai_provider = DEFAULT_OPTIMIZATION_AI_SUMMARY_PROVIDER
         current_ai_key_configured = bool(
             str(
@@ -12872,6 +12879,13 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                 or ""
             ).strip()
         )
+        if current_ai_provider == "chatgpt":
+            current_ai_key_configured = False
+            if self.config_entry.entry_id in self.hass.data.get(DOMAIN, {}):
+                current_ai_key_configured = bool(
+                    get_chatgpt_auth(self.hass, self.config_entry.entry_id).status().get("connected")
+                )
+        current_ai_openai_model = configured_openai_model(self.config_entry)
         current_ai_local_endpoint = str(self._get_option(CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_ENDPOINT, self.config_entry.data.get(CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_ENDPOINT, "")) or "")
         current_ai_local_model = str(self._get_option(CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_MODEL, self.config_entry.data.get(CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_MODEL, "")) or "")
         current_ai_openrouter_model = str(self._get_option(CONF_OPTIMIZATION_AI_SUMMARY_OPENROUTER_MODEL, self.config_entry.data.get(CONF_OPTIMIZATION_AI_SUMMARY_OPENROUTER_MODEL, "")) or "")
@@ -12930,6 +12944,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
             CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_ENDPOINT: current_ai_local_endpoint,
             CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_MODEL: current_ai_local_model,
             CONF_OPTIMIZATION_AI_SUMMARY_OPENROUTER_MODEL: current_ai_openrouter_model,
+            CONF_OPTIMIZATION_AI_SUMMARY_OPENAI_MODEL: current_ai_openai_model,
             CONF_OPTIMIZATION_AI_SUMMARY_AUTO_REFRESH: current_ai_auto_refresh,
         }
         if current_load_entity:
@@ -13012,6 +13027,8 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                     SelectOptionDict(value="gemini", label="Gemini"),
                     SelectOptionDict(value="grok", label="Grok"),
                     SelectOptionDict(value="openrouter", label="OpenRouter"),
+                    SelectOptionDict(value="openai", label="OpenAI (API key)"),
+                    SelectOptionDict(value="chatgpt", label="ChatGPT (subscription)"),
                     SelectOptionDict(value="local_openai_compatible", label="Local OpenAI-compatible (Open WebUI)"),
                 ],
                 mode=SelectSelectorMode.DROPDOWN,
@@ -13030,6 +13047,10 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
             vol.Optional(
                 CONF_OPTIMIZATION_AI_SUMMARY_OPENROUTER_MODEL,
                 description={"suggested_value": current_ai_openrouter_model} if current_ai_openrouter_model else None,
+            ): TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT)),
+            vol.Optional(
+                CONF_OPTIMIZATION_AI_SUMMARY_OPENAI_MODEL,
+                default=current_ai_openai_model,
             ): TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT)),
             vol.Required(
                 CONF_OPTIMIZATION_AI_SUMMARY_AUTO_REFRESH,
@@ -13283,6 +13304,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                 CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_ENDPOINT,
                 CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_MODEL,
                 CONF_OPTIMIZATION_AI_SUMMARY_OPENROUTER_MODEL,
+                CONF_OPTIMIZATION_AI_SUMMARY_OPENAI_MODEL,
                 CONF_OPTIMIZATION_AI_SUMMARY_AUTO_REFRESH,
             },
         }
