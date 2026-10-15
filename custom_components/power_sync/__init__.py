@@ -17380,6 +17380,26 @@ class VehicleChargingConfigView(HomeAssistantView):
                         "error": str(err),
                     }, status=400)
 
+            if "external_session_policy" in data:
+                from .automations.ev_ownership import validate_external_session_policy
+
+                policy = data.get("external_session_policy")
+                try:
+                    if isinstance(policy, Mapping):
+                        data["external_session_policy"] = {
+                            str(mode): validate_external_session_policy(value)
+                            for mode, value in policy.items()
+                        }
+                    else:
+                        data["external_session_policy"] = validate_external_session_policy(
+                            policy
+                        )
+                except ValueError as err:
+                    return web.json_response({
+                        "success": False,
+                        "error": str(err),
+                    }, status=400)
+
             store = self._get_store()
             if not store:
                 return web.json_response({
@@ -17489,6 +17509,8 @@ class VehicleChargingConfigView(HomeAssistantView):
                             )
                         ),
                     ),
+                    "loadpoint_id": data.get("loadpoint_id"),
+                    "external_session_policy": data.get("external_session_policy"),
                     "provider_only": data.get(
                         "provider_only", stable_id.startswith("byd_")
                     ),
@@ -17529,8 +17551,14 @@ class VehicleChargingConfigView(HomeAssistantView):
 
             # Save updated configs (update key in existing _data, don't overwrite)
             vehicle_configs = self._canonicalize_vehicle_configs(vehicle_configs)
+            from .automations.ev_loadpoint_profiles import (
+                prune_connected_ev_selections,
+                validate_profile_loadpoint_mappings,
+            )
+            validate_profile_loadpoint_mappings(vehicle_configs)
             if hasattr(store, '_data') and hasattr(store, 'async_save'):
                 store._data["vehicle_charging_configs"] = vehicle_configs
+                prune_connected_ev_selections(store._data)
                 await store.async_save()
 
             # Sync charger params to AutoScheduleSettings so planner uses correct values
@@ -17795,6 +17823,8 @@ class VehicleChargingConfigView(HomeAssistantView):
                     cleanup_ids.add(f"ocpp_{removed_config['ocpp_charger_id']}")
 
             store._data["vehicle_charging_configs"] = updated
+            from .automations.ev_loadpoint_profiles import prune_connected_ev_selections
+            prune_connected_ev_selections(store._data)
             for key in ("auto_schedule_settings", "cached_vehicle_soc"):
                 value = store._data.get(key)
                 if isinstance(value, dict):
@@ -43525,6 +43555,42 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN][entry.entry_id]["automation_engine"] = automation_engine
     # Also store at domain level for HTTP API access
     hass.data[DOMAIN]["automation_store"] = automation_store
+
+    async def handle_set_connected_ev(call: ServiceCall) -> dict[str, Any]:
+        """Select (or clear) the one EV profile active on a shared charger."""
+        from .automations.ev_loadpoint_profiles import async_set_connected_ev
+
+        target_entry_id = call.data.get("entry_id") or entry.entry_id
+        target_entry = next(
+            (
+                candidate
+                for candidate in hass.config_entries.async_entries(DOMAIN)
+                if candidate.entry_id == target_entry_id
+            ),
+            None,
+        )
+        if target_entry is None:
+            raise HomeAssistantError("PowerSync config entry was not found")
+        try:
+            selected = await async_set_connected_ev(
+                hass,
+                target_entry,
+                call.data.get("loadpoint_id"),
+                call.data.get("vehicle_id"),
+            )
+        except ValueError as err:
+            raise HomeAssistantError(str(err)) from err
+        return {
+            "loadpoint_id": call.data.get("loadpoint_id"),
+            "vehicle_id": selected,
+        }
+
+    hass.services.async_register(
+        DOMAIN,
+        "set_connected_ev",
+        handle_set_connected_ev,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
 
     try:
         from .automations.ev_ownership import restore_ev_runtime_state

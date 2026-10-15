@@ -9,6 +9,29 @@ sync_now:
   description: Immediately refresh data from Amber and Tesla
   fields: {}
 
+set_connected_ev:
+  name: Set connected EV
+  description: Select the active vehicle profile for a shared non-Tesla charger. Clearing vehicle_id disables automated control until another profile is selected.
+  fields:
+    loadpoint_id:
+      name: Physical loadpoint ID
+      description: Canonical physical charger ID configured for the shared profiles.
+      required: true
+      selector:
+        text:
+    vehicle_id:
+      name: Vehicle profile ID
+      description: Profile bound to the physical charger. Omit or clear to select no vehicle.
+      required: false
+      selector:
+        text:
+    entry_id:
+      name: Entry ID
+      description: Optional PowerSync configuration entry ID.
+      required: false
+      selector:
+        text:
+
 preview_history_relink:
   name: Preview History Relink
   description: Preview Sungrow mkaiser-to-PowerSync entity relinks without changing entities.

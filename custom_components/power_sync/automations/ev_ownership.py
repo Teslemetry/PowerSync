@@ -14,6 +14,16 @@ EXTERNAL_CONTROL_POLICY_YIELD = "yield"
 EXTERNAL_CONTROL_POLICIES = frozenset(
     {EXTERNAL_CONTROL_POLICY_OVERRIDE, EXTERNAL_CONTROL_POLICY_YIELD}
 )
+EXTERNAL_SESSION_POLICY_ADOPT = "adopt"
+EXTERNAL_SESSION_POLICY_ABORT = "abort"
+EXTERNAL_SESSION_POLICY_LEAVE_ALONE = "leave_alone"
+EXTERNAL_SESSION_POLICIES = frozenset(
+    {
+        EXTERNAL_SESSION_POLICY_ADOPT,
+        EXTERNAL_SESSION_POLICY_ABORT,
+        EXTERNAL_SESSION_POLICY_LEAVE_ALONE,
+    }
+)
 EXTERNAL_CONTROL_DEFAULT_LOADPOINT_TYPES = frozenset(
     {"generic", "ocpp", "sigenergy", "zaptec"}
 )
@@ -112,6 +122,29 @@ def validate_external_control_policy(value: Any) -> str:
     return policy
 
 
+def normalize_external_session_policy(value: Any) -> str | None:
+    """Normalize an optional per-mode external-session action.
+
+    ``None`` retains the pre-selector mode behavior.  This is important for
+    existing installations: adding the field must never change their current
+    adoption/stop path.
+    """
+    if value is None or str(value).strip() == "":
+        return None
+    policy = str(value).strip().lower().replace("-", "_")
+    return policy if policy in EXTERNAL_SESSION_POLICIES else None
+
+
+def validate_external_session_policy(value: Any) -> str:
+    """Validate an explicitly supplied external-session action."""
+    policy = normalize_external_session_policy(value)
+    if policy is None:
+        raise ValueError(
+            "external_session_policy must be 'adopt', 'abort', or 'leave_alone'"
+        )
+    return policy
+
+
 def external_control_policy_supported(
     vehicle_id: Any,
     charger_type: Any,
@@ -139,6 +172,70 @@ def _stored_vehicle_charging_configs(
     if not isinstance(configs, list):
         return []
     return [config for config in configs if isinstance(config, Mapping)]
+
+
+def _stored_automation_data(hass: Any, config_entry: Any) -> Mapping[str, Any]:
+    entry = _entry_data(hass, config_entry.entry_id)
+    store = entry.get("automation_store")
+    data = getattr(store, "_data", {}) if store is not None else {}
+    return data if isinstance(data, Mapping) else {}
+
+
+def _ownership_loadpoint_id(hass: Any, config_entry: Any, vehicle_id: Any) -> str:
+    """Return the physical key for new shared profiles, preserving legacy IDs."""
+    vid = normalize_vehicle_id(vehicle_id)
+    try:
+        from .ev_loadpoint_profiles import physical_loadpoint_id, profile_id, profiles_for_loadpoint
+
+        configs = _stored_vehicle_charging_configs(hass, config_entry)
+        matching = [config for config in configs if profile_id(config) == vid]
+        if len(matching) == 1:
+            profile = matching[0]
+            loadpoint = physical_loadpoint_id(profile)
+            peers = profiles_for_loadpoint(configs, loadpoint)
+            # Preserve the byte-for-byte legacy runtime namespace until a
+            # physical mapping is actually shared (or explicitly introduced).
+            if len(peers) > 1 or profile.get("loadpoint_id"):
+                return loadpoint
+        # A physical ID received from a mode/controller is already canonical
+        # when it maps to a shared or explicitly named loadpoint.
+        peers = profiles_for_loadpoint(configs, vid)
+        if len(peers) > 1 or (len(peers) == 1 and peers[0].get("loadpoint_id")):
+            return vid
+    except Exception:
+        pass
+    return vid
+
+
+def get_external_session_policy(
+    hass: Any,
+    config_entry: Any,
+    vehicle_id: Any,
+    mode: Any,
+) -> str | None:
+    """Return the selected profile's optional action for one mode family.
+
+    It is intentionally ignored under ``yield``.  Callers use ``None`` to
+    retain their existing mode-specific path, avoiding a compatibility change
+    for profiles that do not opt in.
+    """
+    if get_external_control_policy(hass, config_entry, vehicle_id) == EXTERNAL_CONTROL_POLICY_YIELD:
+        return None
+    try:
+        from .ev_loadpoint_profiles import effective_profile_for_id
+
+        data = _stored_automation_data(hass, config_entry)
+        profile = effective_profile_for_id(
+            _stored_vehicle_charging_configs(hass, config_entry), data, vehicle_id
+        )
+        if profile is None:
+            return None
+        configured = profile.get("external_session_policy")
+        if isinstance(configured, Mapping):
+            configured = configured.get(owner_family(mode), configured.get(str(mode)))
+        return normalize_external_session_policy(configured)
+    except Exception:
+        return None
 
 
 def _canonical_external_policy_id(
@@ -213,6 +310,33 @@ def get_external_control_policy(
     """
     vid = normalize_vehicle_id(vehicle_id)
     configs = _stored_vehicle_charging_configs(hass, config_entry)
+    # A shared non-Tesla loadpoint has no anonymous policy.  Only an explicit
+    # selected profile may opt into yield; an unselected/ambiguous charger
+    # fails safe to override.
+    try:
+        from .ev_loadpoint_profiles import (
+            effective_profile_for_id,
+            physical_loadpoint_id,
+            profile_id,
+            profiles_for_loadpoint,
+        )
+
+        matching = [config for config in configs if profile_id(config) == vid]
+        physical_id = (
+            physical_loadpoint_id(matching[0]) if len(matching) == 1 else vid
+        )
+        peers = profiles_for_loadpoint(configs, physical_id)
+        if len(peers) > 1 or (len(peers) == 1 and peers[0].get("loadpoint_id")):
+            selected = effective_profile_for_id(configs, _stored_automation_data(hass, config_entry), vid)
+            if selected is None:
+                return EXTERNAL_CONTROL_POLICY_OVERRIDE
+            return normalize_external_control_policy(
+                selected.get("external_control_policy")
+            )
+    except Exception:
+        # The legacy resolution below remains the fail-safe fallback for a
+        # partial upgrade or a malformed persisted profile.
+        pass
     if vid == DEFAULT_VEHICLE_ID:
         matches = [
             config
@@ -287,7 +411,7 @@ def record_manual_stop_hold(
     reason: str | None = None,
 ) -> dict[str, Any]:
     """Temporarily suppress automated EV restarts after a user stop."""
-    vid = normalize_vehicle_id(vehicle_id)
+    vid = _ownership_loadpoint_id(hass, config_entry, vehicle_id)
     now = datetime.now(timezone.utc)
     expires_at = now.timestamp() + max(1, int(seconds))
     entry = _entry_data(hass, config_entry.entry_id)
@@ -313,7 +437,7 @@ def manual_stop_hold_reason(
     now = datetime.now(timezone.utc)
     entry = _entry_data(hass, config_entry.entry_id)
     holds = entry.setdefault("ev_manual_stop_holds", {})
-    candidates = [normalize_vehicle_id(vehicle_id)]
+    candidates = [_ownership_loadpoint_id(hass, config_entry, vehicle_id)]
     if candidates[0] != DEFAULT_VEHICLE_ID:
         candidates.append(DEFAULT_VEHICLE_ID)
 
@@ -588,6 +712,7 @@ def get_ev_ownership(
 ) -> tuple[str | None, dict[str, Any] | None]:
     """Return the active ownership lease for a loadpoint, considering overlap."""
     leases = get_ev_ownerships(hass, config_entry)
+    vehicle_id = _ownership_loadpoint_id(hass, config_entry, vehicle_id)
     for candidate_id in _candidate_vehicle_ids(vehicle_id, leases):
         lease = leases.get(candidate_id)
         if isinstance(lease, dict) and lease.get("owner"):
@@ -857,7 +982,7 @@ def record_ev_command(
     source: str = "powersync",
 ) -> dict[str, Any]:
     """Remember an EV command attempt without changing ownership."""
-    vid = normalize_vehicle_id(vehicle_id)
+    vid = _ownership_loadpoint_id(hass, config_entry, vehicle_id)
     now = _now_iso()
     last_command = {
         "command": command,
@@ -938,7 +1063,7 @@ def claim_ev_ownership(
     extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Claim ownership of an EV/loadpoint for the current config entry."""
-    vid = normalize_vehicle_id(vehicle_id)
+    vid = _ownership_loadpoint_id(hass, config_entry, vehicle_id)
     _discard_recovered_ev_ownership(
         _entry_data(hass, config_entry.entry_id),
         vid,
@@ -986,7 +1111,7 @@ def release_ev_ownership(
     source: str = "powersync",
 ) -> dict[str, Any] | None:
     """Release ownership and remember the final command for diagnostics."""
-    vid = normalize_vehicle_id(vehicle_id)
+    vid = _ownership_loadpoint_id(hass, config_entry, vehicle_id)
     leases = get_ev_ownerships(hass, config_entry)
     previous = leases.pop(vid, None)
     if vid != DEFAULT_VEHICLE_ID:
@@ -1017,7 +1142,7 @@ def clear_ev_ownerships(
         _schedule_runtime_save(hass, config_entry)
         return
     for vehicle_id in vehicle_ids:
-        vid = normalize_vehicle_id(vehicle_id)
+        vid = _ownership_loadpoint_id(hass, config_entry, vehicle_id)
         leases.pop(vid, None)
         if vid != DEFAULT_VEHICLE_ID:
             leases.pop(DEFAULT_VEHICLE_ID, None)

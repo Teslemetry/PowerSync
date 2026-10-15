@@ -35,7 +35,13 @@ def _stored_sigenergy_charger_config(
     entry_data = getattr(hass, "data", {}).get(DOMAIN, {}).get(entry_id, {})
     store = entry_data.get("automation_store") if isinstance(entry_data, Mapping) else None
     stored_data = getattr(store, "_data", {}) or {}
-    for config in stored_data.get("vehicle_charging_configs", []):
+    configs = [
+        config
+        for config in stored_data.get("vehicle_charging_configs", [])
+        if isinstance(config, Mapping)
+    ]
+    candidates = []
+    for config in configs:
         if not isinstance(config, Mapping):
             continue
         if (
@@ -43,7 +49,31 @@ def _stored_sigenergy_charger_config(
             or config.get("charger_type") == "sigenergy"
             or _present(config.get("sigenergy_charger_host"))
         ):
-            return config
+            candidates.append(config)
+    if not candidates:
+        return None
+    try:
+        from .automations.ev_loadpoint_profiles import (
+            effective_profile,
+            physical_loadpoint_id,
+        )
+
+        # Multiple Sigenergy profiles may now intentionally name one EVSE.
+        # Connection fields are physical, but choose the selected profile for
+        # consistency and fail closed rather than taking an arbitrary car.
+        selected = effective_profile(
+            candidates,
+            stored_data,
+            physical_loadpoint_id(candidates[0]),
+        )
+        if selected is not None:
+            return selected
+        if len(candidates) > 1:
+            return None
+    except Exception:
+        pass
+    if len(candidates) == 1:
+        return candidates[0]
     return None
 
 

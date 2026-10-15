@@ -5853,6 +5853,12 @@ class AutoScheduleExecutor:
             current_price_cents: Current import price (from Amber/tariff)
         """
         for vehicle_id, settings in self._settings.items():
+            if not self._is_effective_shared_loadpoint_profile(vehicle_id):
+                # Do not call a stop path here: an unselected profile must
+                # never command the shared hardware.  Existing state is left
+                # for the selected profile/normal ownership lifecycle.
+                self._clear_start_failure(vehicle_id)
+                continue
             if not settings.enabled:
                 self._clear_start_failure(vehicle_id)
                 self._clear_active_charging_preserve_intent(
@@ -5896,6 +5902,25 @@ class AutoScheduleExecutor:
                 await sm.cleanup_stale_sessions(timeout_minutes=30)
         except Exception as cleanup_err:
             _LOGGER.warning("Stale EV session cleanup failed: %s", cleanup_err)
+
+    def _is_effective_shared_loadpoint_profile(self, vehicle_id: str) -> bool:
+        """Return whether this executor identity may automate its charger."""
+        try:
+            from .ev_loadpoint_profiles import profile_is_effective
+
+            entry_data = self.hass.data.get(DOMAIN, {}).get(
+                self.config_entry.entry_id, {}
+            )
+            store = entry_data.get("automation_store")
+            data = getattr(store, "_data", {}) or {}
+            profiles = [
+                item
+                for item in data.get("vehicle_charging_configs", [])
+                if isinstance(item, Mapping)
+            ]
+            return profile_is_effective(profiles, data, vehicle_id)
+        except Exception:
+            return True
 
     def _sync_charger_params_from_vehicle_configs(
         self,
@@ -5945,6 +5970,10 @@ class AutoScheduleExecutor:
                         _vehicle_config_matches(candidate, vc.get("vehicle_id"))
                         for candidate in candidate_vehicle_ids
                     ):
+                        from .ev_loadpoint_profiles import profile_is_effective
+
+                        if not profile_is_effective(vehicle_configs, stored_data, vc.get("vehicle_id")):
+                            return
                         settings.apply_charger_config(vc)
                         opts = {
                             **getattr(self.config_entry, "data", {}),

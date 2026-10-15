@@ -7383,6 +7383,33 @@ async def _set_vehicle_amps(
     params: dict,
 ) -> bool:
     """Apply the final per-phase clamp to an owned rate command."""
+    # A shared physical charger is intentionally inert until the user chooses
+    # one connected profile.  Explicit/manual commands retain their historical
+    # behavior, but background controllers must never apply one profile's
+    # target/limits to a different connected vehicle.
+    if config_entry is not None and not params.get("_user_initiated"):
+        try:
+            from .ev_loadpoint_profiles import profile_is_effective
+
+            store = hass.data.get(DOMAIN, {}).get(config_entry.entry_id, {}).get(
+                "automation_store"
+            )
+            stored_data = getattr(store, "_data", {}) or {}
+            profiles = [
+                item
+                for item in stored_data.get("vehicle_charging_configs", [])
+                if isinstance(item, Mapping)
+            ]
+            if not profile_is_effective(profiles, stored_data, vehicle_id):
+                _LOGGER.info(
+                    "Skipping automated EV command for unselected shared loadpoint %s",
+                    vehicle_id,
+                )
+                return False
+        except Exception:
+            # A missing store cannot prove that this is a shared profile; keep
+            # the established command path for partial-startup compatibility.
+            pass
     if not _phase_load_management_applies(hass, config_entry, params):
         return await _set_vehicle_amps_unchecked(
             hass, config_entry, vehicle_id, amps, params
