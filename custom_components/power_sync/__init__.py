@@ -21114,6 +21114,9 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 
     async def _on_ha_started(event=None):
+        from .tesla_dependencies import async_check_tesla_dependencies
+
+        await async_check_tesla_dependencies(hass)
         await _ensure_lovelace_resource(hass)
         await _ensure_powersync_dashboard(hass)
 
