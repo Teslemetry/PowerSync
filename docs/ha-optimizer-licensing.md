@@ -6,7 +6,7 @@ HA optimiser access is separate from PowerSync Cloud: A$4/month through Stripe, 
 
 Direct signup collects a card and completes hosted Checkout before the one seven-day HA trial starts. The subscription then bills A$4/month automatically until cancelled. Abandoned Checkout, account creation, pairing, reinstalling HA, browser return URLs and an existing-user campaign cannot start or reset the trial. GitHub charges immediately and has no HA trial. Paid HA subscriptions and qualifying sponsors include priority HA support; trials and campaign access do not. There is no response-time guarantee.
 
-A fixed existing-user deadline is configured separately from individual trials. The missed announcement implementation date is not used as an invented launch date. No production cutoff has been configured by this implementation. Publish the revised fixed deadline only once activation works. Users can enrol in Stripe during the transition; their own seven-day trial starts at completed signup.
+A fixed existing-user deadline is configured separately from individual trials. The missed announcement implementation date is not used as an invented launch date. Activation is live. The fixed production cutoff is 23 October 2026 at 00:00 UTC (11:00 am AEDT), with signed policy epoch 2. Users can enrol in Stripe during the transition; their own seven-day trial starts at completed signup.
 
 One active HA installation is included per account; multiple PowerSync battery entries on that installation share the subscription and have independent recovery and Resume state. The hosted service validates access; optimisation continues on the user's own HA server. Monitoring, dashboards, manual controls and recovery remain available.
 
@@ -17,7 +17,7 @@ One active HA installation is included per account; multiple PowerSync battery e
 - `/app/ha`: account-only sign-in, direct Checkout, immutable trial status, GitHub verification, Discord linking, pairing, disconnection and billing portals. Cloud enrolment is an explicit separate action. Return URLs poll for verified access and never grant it.
 - HA `licensing/`: public-key registry, signed policy and permission verification, private atomic storage with disk readback, bounded transport, refresh, time watermarks, entry-specific admission, command fencing and owned recovery.
 - HA integration options → **Optimiser access**: Start pairing, Finish pairing, Refresh access, Resume optimisation and Reset pairing. Account passwords and bearer tokens are not stored in HA. The installation has its own random activation credential; only its hash is held by the Worker.
-- Native mobile: optional HA-authoritative status, local Refresh and entry-specific Resume. Older HA remains compatible. No new HA price, payment button or external purchase link is shown in the native app. The previously requested Amber/Hermes/build-441 changes remain bundled.
+- Native mobile: optional HA-authoritative status, local Refresh and entry-specific Resume. Older HA remains compatible. No new HA price, payment button or external purchase link is shown in the native app. The previously requested Amber/Hermes changes in build 442 remain bundled.
 - Public website, terms, privacy, README, HA site and wiki: pricing, activation, cancellation, scoped priority support and offline/recovery guidance.
 
 ## Trust and expiry
@@ -89,7 +89,7 @@ No real provider catalogues/tiers, remote migrations/secrets, deployment, releas
 
 - HA: 80 focused permission/runtime/EV/disable tests after the final task-lifecycle guards; 55 permission/runtime/disable tests; 135 adjacent restore/price-source/controller tests; 58 EV/solar-hold/recovery tests. These sets overlap and are not a summed unique-test count. The larger all-in-one attempt was interrupted and was replaced by the bounded passing groups.
 - Worker: expanded HA lifecycle/provider/signing checks, subscription-plan checks, auth/admin-access security checks and TypeScript pass. Account and admin production web builds pass.
-- Mobile: access parsing/actions, explicit Cloud enrolment, build-441 consistency, EV display, optimiser settings and the mobile-to-HA Amber settings/restart contract pass. TypeScript passes. Hermes reports three passes and two Mac-only skips. The existing mixed import/require optimiser test uses its CommonJS TypeScript harness; running it directly as stripped ESM is not the supported runner.
+- Mobile: access parsing/actions, explicit Cloud enrolment, build-442 consistency, EV display, optimiser settings and the mobile-to-HA Amber settings/restart contract pass. TypeScript passes. Hermes reports three passes and two Mac-only skips. The existing mixed import/require optimiser test uses its CommonJS TypeScript harness; running it directly as stripped ESM is not the supported runner.
 - The actual protected production signing file matches the shipped public registry; a local sign/verify and private-file permission check passes. Private material was not printed or uploaded.
 - The read-only provider readiness script compiles and correctly reports missing provider configuration in this environment. It has not passed against real configured Stripe, GitHub or Discord accounts. No live provider validation or physical hardware outcome is claimed.
 
