@@ -20,6 +20,8 @@ One active HA installation is included per account; multiple PowerSync battery e
 - Native mobile: optional HA-authoritative status, local Refresh and entry-specific Resume. Older HA remains compatible. No new HA price, payment button or external purchase link is shown in the native app. The previously requested Amber/Hermes changes in build 442 remain bundled.
 - Public website, terms, privacy, README, HA site and wiki: pricing, activation, cancellation, scoped priority support and offline/recovery guidance.
 
+The HA access dialog describes the free existing-user transition separately from the seven-day direct-subscription trial, using the fixed deadline from the signed policy. It shows this HA server's pairing status independently of account links on the website. After successful pairing, it removes the approval code and shows only the relevant next step: wait for recovery, restore access, Resume when required, or close the window when access is available and no Resume is needed. Access availability does not mean automatic control is running; Smart Optimization and Monitoring Mode settings still apply.
+
 ## Trust and expiry
 
 Permissions use Ed25519 compact `PSHA1` documents, strict issuer/audience/schema, installation binding and monotonic policy/revision watermarks. HA trusts only the public keys in `licensing/keys.py`; no test key is shipped there. A separate signed `PSHP1` policy controls shadow/enforced mode and the fixed legacy deadline. The public policy endpoint stays available during rollback. A shadow policy expires after at most seven days; it cannot become a permanent offline bypass. A previously verified enforced policy retains its fixed cutoff through an outage.

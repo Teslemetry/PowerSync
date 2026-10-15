@@ -11922,6 +11922,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
     async def async_step_optimizer_access(self, user_input=None):
         """Pair this server without storing account/password credentials in HA."""
         from .licensing.manager import async_get_manager
+        from .licensing.presentation import optimizer_access_description
         manager = await async_get_manager(self.hass)
         errors = {}
         if user_input is not None:
@@ -11935,6 +11936,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                     if not code:
                         raise ValueError("pairing_code_required")
                     await manager.finish_pairing(code)
+                    self._license_pairing_code = None
                 elif action == "refresh":
                     await manager.maintain(force=True)
                     await manager.reconcile_entries()
@@ -11942,6 +11944,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                     await manager.resume_entry(self.config_entry.entry_id)
                 elif action == "reset_pairing":
                     await manager.reset_pairing()
+                    self._license_pairing_code = None
             except Exception:
                 errors["base"] = "optimizer_access_unavailable"
         status = manager.status(self.config_entry.entry_id)
@@ -11957,12 +11960,9 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                 ], mode=SelectSelectorMode.DROPDOWN,
             ))}),
             errors=errors,
-            description_placeholders={
-                "account_url": status["account_url"],
-                "pairing_code": getattr(self, "_license_pairing_code", None) or "Not started",
-                "access_state": status["access_state"],
-                "resume_required": str(status["requires_resume"]),
-            },
+            description_placeholders=optimizer_access_description(
+                status, getattr(self, "_license_pairing_code", None)
+            ),
         )
 
     async def _async_step_optimization(

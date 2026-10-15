@@ -1305,12 +1305,12 @@
     "step": {
       "optimizer_access": {
         "title": "HA optimiser access",
-        "description": "Access: {access_state}. Resume required: {resume_required}.\n\nChoose Start pairing, then sign in at {account_url} and approve this code: {pairing_code}. Return here and choose Finish pairing. After access is restored, choose Resume.\n\nReset pairing disconnects this server locally. Revoke the old installation in your account before pairing a replacement. Monitoring, manual controls and recovery remain available.",
+        "description": "**Access:** {access_summary}\n\n**This HA server:** {pairing_status}\n\n{next_step}\n\nMonitoring, dashboards, manual controls and recovery remain available.\n\nUse Reset pairing only to disconnect this server locally. Revoke the old installation in your account before pairing a replacement.",
         "data": {
           "action": "Action"
         },
         "data_description": {
-          "action": "Start pairing creates a ten-minute approval code. Finish pairing verifies account approval. Resume starts a fresh schedule for this entry. Reset pairing replaces the local installation credential."
+          "action": "Select an action and choose Submit. Resume optimisation is only needed when requested above. Reset pairing disconnects this HA server."
         }
       },
       "init": {
