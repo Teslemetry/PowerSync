@@ -11,14 +11,18 @@ config, regardless of the model string -- the model name is not a reliable signa
 from __future__ import annotations
 
 import ast
+import logging
 import textwrap
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parent.parent
 INIT_PATH = ROOT / "custom_components" / "power_sync" / "__init__.py"
 CONFIG_FLOW_PATH = ROOT / "custom_components" / "power_sync" / "config_flow.py"
+SENSOR_PATH = ROOT / "custom_components" / "power_sync" / "sensor.py"
 
 # Stable Home Assistant config keys referenced by ac_inverter_is_same_hybrid.
 # Mirrors the hard-coded-namespace pattern in test_sungrow_curtailment_runtime.py
@@ -163,6 +167,72 @@ def _build_config_conflict(*, data, options=None):
         )
     )
     return namespace["_sungrow_ac_inverter_conflicts"].__get__(fake_self)
+
+
+@pytest.fixture(scope="module")
+def sensor_poller_route():
+    """Compile the real setup branch and endpoint helpers without importing HA."""
+    sensor_tree = ast.parse(SENSOR_PATH.read_text())
+    init_tree = ast.parse(INIT_PATH.read_text())
+    helpers = [
+        next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name)
+        for tree, name in (
+            (init_tree, "_active_battery_system"),
+            (init_tree, "_solaredge_ac_inverter_matches_battery"),
+            (sensor_tree, "_sungrow_ac_inverter_matches_battery"),
+        )
+    ]
+    namespace = dict(_CONST_NAMESPACE)
+    namespace["CONF_AC_INVERTER_CURTAILMENT_ENABLED"] = "ac_inverter_curtailment_enabled"
+    exec(compile(ast.Module(body=helpers, type_ignores=[]), str(SENSOR_PATH), "exec"), namespace)
+    setup = next(node for node in sensor_tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "async_setup_entry")
+    enabled = next(
+        node for node in setup.body if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "inverter_enabled" for target in node.targets)
+    )
+    branch = next(
+        node for node in setup.body if isinstance(node, ast.If)
+        and any(isinstance(name, ast.Name) and name.id == "_sungrow_ac_inverter_matches_battery" for name in ast.walk(node.test))
+    )
+    code = compile(ast.Module(body=[enabled, branch], type_ignores=[]), str(SENSOR_PATH), "exec")
+    return code, namespace
+
+
+@pytest.mark.parametrize("data,options,poller_count", [
+    pytest.param({}, {}, 0, id="sungrow-same-endpoint"),
+    pytest.param({"ac_inverter_curtailment_enabled": False}, {}, 0, id="disabled"),
+    pytest.param({}, {"ac_inverter_curtailment_enabled": False}, 0, id="disabled-by-options"),
+    pytest.param({"ac_inverter_curtailment_enabled": False, "inverter_host": "separate"}, {"ac_inverter_curtailment_enabled": True}, 1, id="enabled-by-options"),
+    pytest.param({"inverter_host": "separate"}, {}, 1, id="different-host"),
+    pytest.param({"inverter_port": 1502}, {}, 1, id="different-port"),
+    pytest.param({"inverter_slave_id": 2}, {}, 1, id="different-slave"),
+    pytest.param({"inverter_brand": "fronius"}, {}, 1, id="different-ac-brand"),
+    pytest.param({"battery_system": "goodwe"}, {}, 1, id="different-battery-brand"),
+    pytest.param({"inverter_host": "separate"}, {"inverter_host": _BATTERY_HOST}, 0, id="options-select-same-endpoint"),
+    pytest.param({}, {"inverter_host": "separate"}, 1, id="options-select-separate-endpoint"),
+    pytest.param({"battery_system": "solaredge", "inverter_brand": "solaredge", "solaredge_host": _BATTERY_HOST}, {}, 0, id="solaredge-same-endpoint"),
+    pytest.param({"battery_system": "solaredge", "inverter_brand": "solaredge", "solaredge_host": "separate"}, {}, 1, id="solaredge-different-endpoint"),
+    pytest.param({}, {"monitoring_mode": True}, 0, id="monitoring-same-endpoint"),
+    pytest.param({"inverter_host": "separate"}, {"monitoring_mode": True}, 1, id="monitoring-separate-telemetry"),
+])
+def test_same_endpoint_ac_inverter_poller_routing(sensor_poller_route, caplog, data, options, poller_count):
+    entry = _entry(model="sg5.0rs", host=_BATTERY_HOST, port=_BATTERY_PORT, slave=_BATTERY_SLAVE)
+    entry.data.update({"ac_inverter_curtailment_enabled": True, **data})
+    entry.options.update(options)
+    entities = []
+    hass = object()
+    code, constants = sensor_poller_route
+    namespace = {
+        **constants, "entry": entry, "hass": hass, "entities": entities,
+        "InverterStatusSensor": lambda **kwargs: SimpleNamespace(**kwargs),
+        "_LOGGER": logging.getLogger(__name__),
+    }
+    exec(code, namespace)
+    assert len(entities) == poller_count
+    if entities:
+        assert entities[0].entry is entry and entities[0].hass is hass
+    elif options.get("ac_inverter_curtailment_enabled", entry.data["ac_inverter_curtailment_enabled"]):
+        assert "Skipping AC inverter status poller" in caplog.text
 
 
 def test_same_endpoint_non_sh_model_is_treated_as_same_hybrid():

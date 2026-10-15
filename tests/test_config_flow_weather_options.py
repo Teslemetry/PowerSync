@@ -2848,8 +2848,6 @@ def test_agl_custom_tariff_rates_preserve_hundredths_of_a_cent():
     assert initial_period is not None
     assert options_custom is not None
     assert options_period is not None
-    assert agl_setup.count("step=0.01") == 4
-    assert agl_options.count("step=0.01") == 4
 
     for method_source in (
         initial_custom,
@@ -2962,6 +2960,58 @@ def test_agl_custom_tariff_rates_preserve_hundredths_of_a_cent():
         "SelectOptionDict": lambda **kwargs: kwargs,
         "vol": _Vol,
     }
+    # Exercise each named field instead of counting selector declarations:
+    # optional seasonal import rates add fields without changing precision.
+    constants = ast.parse(CONST_PATH.read_text())
+    rate_names = {
+        "CONF_AGL_SUMMER_OFFPEAK_IMPORT_RATE",
+        "CONF_AGL_SUMMER_PEAK_IMPORT_RATE",
+        "CONF_AGL_WINTER_OFFPEAK_IMPORT_RATE",
+        "CONF_AGL_WINTER_PEAK_IMPORT_RATE",
+        "CONF_AGL_BATTERY_REWARDS_PEAK_EXPORT_RATE",
+        "CONF_AGL_BATTERY_REWARDS_OFFPEAK_EXPORT_RATE",
+        "CONF_DAILY_SUPPLY_CHARGE",
+        "CONF_MONTHLY_SUPPLY_CHARGE",
+    }
+    constant_names = rate_names | {
+        "CONF_AGL_IMPORT_SCHEDULE",
+        "AGL_IMPORT_SCHEDULE_MANUAL",
+        "AGL_IMPORT_SCHEDULE_AUSGRID_SEASONAL",
+        "AGL_IMPORT_SCHEDULES",
+        "DEFAULT_AGL_BATTERY_REWARDS_PEAK_EXPORT_RATE",
+        "DEFAULT_AGL_BATTERY_REWARDS_OFFPEAK_EXPORT_RATE",
+    }
+    assignments = [
+        node for node in constants.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id in constant_names for target in node.targets)
+    ]
+    exec(compile(ast.Module(body=assignments, type_ignores=[]), str(CONST_PATH), "exec"), namespace)
+
+    class _RateFlow(_OptionsFlow):
+        @staticmethod
+        def _selector_unit(kind=None):
+            return {"daily": "c/day", "monthly": "c/month"}.get(kind, "c/kWh")
+
+        @staticmethod
+        def _get_option(name, default=None):
+            # A saved rate with hundredths must survive reopening options.
+            return 6.63 if name in {namespace[key] for key in rate_names} else default
+
+    for method_source, name in (
+        (agl_setup, "async_step_agl"),
+        (agl_options, "async_step_agl_options"),
+    ):
+        exec(textwrap.dedent(method_source), namespace)
+        result = asyncio.run(namespace[name](_RateFlow()))
+        fields = {field.name: (field.default, selector) for field, selector in result["data_schema"].items()}
+        for constant in rate_names:
+            key = namespace[constant]
+            default, config = fields[key]
+            assert config.step == 0.01, (name, key)
+            if name == "async_step_agl_options":
+                assert default == 6.63, key
+
     executable_source = textwrap.dedent(options_custom).replace(
         "from .const import DOMAIN",
         "DOMAIN = 'power_sync'",
@@ -3228,14 +3278,6 @@ def test_sungrow_hybrid_model_cannot_share_battery_modbus_endpoint():
     assert "inverter_host == sungrow_host" in conflict_block
     assert "inverter_port == sungrow_port" in conflict_block
     assert "inverter_slave_id == sungrow_slave_id" in conflict_block
-
-
-def test_sungrow_same_endpoint_ac_inverter_poller_is_skipped():
-    source = SENSOR_PATH.read_text()
-
-    assert "def _sungrow_ac_inverter_matches_battery" in source
-    assert "if inverter_enabled and not _sungrow_ac_inverter_matches_battery(entry)" in source
-    assert "Skipping AC inverter status poller" in source
 
 
 def test_sungrow_ac_inverter_models_include_three_phase_sg_rt():
