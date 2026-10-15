@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import json
 import sys
 import types
 from datetime import datetime, timedelta, timezone
@@ -78,6 +79,147 @@ def _optimizer(module):
 def _timestamps(n: int) -> list[datetime]:
     start = datetime(2026, 8, 1, 20, 0, tzinfo=timezone.utc)
     return [start + timedelta(hours=idx) for idx in range(n)]
+
+
+@pytest.mark.parametrize("disable_idle", [False, True])
+def test_cost_neutral_waits_for_free_window_without_paid_topups(
+    optimizer_module, disable_idle,
+):
+    """A protected export must not invent a later need for paid recharge."""
+    if not optimizer_module.HIGHS_AVAILABLE:
+        pytest.skip("requires HiGHS LP solver")
+    inputs = json.loads(
+        (ROOT / "tests/fixtures/cost_neutral_free_window_paid_topups.json").read_text()
+    )
+    start = datetime.fromisoformat(inputs["start"])
+    timestamps = [
+        start + timedelta(minutes=inputs["interval_minutes"] * idx)
+        for idx in range(len(inputs["import_prices"]))
+    ]
+    allowances = inputs["cost_neutral_fixed_allowances"]
+    plan = optimizer_module.CostNeutralPlan(
+        day_ids=[timestamp.date().isoformat() for timestamp in timestamps],
+        earnings_caps_by_day=allowances,
+        forecast_import_costs_by_day={day: 0.0 for day in allowances},
+        fixed_cost_allowances_by_day=allowances,
+        current_day=start.date().isoformat(),
+        timezone="Australia/Brisbane",
+        settlement_import_prices=inputs["import_prices"],
+        settlement_export_prices=inputs["export_prices"],
+    )
+    optimizer = optimizer_module.BatteryOptimizer(
+        capacity_wh=54_000,
+        max_charge_w=14_700,
+        max_discharge_w=21_000,
+        max_grid_import_w=15_000,
+        max_grid_export_w=10_000,
+        efficiency=0.92,
+        backup_reserve=0.38,
+        hardware_reserve=0.0,
+        interval_minutes=5,
+        horizon_hours=48,
+    )
+    result = optimizer.optimize(
+        import_prices=inputs["import_prices"],
+        export_prices=inputs["export_prices"],
+        solar_forecast=inputs["solar_forecast"],
+        load_forecast=inputs["load_forecast"],
+        current_soc=inputs["initial_soc"],
+        allow_battery_export=[price > 0 for price in inputs["export_prices"]],
+        schedule_timestamps=timestamps,
+        disable_idle=disable_idle,
+        cost_neutral_plan=plan,
+    )
+
+    assert result.solver_used == "highs"
+    assert result.feasible
+    assert result.lp_stats["mode_converged"] is True
+    assert not [
+        action.timestamp
+        for idx, action in enumerate(result.schedule.actions)
+        if action.action == "charge" and inputs["import_prices"][idx] > 0.001
+    ]
+    assert any(action.action == "export" for action in result.schedule.actions)
+    assert any(
+        action.action == "charge" and inputs["import_prices"][idx] == 0.0
+        for idx, action in enumerate(result.schedule.actions)
+    )
+    assert all(
+        action.soc >= 0.38 - 0.0001
+        for action in result.schedule.actions
+        if action.action == "export"
+    )
+
+
+@pytest.mark.parametrize("secondary_timeout", [False, True])
+def test_cost_neutral_keeps_paid_charging_for_deadline_before_free_window(
+    optimizer_module, monkeypatch, secondary_timeout,
+):
+    """Free charging preferences must not prevent a necessary earlier top-up."""
+    if not optimizer_module.HIGHS_AVAILABLE:
+        pytest.skip("requires HiGHS LP solver")
+    optimizer = _optimizer(optimizer_module)
+    optimizer.pre_window_slot = 2
+    optimizer.pre_window_soc_target = 1.0
+    if secondary_timeout:
+        real_solve = optimizer_module._solve_lp_highs
+        calls = 0
+
+        def timeout_preference(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                return optimizer_module._HighsResult(
+                    None, False, "Time limit reached", 13, None,
+                )
+            return real_solve(*args, **kwargs)
+
+        monkeypatch.setattr(optimizer_module, "_solve_lp_highs", timeout_preference)
+    result = optimizer.optimize(
+        import_prices=[0.31, 0.31, 0.0, 0.0],
+        export_prices=[0.0] * 4,
+        solar_forecast=[0.0] * 4,
+        load_forecast=[0.0, 0.0, 0.5, 0.5],
+        current_soc=0.2,
+        allow_battery_export=False,
+        schedule_timestamps=_timestamps(4),
+        cost_neutral_earnings_cap=0.2,
+        cost_neutral_slots=[True] * 4,
+    )
+
+    assert result.feasible
+    assert result.solver_used == "highs"
+    assert result.lp_stats["cost_neutral_charging_tiebreak_used"] is True
+    assert result.schedule.actions[1].soc >= 0.995
+    assert sum(result.schedule.charge_w[:2]) / 1000.0 == pytest.approx(7.95, abs=0.01)
+    assert any(action.action == "charge" for action in result.schedule.actions[:2])
+
+
+@pytest.mark.parametrize("free_price", [0.0, -0.05])
+def test_cost_neutral_keeps_paid_charge_that_avoids_expensive_home_import(
+    optimizer_module, free_price,
+):
+    """A later free window does not prohibit useful earlier price arbitrage."""
+    if not optimizer_module.HIGHS_AVAILABLE:
+        pytest.skip("requires HiGHS LP solver")
+    result = _optimizer(optimizer_module).optimize(
+        import_prices=[0.10, 0.50, free_price, 0.30],
+        export_prices=[0.0] * 4,
+        solar_forecast=[0.0] * 4,
+        load_forecast=[0.0, 5.0, 0.0, 0.0],
+        current_soc=0.0,
+        allow_battery_export=False,
+        schedule_timestamps=_timestamps(4),
+        cost_neutral_earnings_cap=0.2,
+        cost_neutral_slots=[True] * 4,
+    )
+
+    assert result.feasible
+    assert result.solver_used == "highs"
+    assert result.schedule.actions[0].action == "charge"
+    assert result.schedule.charge_w[0] == pytest.approx(5_000.0, abs=0.01)
+    assert result.grid_import_w[1] <= 0.01
+    assert result.schedule.actions[2].action == "charge"
 
 
 def _charge_by_time_cost_neutral_optimizer(module):
@@ -165,9 +307,12 @@ def test_cost_neutral_five_minute_deadline_can_top_up_before_target(
 
 
 @pytest.mark.parametrize("cost_neutral_enabled", [True, False])
+@pytest.mark.parametrize("projection_limit", [None, 13, 14])
 def test_subthreshold_deadline_grid_top_up_is_not_reported_as_idle_charge(
     optimizer_module,
     cost_neutral_enabled,
+    projection_limit,
+    monkeypatch,
 ):
     """An executable idle fallback must not retain suppressed grid energy."""
     if not optimizer_module.HIGHS_AVAILABLE:
@@ -190,6 +335,24 @@ def test_subthreshold_deadline_grid_top_up_is_not_reported_as_idle_charge(
     )
     optimizer.pre_window_slot = n
     optimizer.pre_window_soc_target = 1.0
+    if projection_limit is not None:
+        real_solve = optimizer_module._solve_lp_highs
+        solve_count = 0
+
+        def limited_projection(*args, **kwargs):
+            nonlocal solve_count
+            solve_count += 1
+            if solve_count > 1:
+                message = (
+                    "Time limit reached" if projection_limit == 13
+                    else "Iteration limit reached"
+                )
+                return optimizer_module._HighsResult(
+                    None, False, message, projection_limit, None
+                )
+            return real_solve(*args, **kwargs)
+
+        monkeypatch.setattr(optimizer_module, "_solve_lp_highs", limited_projection)
     start = datetime(2026, 10, 13, 15, 0, tzinfo=timezone(timedelta(hours=10)))
     result = optimizer.optimize(
         import_prices=[0.1291225] * n,
@@ -210,9 +373,13 @@ def test_subthreshold_deadline_grid_top_up_is_not_reported_as_idle_charge(
     assert result.feasible is False
     assert (
         result.lp_stats["fallback_reason"]
-        == "mode_projection_infeasible_executable_deadline"
+        == "mode_projection_" + (
+            "infeasible" if projection_limit is None
+            else "timeout" if projection_limit == 13 else "iteration_limit"
+        ) + "_executable_deadline"
     )
     assert result.lp_stats["deadline_unmet_after_mode_projection"] is True
+    assert result.reserve_recommendation == {}
     assert all(action.action == "idle" for action in result.schedule.actions)
     assert all(action.battery_charge_w == 0.0 for action in result.schedule.actions)
     assert all(action.battery_discharge_w == 0.0 for action in result.schedule.actions)
@@ -846,6 +1013,151 @@ def test_final_schedule_guard_trims_overlay_without_touching_home_discharge(
     assert earnings == pytest.approx(0.5)
     assert trimmed.actions[0].battery_discharge_w == pytest.approx(1_500.0)
     assert trimmed.actions[0].power_w == pytest.approx(500.0)
+
+
+@pytest.mark.parametrize(
+    ("battery_export_w", "expected_action"),
+    [
+        (99.9, "self_consumption"),
+        (100.0, "self_consumption"),
+        (100.01, "self_consumption"),
+        (100.1, "export"),
+    ],
+)
+def test_reconcile_uses_emitted_export_threshold(
+    optimizer_module,
+    battery_export_w,
+    expected_action,
+):
+    """Rounded sub-threshold export must not survive as an export action."""
+    module = optimizer_module
+    optimizer = _optimizer(module)
+    optimizer.interval_minutes = 5
+    optimizer.dt_hours = 5 / 60
+    start = _timestamps(1)[0]
+    schedule = module.OptimizationSchedule(
+        actions=[module.ScheduleAction(
+            timestamp=start,
+            action="export",
+            power_w=battery_export_w,
+            soc=0.5,
+            battery_discharge_w=2_000.0 + battery_export_w,
+        )],
+        predicted_cost=0.0,
+        predicted_savings=0.0,
+        last_updated=start,
+    )
+
+    reconciled = optimizer.reconcile_result_with_schedule(
+        module.OptimizerResult(schedule=schedule),
+        schedule,
+        import_prices=[0.20],
+        export_prices=[0.10],
+        solar=[0.0],
+        load=[2.0],
+        initial_soc=0.5,
+    )
+
+    action = reconciled.schedule.actions[0]
+    assert action.action == expected_action
+    if expected_action == "self_consumption":
+        assert action.battery_discharge_w == pytest.approx(2_000.0)
+        assert reconciled.grid_export_w == pytest.approx([0.0])
+        assert reconciled.battery_to_grid_w == pytest.approx([0.0])
+    else:
+        assert action.battery_discharge_w == pytest.approx(
+            2_000.0 + battery_export_w
+        )
+        assert reconciled.grid_export_w == pytest.approx([battery_export_w])
+        assert reconciled.battery_to_grid_w == pytest.approx([battery_export_w])
+
+
+def test_cost_neutral_subthreshold_export_does_not_consume_earnings_cap(
+    optimizer_module,
+):
+    """A converted export is not physical export and earns no settlement credit."""
+    module = optimizer_module
+    optimizer = _optimizer(module)
+    optimizer.interval_minutes = 5
+    optimizer.dt_hours = 5 / 60
+    start = _timestamps(1)[0]
+    schedule = module.OptimizationSchedule(
+        actions=[module.ScheduleAction(
+            timestamp=start,
+            action="export",
+            power_w=100.0,
+            soc=0.5,
+            battery_discharge_w=2_100.0,
+        )],
+        predicted_cost=0.0,
+        predicted_savings=0.0,
+        last_updated=start,
+    )
+
+    reconciled = optimizer.reconcile_result_with_schedule(
+        module.OptimizerResult(schedule=schedule),
+        schedule,
+        import_prices=[0.20],
+        export_prices=[0.10],
+        solar=[0.0],
+        load=[2.0],
+        initial_soc=0.5,
+        cost_neutral_earnings_cap=1.0,
+        cost_neutral_slots=[True],
+    )
+
+    action = reconciled.schedule.actions[0]
+    assert action.action == "self_consumption"
+    assert action.battery_discharge_w == pytest.approx(2_000.0)
+    assert reconciled.grid_export_w == pytest.approx([0.0])
+    assert reconciled.battery_to_grid_w == pytest.approx([0.0])
+    assert reconciled.lp_stats["cost_neutral_planned_earnings"] == pytest.approx(0.0)
+
+
+def test_cost_neutral_dated_subthreshold_export_does_not_consume_day_credit(
+    optimizer_module,
+):
+    """Dated settlement accounting must match the final zero-export action."""
+    module = optimizer_module
+    optimizer = _optimizer(module)
+    optimizer.interval_minutes = 5
+    optimizer.dt_hours = 5 / 60
+    start = _timestamps(1)[0]
+    schedule = module.OptimizationSchedule(
+        actions=[module.ScheduleAction(
+            timestamp=start,
+            action="export",
+            power_w=100.0,
+            soc=0.5,
+            battery_discharge_w=2_100.0,
+        )],
+        predicted_cost=0.0,
+        predicted_savings=0.0,
+        last_updated=start,
+    )
+    plan = module.CostNeutralPlan(
+        day_ids=["2026-08-01"],
+        earnings_caps_by_day={"2026-08-01": 1.0},
+        forecast_import_costs_by_day={"2026-08-01": 0.0},
+        fixed_cost_allowances_by_day={"2026-08-01": 1.0},
+        current_day="2026-08-01",
+    )
+
+    reconciled = optimizer.reconcile_result_with_schedule(
+        module.OptimizerResult(schedule=schedule),
+        schedule,
+        import_prices=[0.20],
+        export_prices=[0.10],
+        solar=[0.0],
+        load=[2.0],
+        initial_soc=0.5,
+        cost_neutral_plan=plan,
+    )
+
+    assert reconciled.grid_export_w == pytest.approx([0.0])
+    assert reconciled.lp_stats["cost_neutral_planned_earnings_by_day"] == {
+        "2026-08-01": pytest.approx(0.0),
+    }
 
 
 def test_final_schedule_guard_values_only_remaining_capped_export_bonus(

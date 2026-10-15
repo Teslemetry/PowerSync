@@ -5082,6 +5082,12 @@ async def _start_zaptec_charging(
         if not await _set_zaptec_charging_amps(hass, config_entry, target_amps or 16):
             _LOGGER.warning("Zaptec start: waiting charger could not be assigned current")
             return False
+        if params is not None:
+            # Setting installation current arms a waiting charger but does not
+            # prove that the vehicle has started drawing power.  Keep this
+            # attribution so a later price/SOC rejection can cancel the
+            # pending authorization instead of treating it as external.
+            params["_zaptec_pending_start"] = True
         _LOGGER.info("Zaptec charger waiting: set installation current instead of resume")
         return True
 
@@ -5099,6 +5105,8 @@ async def _start_zaptec_charging(
 async def _stop_zaptec_charging(
     hass: HomeAssistant,
     config_entry: ConfigEntry | None,
+    *,
+    pending_start: bool = False,
 ) -> bool:
     """Stop Zaptec standalone charging, treating already-idle states as success."""
     zaptec = _get_zaptec_standalone(hass, config_entry)
@@ -5113,11 +5121,30 @@ async def _stop_zaptec_charging(
     except (TypeError, ValueError):
         power_w = 0
 
-    if charger_mode in ("connected_waiting", "disconnected", "") and power_w <= 50:
+    if charger_mode == "connected_waiting" and power_w <= 50:
+        if not pending_start:
+            _LOGGER.info(
+                "Zaptec charger already in %s mode, skipping stop command",
+                charger_mode,
+            )
+            return True
+        try:
+            await zaptec["client"].deauthorize_and_stop(zaptec["charger_id"])
+            _LOGGER.info("Zaptec pending session deauthorized and stopped via Cloud API")
+            return True
+        except Exception as e:
+            _LOGGER.error("Zaptec pending session cancellation failed: %s", e)
+            return False
+
+    if charger_mode == "disconnected" and power_w <= 50:
         _LOGGER.info(
             "Zaptec charger already in %s mode, skipping stop command",
             charger_mode or "unknown",
         )
+        return True
+
+    if charger_mode == "" and power_w <= 50 and not pending_start:
+        _LOGGER.info("Zaptec charger state is unknown, skipping stop command")
         return True
 
     try:
@@ -7512,7 +7539,14 @@ async def _set_vehicle_amps_unchecked(
 
     elif charger_type == "zaptec":
         if amps == 0:
-            return await _stop_zaptec_charging(hass, config_entry)
+            return await _stop_zaptec_charging(
+                hass,
+                config_entry,
+                pending_start=bool(
+                    params.get("_zaptec_pending_start")
+                    or params.get("zaptec_pending_start")
+                ),
+            )
         return await _start_zaptec_charging(hass, config_entry, amps, params)
 
     elif charger_type == "sigenergy":
@@ -13383,6 +13417,8 @@ async def _action_start_ev_charging_dynamic_locked(
                 start_success = await _set_vehicle_amps(
                     hass, config_entry, vehicle_id, start_amps, start_params
                 )
+                if start_success and start_params.get("_zaptec_pending_start"):
+                    params["_zaptec_pending_start"] = True
             finally:
                 if (
                     pending_starts is not None
@@ -13629,6 +13665,7 @@ async def _action_start_ev_charging_dynamic_locked(
         "time_window_end": time_window_end,
         "timezone": timezone,
         "charger_type": charger_type,
+        "zaptec_pending_start": bool(params.get("_zaptec_pending_start")),
         **mode_params,
         # Pass through generic charger entities if present
         "charger_switch_entity": params.get("charger_switch_entity"),

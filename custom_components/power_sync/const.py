@@ -23,7 +23,7 @@ except (FileNotFoundError, json.JSONDecodeError):
     POWER_SYNC_VERSION = "0.0.0"
 
 # Dashboard JS version — bump this to cache-bust the strategy JS independently of the app version
-DASHBOARD_JS_VERSION = "51"
+DASHBOARD_JS_VERSION = "52"
 
 # User-Agent for API identification
 POWER_SYNC_USER_AGENT = f"PowerSync/{POWER_SYNC_VERSION} HomeAssistant"
@@ -2117,6 +2117,7 @@ CONF_OPTIMIZATION_AI_SUMMARY_CLEAR_API_KEY = "optimization_ai_summary_clear_api_
 CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_ENDPOINT = "optimization_ai_summary_local_endpoint"
 CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_MODEL = "optimization_ai_summary_local_model"
 CONF_OPTIMIZATION_AI_SUMMARY_OPENROUTER_MODEL = "optimization_ai_summary_openrouter_model"
+CONF_OPTIMIZATION_AI_SUMMARY_OPENAI_MODEL = "optimization_ai_summary_openai_model"
 CONF_OPTIMIZATION_AI_SUMMARY_AUTO_REFRESH = "optimization_ai_summary_auto_refresh"
 CONF_OPTIMIZATION_BACKUP_ENERGY_WH = "optimization_backup_energy_wh"
 CONF_OPTIMIZATION_BACKUP_ENERGY_MAX_POWER_W = (

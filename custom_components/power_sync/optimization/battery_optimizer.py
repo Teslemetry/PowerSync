@@ -2743,17 +2743,33 @@ class BatteryOptimizer:
                 result.lp_stats["mode_iterations"] = iteration + 1
                 if result.solver_used != "highs":
                     if last_result is not None:
+                        # Keep the retained plan's solve status separate from
+                        # the failed provisional pass. A limit without an
+                        # incumbent does not establish infeasibility.
+                        failure_status = result.lp_stats.get("status")
+                        failure_message = result.lp_stats.get("message", "")
+                        if "infeasible" in failure_message.lower():
+                            failure_reason = "infeasible"
+                        elif failure_status == int(highspy.HighsModelStatus.kTimeLimit):
+                            failure_reason = "timeout"
+                        elif failure_status == int(highspy.HighsModelStatus.kIterationLimit):
+                            failure_reason = "iteration_limit"
+                        else:
+                            failure_reason = "failed"
                         _LOGGER.warning(
-                            "Optimizer command-mode projection became infeasible on "
-                            "pass %d; using the previous physically projected HiGHS plan",
+                            "Optimizer command-mode projection failed on pass %d "
+                            "(%s); using the previous physically projected HiGHS plan",
                             iteration + 1,
+                            failure_message or failure_reason,
                         )
                         last_result.lp_stats = {
                             **last_result.lp_stats,
                             "mode_iterations": iteration + 1,
                             "mode_converged": False,
+                            "mode_projection_failure_status": failure_status,
+                            "mode_projection_failure_message": failure_message,
                             "fallback_reason": (
-                                "mode_projection_infeasible_projected_highs"
+                                f"mode_projection_{failure_reason}_projected_highs"
                             ),
                         }
                         if not self._schedule_meets_effective_deadline(
@@ -2764,7 +2780,7 @@ class BatteryOptimizer:
                             last_result.lp_stats.update(
                                 {
                                     "fallback_reason": (
-                                        "mode_projection_infeasible_executable_deadline"
+                                        f"mode_projection_{failure_reason}_executable_deadline"
                                     ),
                                     "deadline_unmet_after_mode_projection": True,
                                 }
@@ -3908,6 +3924,10 @@ class BatteryOptimizer:
             _nonzero_prices[len(_nonzero_prices) // 2] * eff / _terminal_unit_divisor
             if _nonzero_prices else 0.0
         )
+        cost_neutral_free_charge_tiebreak = cost_neutral_active and any(
+            price <= 0.001 for price in p_import
+        )
+        charging_tiebreak_objective = [0.0] * num_vars
 
         # The two tie-break branches below share one epsilon scale, so without
         # an offset they interleave: the pre-bias branch costs eps*(p_n - t),
@@ -3937,11 +3957,17 @@ class BatteryOptimizer:
                 if prefer_earlier_import
                 else (p_n - t) + pre_bias_import_eps_offset
             )
-            c[grid_import_var(t)] = (p_import[t] + import_eps) * p_dt[t]
+            free_charge_tiebreak_slot = (
+                cost_neutral_free_charge_tiebreak and p_import[t] <= 0.001
+            )
+            c[grid_import_var(t)] = (
+                p_import[t] + (0.0 if free_charge_tiebreak_slot else import_eps)
+            ) * p_dt[t]
             # Prefer direct grid supply over a price-identical battery cycle.
             # This is only a deterministic tie-breaker (0.001 c/kWh per side),
             # not a degradation-cost model.
-            c[charge_var(t)] += 1e-5 * p_dt[t]
+            if not free_charge_tiebreak_slot:
+                c[charge_var(t)] += 1e-5 * p_dt[t]
             c[discharge_var(t)] += 1e-5 * p_dt[t]
             if economic_adjustment_active:
                 physical_rte = max(self.physical_round_trip_efficiency, 1e-9)
@@ -3978,8 +4004,23 @@ class BatteryOptimizer:
             # Free electricity: strongly incentivize charging.
             # Without this, the LP may idle during free windows because
             # the near-zero import cost doesn't overcome terminal valuation.
-            if p_import[t] <= 0.001 and _free_charge_bonus > 0:
+            if (
+                p_import[t] <= 0.001
+                and _free_charge_bonus > 0
+                and not cost_neutral_free_charge_tiebreak
+            ):
                 c[charge_var(t)] -= _free_charge_bonus * p_dt[t]
+
+            if cost_neutral_free_charge_tiebreak:
+                # First minimize real costs. Only then prefer low paid import
+                # and a full free window; free throughput must never subsidize
+                # buying energy just to reopen a Cost Neutral export budget.
+                if p_import[t] > 0.001:
+                    charging_tiebreak_objective[grid_import_var(t)] = (
+                        p_import[t] + import_eps
+                    ) * p_dt[t]
+                else:
+                    charging_tiebreak_objective[charge_var(t)] = -1e-4 * p_dt[t]
 
             if bonus_export_active and p_export_bonus[t] > 0:
                 c[bonus_export_var(t)] = -(
@@ -4332,7 +4373,7 @@ class BatteryOptimizer:
             # export and prevent it from discharging the battery. The
             # remaining rows make native solar absorption exact, including
             # capacity saturation and total-EV surplus crossing zero.
-            A_ub_rows += 8 * len(cost_neutral_mode_periods)
+            A_ub_rows += 9 * len(cost_neutral_mode_periods)
             if ev_charge_active:
                 A_ub_rows += 11 * len(cost_neutral_natural_periods)
             else:
@@ -4440,6 +4481,10 @@ class BatteryOptimizer:
             # physical intersection of battery discharge and grid export. The
             # Cost Neutral selectors witness an executable export or forced
             # charge action; they do not add a solar-export action.
+            # The action builder uses a strict >100 W boundary. Leave a small
+            # margin so a binary witness cannot settle at exactly 100 W and
+            # disappear when the executable schedule is rendered.
+            command_threshold_kw = (ACTION_THRESHOLD_W + 0.1) / 1000.0
             for t in cost_neutral_mode_periods:
                 export_mode = cost_neutral_export_mode_var(t)
                 charge_mode = cost_neutral_charge_mode_var(t)
@@ -4453,6 +4498,28 @@ class BatteryOptimizer:
                 )
                 charge_cap = max(0.0, self.max_charge_kw)
 
+                if not p_manual_control[t]:
+                    # A Cost Neutral selector may introduce an export even in
+                    # an unpinned/self-use period. Protect its energy here too:
+                    # relying only on p_mode == "export" lets the LP spend SOC
+                    # that the physical schedule will retain, then buy it back.
+                    period_export_floor = max(
+                        optimizer_reserve,
+                        self._configured_export_reserve_floor_for_range(
+                            periods[t].start, periods[t].end,
+                        ),
+                    )
+                    reachable_floor = max(
+                        self_consumption_floor,
+                        max_reachable_soc[t + 1] - 0.005,
+                    )
+                    selector_export_floor = min(period_export_floor, reachable_floor)
+                else:
+                    selector_export_floor = 0.0
+                A_ub[len(b_ub), energy_var(t + 1)] = -1.0
+                A_ub[len(b_ub), export_mode] = selector_export_floor * cap
+                b_ub.append(0.0)
+
                 # A charge mode may top up from the grid, but it must not
                 # overlap an export mode or discharge the battery. Solar can
                 # still serve the house and export its genuine surplus via
@@ -4465,16 +4532,16 @@ class BatteryOptimizer:
                 b_ub.append(self.max_discharge_kw)
 
                 A_ub[len(b_ub), battery_to_grid_var(t)] = -1.0
-                A_ub[len(b_ub), export_mode] = ACTION_THRESHOLD_W / 1000.0
+                A_ub[len(b_ub), export_mode] = command_threshold_kw
                 b_ub.append(0.0)
                 A_ub[len(b_ub), battery_to_grid_var(t)] = 1.0
                 A_ub[len(b_ub), export_mode] = -export_cap
                 b_ub.append(0.0)
                 A_ub[len(b_ub), grid_export_var(t)] = -1.0
-                A_ub[len(b_ub), export_mode] = ACTION_THRESHOLD_W / 1000.0
+                A_ub[len(b_ub), export_mode] = command_threshold_kw
                 b_ub.append(0.0)
                 A_ub[len(b_ub), discharge_var(t)] = -1.0
-                A_ub[len(b_ub), export_mode] = ACTION_THRESHOLD_W / 1000.0
+                A_ub[len(b_ub), export_mode] = command_threshold_kw
                 b_ub.append(0.0)
                 A_ub[len(b_ub), charge_var(t)] = 1.0
                 A_ub[len(b_ub), export_mode] = charge_cap
@@ -5596,6 +5663,43 @@ class BatteryOptimizer:
                 *solve_args,
                 time_limit=LP_SOLVER_TIME_LIMIT_SECONDS,
             )
+        charging_tiebreak_used = False
+        if cost_neutral_free_charge_tiebreak and result.success:
+            remaining_time = LP_SOLVER_TIME_LIMIT_SECONDS - (
+                time.monotonic() - solver_start
+            )
+            if remaining_time > 0.0:
+                # Keep the economic optimum as a hard bound in the second
+                # solve. An epsilon preference can fill a free window without
+                # trading away import/export money to do so.
+                economic_limit = float(result.fun) + 1e-6
+                tiebreak_constraints = _LpMatrix(
+                    (A_ub.shape[0] + 1, num_vars), dtype=float,
+                )
+                for row, indices, values in A_ub.iter_rows():
+                    for index, value in zip(indices, values):
+                        tiebreak_constraints[row, index] = value
+                for index, coefficient in enumerate(c):
+                    tiebreak_constraints[A_ub.shape[0], index] = coefficient
+                preferred = _solve_lp_highs(
+                    charging_tiebreak_objective,
+                    tiebreak_constraints,
+                    [*b_ub, economic_limit],
+                    A_eq,
+                    b_eq,
+                    bounds,
+                    time_limit=remaining_time,
+                    integer_indices=integer_indices,
+                )
+                if preferred.success:
+                    preferred_economic_cost = math.fsum(
+                        coefficient * value
+                        for coefficient, value in zip(c, preferred.x)
+                    )
+                    if preferred_economic_cost <= economic_limit + 1e-7:
+                        preferred.fun = preferred_economic_cost
+                        result = preferred
+                        charging_tiebreak_used = True
         solver_time_s = time.monotonic() - solver_start
         lp_stats = {
             "backend": "highspy",
@@ -5609,6 +5713,7 @@ class BatteryOptimizer:
             "time_limit_s": LP_SOLVER_TIME_LIMIT_SECONDS,
             "status": getattr(result, "status", None),
             "message": getattr(result, "message", ""),
+            "cost_neutral_charging_tiebreak_used": charging_tiebreak_used,
             "battery_export_constraints": battery_export_constraints,
         }
         if pre_window_effective_target is not None:
@@ -8218,6 +8323,10 @@ class BatteryOptimizer:
         )
         grid_charge_cap_active = allow_grid_charge and grid_charge_soc_cap < 0.999
 
+        # When native PV makes an earlier deadline hold unnecessary, carry
+        # that extra recharge into the emitted schedule as well as the check.
+        deadline_native_charge_slots: set[int] = set()
+
         def _future_grid_charge_planned(
             start_idx: int,
             *,
@@ -8267,6 +8376,7 @@ class BatteryOptimizer:
                 return False
 
             deadline = min(n, self.pre_window_slot)
+            expanded_native_charge_slots: set[int] = set()
 
             def _max_reachable_charge_kw(idx: int, projected_soc: float) -> float:
                 """Return charge available without changing the projected mode."""
@@ -8307,11 +8417,23 @@ class BatteryOptimizer:
                     and grid_import[idx] > net_load_kw + threshold_kw
                 )
                 if not planned_charge_mode:
-                    # A self-use or idle mode is not free to become a forced
-                    # grid-charge command on the next projection pass. Keep its
-                    # existing physical flow; only a charge-mode slot provides
-                    # concrete recharge headroom for replacing this hold.
-                    return max(0.0, battery_charge[idx])
+                    planned_charge_kw = max(0.0, battery_charge[idx])
+                    if (
+                        manual_control_slots[idx] is None
+                        and not profit_max_solar_export_slots[idx]
+                        and battery_discharge[idx] <= threshold_kw
+                    ):
+                        # Native self-consumption can absorb unused PV after
+                        # earlier household use creates more battery room.
+                        # It cannot acquire an unplanned grid-charge command.
+                        native_charge_kw = min(
+                            self._charge_limit_kw(load[idx], solar[idx], False),
+                            max(0.0, 1.0 - projected_soc) * cap / (eff * dt),
+                        )
+                        if native_charge_kw > planned_charge_kw + 1e-9:
+                            expanded_native_charge_slots.add(idx)
+                        return native_charge_kw
+                    return planned_charge_kw
 
                 charge_limit_kw = self._charge_limit_kw(
                     load[idx],
@@ -8429,7 +8551,10 @@ class BatteryOptimizer:
                     min(1.0, projected_soc),
                 )
 
-            return projected_soc < self.pre_window_soc_target - 0.0001
+            hold_required = projected_soc < self.pre_window_soc_target - 0.0001
+            if not hold_required:
+                deadline_native_charge_slots.update(expanded_native_charge_slots)
+            return hold_required
 
         for t in range(n):
             ts = (
@@ -8749,6 +8874,23 @@ class BatteryOptimizer:
                 # Export modes never charge the battery, but they retain the
                 # battery discharge selected by the LP and its reserve cap.
                 reported_charge_w = 0.0
+
+            if (
+                action == "self_consumption"
+                and t in deadline_native_charge_slots
+                and manual_mode is None
+                and not charge_blocked
+                and not profit_max_solar_export_slots[t]
+                and reported_discharge_w <= ACTION_THRESHOLD_W
+            ):
+                # Match the recharge that released the earlier hold. Keeping
+                # the old PV charge here would invent a reachable deadline.
+                reported_charge_w = min(
+                    self._charge_limit_kw(load[t], solar[t], False),
+                    max(0.0, 1.0 - soc) * cap / (eff * dt),
+                ) * 1000.0
+                reported_discharge_w = 0.0
+                power_w = reported_charge_w
 
             if action == "self_consumption" and reported_charge_w > 0:
                 # Self-consumption may charge only from native solar surplus;
@@ -9154,6 +9296,8 @@ class BatteryOptimizer:
             available_kwh = battery_export_w / 1000.0 * self.dt_hours
             allowed_bonus_kwh = 0.0
             allowed_base_kwh = 0.0
+            remaining_before_battery = remaining
+            bonus_remaining_before_battery = bonus_remaining
             if remaining > 0 and bonus_price > 0 and bonus_remaining > 0:
                 bonus_unit_value = base_price + bonus_price
                 if bonus_unit_value > 0:
@@ -9175,14 +9319,26 @@ class BatteryOptimizer:
                 remaining = max(
                     0.0, remaining - allowed_base_kwh * base_price
                 )
-            bonus_remaining_by_group[group] = bonus_remaining
             allowed_export_w = (
                 allowed_bonus_kwh + allowed_base_kwh
             ) / max(self.dt_hours, 1e-12) * 1000.0
-            earned = (
-                allowed_bonus_kwh * (base_price + bonus_price)
-                + allowed_base_kwh * base_price
-            )
+            emitted_export_w = round(allowed_export_w, 1)
+            if emitted_export_w <= ACTION_THRESHOLD_W:
+                # The rounded action cannot execute as an export command. Do
+                # not spend settlement credit on energy that is removed from
+                # the emitted flow, and keep only the natural home discharge.
+                allowed_bonus_kwh = 0.0
+                allowed_base_kwh = 0.0
+                allowed_export_w = 0.0
+                remaining = remaining_before_battery
+                bonus_remaining = bonus_remaining_before_battery
+                earned = 0.0
+            else:
+                    earned = (
+                        allowed_bonus_kwh * (base_price + bonus_price)
+                        + allowed_base_kwh * base_price
+                    )
+            bonus_remaining_by_group[group] = bonus_remaining
             planned_earnings += earned
             remaining_by_day[day] = remaining
             if planned_earnings_by_day is not None:
@@ -9192,7 +9348,7 @@ class BatteryOptimizer:
             new_discharge_w = min(discharge_w, net_home_w) + allowed_export_w
             emitted_action = action.action
             power_w = float(action.power_w or 0.0)
-            if allowed_export_w <= ACTION_THRESHOLD_W:
+            if emitted_export_w <= ACTION_THRESHOLD_W:
                 emitted_action = "self_consumption"
                 power_w = min(new_discharge_w, net_home_w)
             else:
@@ -9487,11 +9643,13 @@ class BatteryOptimizer:
                         net_home_w,
                     )
                     battery_export_w = max(0.0, discharge_w - home_discharge_w)
+                    emitted_battery_export_w = round(battery_export_w, 1)
                     if (
-                        battery_export_w <= ACTION_THRESHOLD_W
+                        emitted_battery_export_w <= ACTION_THRESHOLD_W
                         and action.control_source != "manual"
                     ):
                         emitted_action = "self_consumption"
+                        discharge_w = home_discharge_w
                         power_w = discharge_w
                     else:
                         power_w = battery_export_w

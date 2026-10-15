@@ -203,6 +203,44 @@ def test_configured_vehicle_profiles_are_kept_as_idle_loadpoints():
     assert "'include_idle': any((vehicle_ids_match(configured_id, vehicle_id)" in source
 
 
+def test_zaptec_finished_mode_is_kept_as_a_connected_loadpoint():
+    method = _get_method()
+    body = method.body[1].body
+    index = next(
+        index
+        for index, node in enumerate(body)
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "zaptec_cached"
+                for target in node.targets
+            )
+        )
+    )
+    module = ast.Module(body=body[index : index + 2], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {
+        "entry_data": {
+            "zaptec_cached_state": {
+                "charger_operation_mode": "connected_finished",
+                "total_charge_power_w": 0,
+            }
+        },
+        "observed_vehicles": [],
+    }
+    exec(compile(module, str(INIT_PATH), "exec"), namespace)
+
+    assert namespace["observed_vehicles"] == [{
+        "charger_id": "zaptec_standalone",
+        "vehicle_name": "Zaptec Charger",
+        "charger_type": "zaptec",
+        "ev_power_kw": 0.0,
+        "is_connected": True,
+        "is_charging": False,
+        "blocking_reason": "connected_finished",
+    }]
+
+
 def test_ble_loadpoint_observations_use_current_entity_compatibility_helpers():
     tree = ast.parse(INIT_PATH.read_text())
     source = ast.unparse(tree)

@@ -8526,7 +8526,7 @@ class BatteryHealthView(HomeAssistantView):
         if local_ip and not is_loopback_host(local_ip):
             try:
                 from .powerwall_local.transport import get_insecure_ssl_context
-                from tesla_protocol.energy_device import signed_message_pb2 as _pb2
+                from .powerwall_local.energy_device import signed_message_pb2 as _pb2
                 ssl_ctx = await get_insecure_ssl_context(self._hass)
                 connector = _aio.TCPConnector(ssl=ssl_ctx, limit=2)
                 async with _aio.ClientSession(
@@ -8942,7 +8942,7 @@ class BatteryHealthView(HomeAssistantView):
             if local_ip and not is_loopback_host(local_ip):
                 try:
                     from .powerwall_local.transport import get_insecure_ssl_context
-                    from tesla_protocol.energy_device import signed_message_pb2 as _pb2
+                    from .powerwall_local.energy_device import signed_message_pb2 as _pb2
                     ssl_ctx = await get_insecure_ssl_context(self._hass)
                     connector = _aio.TCPConnector(ssl=ssl_ctx, limit=2)
                     async with _aio.ClientSession(
@@ -19557,6 +19557,7 @@ class EVLoadpointStatusView(HomeAssistantView):
                 zaptec_connected = zaptec_mode in (
                     "charging",
                     "connected_waiting",
+                    "connected_finished",
                     "connected_finishing",
                 )
                 observed_vehicles.append({
@@ -21113,6 +21114,9 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 
     async def _on_ha_started(event=None):
+        from .tesla_dependencies import async_check_tesla_dependencies
+
+        await async_check_tesla_dependencies(hass)
         await _ensure_lovelace_resource(hass)
         await _ensure_powersync_dashboard(hass)
 
@@ -26614,7 +26618,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         from .tariff_converter import (
             convert_amber_to_tesla_tariff,
             convert_custom_tariff_to_tesla_tariff,
-            extract_most_recent_actual_interval,
+            extract_current_price_interval,
             compare_forecast_types,
             detect_price_spikes,
             format_spike_alert_time,
@@ -26807,9 +26811,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             await amber_coordinator.async_request_refresh()
 
             if amber_coordinator.data:
-                # Extract most recent CurrentInterval/ActualInterval from 5-min forecast data
-                forecast_5min = amber_coordinator.data.get("forecast_5min", [])
-                current_actual_interval = extract_most_recent_actual_interval(forecast_5min)
+                # Use the refreshed current endpoint for the active TOU period.
+                # forecast_5min is independently cached and may end at a prior
+                # boundary even when the live endpoint has already advanced.
+                current_prices = amber_coordinator.data.get("current", [])
+                current_actual_interval = extract_current_price_interval(current_prices)
 
                 if current_actual_interval:
                     general_price = current_actual_interval.get('general', {}).get('perKwh') if current_actual_interval.get('general') else None
@@ -39163,7 +39169,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 foxess_coord = entry_data.get("foxess_coordinator")
                 if not foxess_coord:
                     _LOGGER.error("Self-consumption: FoxESS coordinator not available")
-                    return
+                    raise HomeAssistantError("FoxESS coordinator unavailable")
 
                 if (
                     source == "optimizer"
@@ -39184,10 +39190,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     _LOGGER.info("✅ FoxESS self-consumption mode set (Self Use)")
                 else:
                     _LOGGER.error("Failed to set FoxESS self-consumption mode")
+                    raise HomeAssistantError(
+                        "FoxESS self-consumption restore failed; check control health"
+                    )
                 return
+            except HomeAssistantError:
+                raise
             except Exception as e:
                 _LOGGER.error(f"Error setting FoxESS self-consumption: {e}", exc_info=True)
-                return
+                raise HomeAssistantError(
+                    "FoxESS self-consumption restore failed; check control health"
+                ) from e
 
         # Check if this is a GoodWe system
         is_goodwe = bool(entry.data.get(CONF_GOODWE_HOST))
@@ -41876,9 +41889,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 _LOGGER.warning("Zaptec state poll skipped: no charger_id configured")
                 return
             try:
+                poll_started_at = time.monotonic()
                 raw_state = await zaptec_client.get_charger_state(charger_id)
                 parsed = zaptec_client.parse_charger_state(raw_state)
-                hass.data[DOMAIN][entry.entry_id]["zaptec_cached_state"] = parsed
+                entry_data = hass.data[DOMAIN][entry.entry_id]
+                entry_data["zaptec_cached_state"] = parsed
+                entry_data["zaptec_state_poll"] = {
+                    "started_at": poll_started_at,
+                    "completed_at": time.monotonic(),
+                }
                 _LOGGER.debug(
                     "Zaptec state poll OK: mode=%s (raw=%s), power=%sW, "
                     "phase_a=%.1fA, phase_b=%.1fA, phase_c=%.1fA, cable_locked=%s",
@@ -44917,6 +44936,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.http.register_view(OptimizationView(hass))
     hass.http.register_view(OptimizationSettingsView(hass))
     hass.http.register_view(OptimizationAISummaryView(hass))
+    hass.http.register_view(OptimizationChatGPTView(hass))
+    from .optimization.chatgpt_auth import ChatGPTAuthError, get_chatgpt_auth
+    try:
+        await get_chatgpt_auth(hass, entry.entry_id).async_load()
+    except ChatGPTAuthError as err:
+        # Optional explanation credentials must not prevent energy control setup.
+        _LOGGER.warning("ChatGPT connection unavailable during setup: %s", err.code)
     _LOGGER.info("Optimization HTTP endpoints registered at /api/power_sync/optimization")
 
     # Reload integration when options change (e.g. optimizer toggled in config flow)
@@ -44951,6 +44977,28 @@ async def _async_options_update_listener(hass: HomeAssistant, entry: ConfigEntry
     await hass.config_entries.async_reload(entry.entry_id)
 
 
+def _optimization_chatgpt_auth(hass: HomeAssistant, entry_id: str):
+    """Return the server-owned subscription credentials for an entry."""
+    from .optimization.chatgpt_auth import get_chatgpt_auth
+
+    return get_chatgpt_auth(hass, entry_id)
+
+
+def _optimization_ai_settings(hass: HomeAssistant, entry: ConfigEntry | None):
+    """Return readiness metadata without exposing saved credentials."""
+    from .optimization.ai_summary import ai_summary_settings
+
+    entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id) if entry else None
+    status = _optimization_chatgpt_auth(hass, entry.entry_id).status() if isinstance(entry_data, dict) else None
+    return ai_summary_settings(entry, chatgpt_status=status)
+
+
+def _optimization_ai_current_options(entry: ConfigEntry) -> dict:
+    """Honor legacy AI values while saving an explicit options override."""
+    inherited = {key: value for key, value in entry.data.items() if key.startswith("optimization_ai_summary_")}
+    return {**inherited, **entry.options}
+
+
 def _optimization_ai_service(
     hass: HomeAssistant,
     entry_id: str,
@@ -44967,6 +45015,7 @@ def _optimization_ai_service(
         service = AISummaryService(
             async_get_clientsession(hass),
             opt_coordinator.get_api_data,
+            chatgpt_auth=_optimization_chatgpt_auth(hass, entry_id),
         )
         entry_data["_optimization_ai_summary_service"] = service
         # Coordinator listeners run after committed data is published.  This
@@ -44979,9 +45028,10 @@ def _optimization_ai_service(
                 configured_local_endpoint,
                 configured_local_model,
                 configured_openrouter_model,
+                configured_openai_model,
             )
             entry = hass.config_entries.async_get_entry(entry_id)
-            settings = ai_summary_settings(entry)
+            settings = _optimization_ai_settings(hass, entry)
             if not settings.get("ai_summary_auto_refresh"):
                 return
             service.schedule_auto_refresh(
@@ -44990,6 +45040,7 @@ def _optimization_ai_service(
                 endpoint=configured_local_endpoint(entry),
                 local_model=configured_local_model(entry),
                 openrouter_model=configured_openrouter_model(entry),
+                openai_model=configured_openai_model(entry),
             )
         entry_data["_optimization_ai_summary_auto_unsub"] = (
             opt_coordinator.async_add_listener(_queue_auto_ai_summary)
@@ -45035,8 +45086,9 @@ class OptimizationView(HomeAssistantView):
             configured_local_endpoint,
             configured_local_model,
             configured_openrouter_model,
+            configured_openai_model,
         )
-        ai_settings = ai_summary_settings(config_entry)
+        ai_settings = _optimization_ai_settings(self._hass, config_entry)
 
         if not opt_coordinator:
             # Optimization not enabled - return disabled status
@@ -45076,6 +45128,7 @@ class OptimizationView(HomeAssistantView):
                 endpoint=configured_local_endpoint(config_entry),
                 local_model=configured_local_model(config_entry),
                 openrouter_model=configured_openrouter_model(config_entry),
+                openai_model=configured_openai_model(config_entry),
             )
         _LOGGER.debug(f"Optimization GET response: enabled={api_data.get('enabled')}, "
                       f"predicted_cost=${api_data.get('predicted_cost', 0):.2f}, "
@@ -45351,7 +45404,7 @@ class OptimizationSettingsView(HomeAssistantView):
             from .optimization.ai_summary import ai_summary_settings
             return web.json_response({
                 "success": True,
-                **ai_summary_settings(config_entry),
+                **_optimization_ai_settings(self._hass, config_entry),
                 "enabled": bool(
                     config_entry
                     and config_entry.options.get(CONF_OPTIMIZATION_ENABLED, False)
@@ -45611,7 +45664,7 @@ class OptimizationSettingsView(HomeAssistantView):
         from .optimization.ai_summary import ai_summary_settings
         return web.json_response({
             "success": True,
-            **ai_summary_settings(config_entry),
+            **_optimization_ai_settings(self._hass, config_entry),
             "enabled": opt_coordinator.enabled,
             "optimiser_available": opt_coordinator.optimiser_available,
             "cost_function": opt_coordinator._cost_function.value,
@@ -45742,9 +45795,15 @@ class OptimizationSettingsView(HomeAssistantView):
                 "ai_summary_local_endpoint",
                 "ai_summary_local_model",
                 "ai_summary_openrouter_model",
-                "ai_summary_auto_refresh",
+                "ai_summary_openai_model",                "ai_summary_auto_refresh",
             }
             if ai_setting_keys.intersection(settings):
+                user = request.get("hass_user")
+                if user is None or not user.is_admin:
+                    return web.json_response(
+                        {"success": False, "code": "admin_required", "message": "An administrator must manage the AI connection."},
+                        status=403,
+                    )
                 if config_entry is None:
                     return web.json_response(
                         {
@@ -45761,7 +45820,7 @@ class OptimizationSettingsView(HomeAssistantView):
                 )
                 try:
                     new_options, ai_changes = apply_ai_summary_settings(
-                        config_entry.options,
+                        _optimization_ai_current_options(config_entry),
                         settings,
                     )
                 except AISummaryError as err:
@@ -45798,7 +45857,7 @@ class OptimizationSettingsView(HomeAssistantView):
                         {
                             "success": True,
                             "changes": changes,
-                            **ai_summary_settings(config_entry),
+                            **_optimization_ai_settings(self._hass, config_entry),
                         }
                     )
 
@@ -46413,6 +46472,142 @@ class OptimizationSettingsView(HomeAssistantView):
             }, status=500)
 
 
+class OptimizationChatGPTView(HomeAssistantView):
+    """Administrator-only connection and write-only explanation settings."""
+
+    url = "/api/power_sync/optimization/chatgpt"
+    name = "api:power_sync:optimization:chatgpt"
+    requires_auth = True
+
+    def __init__(self, hass: HomeAssistant):
+        self._hass = hass
+
+    def _context(self, request: web.Request):
+        from .optimization.chatgpt_auth import ChatGPTAuthError
+
+        user = request.get("hass_user")
+        if user is None or not user.is_admin:
+            raise ChatGPTAuthError("admin_required", "An administrator must manage the AI connection.", 403)
+        entries = self._hass.config_entries.async_entries(DOMAIN)
+        if not entries:
+            raise ChatGPTAuthError("integration_not_configured", "PowerSync is not configured.", 409)
+        entry = entries[0]
+        if not isinstance(self._hass.data.get(DOMAIN, {}).get(entry.entry_id), dict):
+            raise ChatGPTAuthError("integration_unavailable", "PowerSync is not loaded. Try again after it starts.", 409)
+        return user.id, entry, _optimization_chatgpt_auth(self._hass, entry.entry_id)
+
+    def _settings(self, entry: ConfigEntry, payload: dict) -> None:
+        from .optimization.ai_summary import apply_ai_summary_settings
+
+        options, _ = apply_ai_summary_settings(_optimization_ai_current_options(entry), payload)
+        if options != dict(entry.options):
+            entry_data = self._hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+            entry_data["_skip_reload"] = True
+            self._hass.config_entries.async_update_entry(entry, options=options)
+        self._invalidate(entry)
+
+    def _invalidate(self, entry: ConfigEntry) -> None:
+        entry_data = self._hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+        if service := entry_data.get("_optimization_ai_summary_service"):
+            service.invalidate()
+
+    def _response(self, entry: ConfigEntry, manager, **extra) -> web.Response:
+        return web.json_response({
+            "success": True,
+            **manager.status(),
+            "settings": _optimization_ai_settings(self._hass, entry),
+            **extra,
+        })
+
+    async def get(self, request: web.Request) -> web.Response:
+        from .optimization.chatgpt_auth import ChatGPTAuthError
+
+        try:
+            _, entry, manager = self._context(request)
+            await manager.async_load()
+            return self._response(entry, manager)
+        except ChatGPTAuthError as err:
+            return self._error(err)
+
+    @staticmethod
+    def _error(err, *, login_restart_required: bool | None = None) -> web.Response:
+        return web.json_response(
+            {"success": False, "code": err.code, "message": err.message,
+             **({"login_restart_required": login_restart_required} if login_restart_required is not None else {})},
+            status=err.http_status,
+        )
+
+    async def post(self, request: web.Request) -> web.Response:
+        from .optimization.ai_summary import AISummaryError, configured_openai_model
+        from .optimization.chatgpt_auth import ChatGPTAuthError
+
+        manager = None
+        owner_id = None
+        payload = None
+        action = None
+        try:
+            owner_id, entry, manager = self._context(request)
+            try:
+                payload = await request.json()
+            except (ValueError, TypeError):
+                payload = None
+            allowed = {
+                "start": set(),
+                "complete": {"login_id", "callback_url"},
+                "cancel": {"login_id"},
+                "logout": set(),
+                "models": set(),
+                "settings": {
+                    "ai_summary_provider", "ai_summary_openai_model",
+                    "ai_summary_api_key", "clear_ai_summary_api_key",
+                    "ai_summary_local_endpoint", "ai_summary_local_model",
+                    "ai_summary_openrouter_model", "ai_summary_auto_refresh",
+                },
+            }
+            action = payload.get("action") if isinstance(payload, dict) else None
+            if not isinstance(action, str) or action not in allowed or set(payload) - {"action"} - allowed[action]:
+                raise ChatGPTAuthError("invalid_request", "Choose a valid AI connection action.")
+            if action in {"complete", "cancel"}:
+                if not isinstance(payload.get("login_id"), str) or not 1 <= len(payload["login_id"]) <= 128:
+                    raise ChatGPTAuthError("invalid_request", "This sign-in session is invalid. Start again.")
+            if action == "complete" and (not isinstance(payload.get("callback_url"), str) or not 1 <= len(payload["callback_url"]) <= 16384):
+                raise ChatGPTAuthError("invalid_callback", "Paste the full callback URL from this sign-in session.")
+            if action == "start":
+                return web.json_response({"success": True, **await manager.async_start_login(owner_id)})
+            if action == "complete":
+                await manager.async_complete_login(payload["callback_url"], payload["login_id"], owner_id)
+                # Catalog failure does not undo a successfully saved account.
+                models = []
+                try:
+                    models = await manager.async_models()
+                except ChatGPTAuthError as err:
+                    _LOGGER.warning("ChatGPT models unavailable after sign-in: %s", err.code)
+                settings = {"ai_summary_provider": "chatgpt"}
+                if models and configured_openai_model(entry) not in {model["id"] for model in models}:
+                    settings["ai_summary_openai_model"] = models[0]["id"]
+                self._settings(entry, settings)
+                return self._response(entry, manager, models=models)
+            if action == "cancel":
+                await manager.async_cancel_login(payload["login_id"], owner_id)
+            elif action == "logout":
+                result = await manager.async_logout()
+                self._invalidate(entry)
+                return self._response(entry, manager, **({"warning": result["warning"]} if result.get("warning") else {}))
+            elif action == "models":
+                return self._response(entry, manager, models=await manager.async_models())
+            elif action == "settings":
+                if not allowed["settings"].intersection(payload):
+                    raise ChatGPTAuthError("invalid_request", "Choose AI settings to save.")
+                self._settings(entry, {key: value for key, value in payload.items() if key != "action"})
+            return self._response(entry, manager)
+        except (ChatGPTAuthError, AISummaryError) as err:
+            _LOGGER.warning("AI connection action failed: %s", err.code)
+            restart_required = None
+            if manager is not None and isinstance(action, str) and action in {"complete", "cancel"}:
+                restart_required = manager.login_restart_required(payload.get("login_id"), owner_id)
+            return self._error(err, login_restart_required=restart_required)
+
+
 class OptimizationAISummaryView(HomeAssistantView):
     """Explicitly generate a descriptive explanation of the current plan."""
 
@@ -46433,6 +46628,7 @@ class OptimizationAISummaryView(HomeAssistantView):
             configured_local_endpoint,
             configured_local_model,
             configured_openrouter_model,
+            configured_openai_model,
         )
 
         try:
@@ -46481,7 +46677,7 @@ class OptimizationAISummaryView(HomeAssistantView):
                 status=409,
             )
 
-        public_settings = ai_summary_settings(config_entry)
+        public_settings = _optimization_ai_settings(self._hass, config_entry)
         service = _optimization_ai_service(
             self._hass,
             config_entry.entry_id,
@@ -46505,6 +46701,7 @@ class OptimizationAISummaryView(HomeAssistantView):
                 endpoint=configured_local_endpoint(config_entry),
                 local_model=configured_local_model(config_entry),
                 openrouter_model=configured_openrouter_model(config_entry),
+                openai_model=configured_openai_model(config_entry),
             )
         except AISummaryError as err:
             _LOGGER.warning("AI plan explanation failed: %s", err.code)
@@ -46567,6 +46764,16 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             auto_unsub()
         if ai_service := entry_data.get("_optimization_ai_summary_service"):
             await ai_service.async_shutdown()
+        if chatgpt_auth := entry_data.get("_optimization_chatgpt_auth"):
+            try:
+                await chatgpt_auth.async_shutdown()
+            except Exception:
+                from .optimization.chatgpt_auth import CHATGPT_AUTH_RETAINED_KEY
+
+                # Keep the manager and its dirty grant journal for a retry,
+                # while still retiring hardware, timers and coordinators.
+                hass.data.setdefault(CHATGPT_AUTH_RETAINED_KEY, {})[entry.entry_id] = chatgpt_auth
+                _LOGGER.warning("ChatGPT credential shutdown could not be completed")
 
     # Let every in-flight Tesla reserve pulse finish its verified exact restore
     # before a replacement setup receives a new lock/generation namespace.
@@ -46994,3 +47201,39 @@ async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Reload config entry."""
     await async_unload_entry(hass, entry)
     await async_setup_entry(hass, entry)
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Best-effort revoke ChatGPT access and erase the entry's private store."""
+    warning = False
+    try:
+        from homeassistant.helpers.storage import Store
+        from .optimization.chatgpt_auth import CHATGPT_AUTH_RETAINED_KEY, ChatGPTAuthManager, _PrivateCredentialStore
+
+        domain_data = hass.data.get(DOMAIN, {})
+        entry_data = domain_data.get(entry.entry_id, {})
+        manager = hass.data.get(CHATGPT_AUTH_RETAINED_KEY, {}).pop(entry.entry_id, None)
+        manager = manager or entry_data.get("_optimization_chatgpt_auth")
+        if manager is None:
+            store = Store(hass, 1, f"power_sync.chatgpt_auth.{entry.entry_id}", private=True, atomic_writes=True)
+            manager = ChatGPTAuthManager(async_get_clientsession(hass), _PrivateCredentialStore(hass, store))
+        async with asyncio.timeout(10):
+            result = await manager.async_revoke_for_removal()
+        warning = bool(result.get("warning"))
+    except Exception:
+        warning = True
+        _LOGGER.warning("ChatGPT remote disconnection could not be confirmed during removal")
+    finally:
+        if warning:
+            from homeassistant.components import persistent_notification
+
+            persistent_notification.async_create(
+                hass, "Disconnect PowerSync in ChatGPT Settings. Remote disconnection could not be confirmed.",
+                title="PowerSync ChatGPT disconnection", notification_id=f"power_sync_chatgpt_removal_{entry.entry_id}",
+            )
+        try:
+            from homeassistant.helpers.storage import Store
+
+            await Store(hass, 1, f"power_sync.chatgpt_auth.{entry.entry_id}", private=True, atomic_writes=True).async_remove()
+        except Exception:
+            _LOGGER.warning("ChatGPT credential storage could not be removed")

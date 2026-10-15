@@ -1,0 +1,63 @@
+{
+  "source": "Published tesla-protocol==1.4.0 wheel; synthetic values only; no gateway commands",
+  "cases": [
+    {
+      "name": "signed_request",
+      "module": "signed_message_pb2",
+      "message": "RoutableMessage",
+      "hex": "32020807520208026a260a0d0a0b7075626c69632d746573743a150d00f15365120e7369676e61747572652d746573749a030a66697865642d74657374",
+      "expected": {
+        "to_destination.domain": 7,
+        "signature_data.rsa_data.expires_at": 1700000000
+      }
+    },
+    {
+      "name": "unknown_key_response",
+      "module": "signed_message_pb2",
+      "message": "RoutableMessage",
+      "hex": "62020803",
+      "expected": {
+        "signed_message_status.message_fault": 3
+      }
+    },
+    {
+      "name": "read_config",
+      "module": "transport_pb2",
+      "message": "MessageEnvelope",
+      "hex": "0802120220011a0a0a0844494e2d746573747a110a0f0801120b636f6e6669672e6a736f6e",
+      "expected": {
+        "filestore.read_file_request.name": "config.json",
+        "recipient.din": "DIN-test"
+      }
+    },
+    {
+      "name": "system_info",
+      "module": "transport_pb2",
+      "message": "MessageEnvelope",
+      "hex": "22391a370a180a09706172742d74657374120b73657269616c2d74657374120a0a0844494e2d746573741a0d0a0732342e34342e301202aabb2801",
+      "expected": {
+        "common.get_system_info_response.din.value": "DIN-test",
+        "common.get_system_info_response.firmare_version.version": "24.44.0"
+      }
+    },
+    {
+      "name": "networking",
+      "module": "transport_pb2",
+      "message": "MessageEnvelope",
+      "hex": "2218ba01151213100122051d3201a8c02a08220608711202084e",
+      "expected": {
+        "common.get_networking_status_response.wifi.enabled": true,
+        "common.get_networking_status_response.wifi.connectivity_status.rssi.value": -57
+      }
+    },
+    {
+      "name": "backup_event",
+      "module": "transport_pb2",
+      "message": "MessageEnvelope",
+      "hex": "2a1292030f0a0d0a0b0a060880e2cfaa0610d804",
+      "expected": {
+        "teg.get_backup_events_response.manual_backup_event.scheduling_info.start_time.seconds": 1700000000
+      }
+    }
+  ]
+}

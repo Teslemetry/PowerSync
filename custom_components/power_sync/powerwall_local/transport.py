@@ -30,7 +30,7 @@ import aiohttp
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
-from tesla_protocol.energy_device import (
+from .energy_device import (
     authorization_types_pb2,
     device_pb2,
     filestore_api_pb2,
@@ -60,6 +60,14 @@ def _enum_suffix(enum_type: Any, value: int, prefix: str) -> str:
     except ValueError:
         return str(value)
     return name.removeprefix(prefix)
+
+
+def _protobuf_text(value: Any) -> str | None:
+    """Read text from either a scalar or a legacy protobuf wrapper."""
+    if isinstance(value, str):
+        return value or None
+    wrapped = getattr(value, "value", None)
+    return wrapped if isinstance(wrapped, str) and wrapped else None
 
 
 def _ipv4(value: int) -> str | None:
@@ -683,7 +691,7 @@ class TEDAPIv1rTransport:
                     "id": event.id,
                     "name": event.name,
                     # `sheduling_info` (sic) — the field is misspelled upstream
-                    # in tesla_protocol.energy_device.teg_api_pb2.BackupEvent.
+                    # in the bundled energy_device.teg_api_pb2.BackupEvent.
                     "start_time": event.sheduling_info.start_time.seconds,
                     "duration_seconds": event.sheduling_info.duration_seconds,
                     "priority": event.sheduling_info.priority,
@@ -732,14 +740,20 @@ class TEDAPIv1rTransport:
         )
         if response is None:
             return None
+        firmware = getattr(response, "firmware_version", None)
+        if firmware is None:
+            # tesla-protocol <2.0.0 exposes the same wire field as the
+            # historical ``firmare_version`` spelling.
+            firmware = getattr(response, "firmare_version", None)
+        githash = getattr(firmware, "githash", None)
         return {
             "part_number": response.device_id.part_number or None,
             "serial_number": response.device_id.serial_number or None,
-            "din": response.din or None,
-            "firmware_version": response.firmware_version.version or None,
+            "din": _protobuf_text(response.din),
+            "firmware_version": getattr(firmware, "version", None) or None,
             "firmware_githash": (
-                response.firmware_version.githash.hex()
-                if response.firmware_version.githash
+                githash.hex()
+                if githash
                 else None
             ),
             "device_type": _enum_suffix(

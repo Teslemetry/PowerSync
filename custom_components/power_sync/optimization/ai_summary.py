@@ -8,13 +8,15 @@ validates the structured response, and keeps only an in-memory cache.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
+import codecs
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import ipaddress
 import json
 import math
+import re
 import socket
 from typing import Any, Protocol
 from urllib.parse import urlsplit, urlunsplit
@@ -27,15 +29,18 @@ from ..const import (
     CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_ENDPOINT,
     CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_MODEL,
     CONF_OPTIMIZATION_AI_SUMMARY_OPENROUTER_MODEL,
+    CONF_OPTIMIZATION_AI_SUMMARY_OPENAI_MODEL,
     CONF_OPTIMIZATION_AI_SUMMARY_PROVIDER,
     DEFAULT_OPTIMIZATION_AI_SUMMARY_PROVIDER,
 )
 
-AI_SUMMARY_PROVIDERS = ("gemini", "grok", "openrouter", "local_openai_compatible")
+AI_SUMMARY_PROVIDERS = ("gemini", "grok", "openrouter", "openai", "chatgpt", "local_openai_compatible")
 AI_SUMMARY_MODELS = {
     "gemini": "gemini-3.5-flash-lite",
     "grok": "grok-4.5",
     "openrouter": "",
+    "openai": "gpt-6.1-sol",
+    "chatgpt": "gpt-6.1-sol",
     "local_openai_compatible": "",
 }
 EXPLAINER_CONTRACT_VERSION = "powersync.optimizer-explainer.v2"
@@ -48,6 +53,10 @@ LOCAL_OPENAI_MAX_TOKENS = 2048
 MAX_LOCAL_ENDPOINT_LENGTH = 512
 MAX_LOCAL_MODEL_LENGTH = 128
 MAX_OPENROUTER_MODEL_LENGTH = 128
+MAX_OPENAI_MODEL_LENGTH = 128
+MAX_RESPONSES_STREAM_BYTES = 1024 * 1024
+MAX_RESPONSES_OUTPUT_CHARS = 64 * 1024
+MAX_RESPONSES_EVENTS = 4096
 AUTO_REFRESH_DEBOUNCE_SECONDS = 15
 AUTO_REFRESH_COOLDOWN_SECONDS = 300
 
@@ -245,12 +254,13 @@ def provider_model(
     provider: str,
     local_model: str = "",
     openrouter_model: str = "",
+    openai_model: str = "",
 ) -> str:
     """Return the backend-owned model for a supported provider."""
     if provider not in AI_SUMMARY_MODELS:
         raise AISummaryError(
             "invalid_ai_provider",
-            "Choose Gemini, Grok, OpenRouter, or a local OpenAI-compatible provider for AI plan explanations.",
+            "Choose Gemini, Grok, OpenRouter, OpenAI, ChatGPT, or a local OpenAI-compatible provider for AI plan explanations.",
             http_status=400,
         )
     if provider == "local_openai_compatible":
@@ -267,10 +277,15 @@ def provider_model(
                 http_status=400,
             )
         return model
+    if provider in {"openai", "chatgpt"}:
+        model = openai_model or AI_SUMMARY_MODELS[provider]
+        if not isinstance(model, str) or not model.strip() or len(model) > MAX_OPENAI_MODEL_LENGTH or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]*", model.strip()):
+            raise AISummaryError("invalid_openai_model", "Enter a valid OpenAI model identifier.", http_status=400)
+        return model.strip()
     return AI_SUMMARY_MODELS[provider]
 
 
-def ai_summary_settings(entry: Any | None) -> dict[str, Any]:
+def ai_summary_settings(entry: Any | None, *, chatgpt_status: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Return public, write-only-safe settings metadata for a config entry."""
     data = getattr(entry, "data", {}) or {}
     options = getattr(entry, "options", {}) or {}
@@ -292,22 +307,36 @@ def ai_summary_settings(entry: Any | None) -> dict[str, Any]:
     endpoint = options.get(CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_ENDPOINT, data.get(CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_ENDPOINT, ""))
     local_model = options.get(CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_MODEL, data.get(CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_MODEL, ""))
     openrouter_model = options.get(CONF_OPTIMIZATION_AI_SUMMARY_OPENROUTER_MODEL, data.get(CONF_OPTIMIZATION_AI_SUMMARY_OPENROUTER_MODEL, ""))
-    local_configured = provider != "local_openai_compatible" or bool(str(endpoint).strip() and str(local_model).strip())
+    openai_model = configured_openai_model(entry)
+    public_endpoint = ""
+    if endpoint:
+        try:
+            public_endpoint = normalize_local_endpoint(endpoint)
+        except AISummaryError:
+            pass
+    local_configured = provider != "local_openai_compatible" or bool(public_endpoint and str(local_model or "").strip())
     openrouter_configured = provider != "openrouter" or bool(str(api_key or "").strip() and str(openrouter_model).strip())
     return {
         "ai_summary_provider": provider,
+        "ai_summary_api_key_configured": bool(str(api_key or "").strip()),
         "ai_summary_key_configured": (
-            local_configured
+            bool(chatgpt_status and chatgpt_status.get("connected"))
+            if provider == "chatgpt"
+            else local_configured
             if provider == "local_openai_compatible"
             else openrouter_configured
             if provider == "openrouter"
             else bool(str(api_key or "").strip())
         ),
         "ai_summary_model": (
-            provider_model(provider, str(local_model or ""), str(openrouter_model or ""))
+            provider_model(provider, str(local_model or ""), str(openrouter_model or ""), openai_model)
             if local_configured and openrouter_configured
             else ""
         ),
+        "ai_summary_local_endpoint": public_endpoint,
+        "ai_summary_local_model": str(local_model or "").strip(),
+        "ai_summary_openrouter_model": str(openrouter_model or "").strip(),
+        "ai_summary_openai_model": openai_model,
         "ai_summary_auto_refresh": bool(options.get(CONF_OPTIMIZATION_AI_SUMMARY_AUTO_REFRESH, data.get(CONF_OPTIMIZATION_AI_SUMMARY_AUTO_REFRESH, False))),
     }
 
@@ -353,6 +382,13 @@ def configured_openrouter_model(entry: Any | None) -> str:
     return str(options.get(CONF_OPTIMIZATION_AI_SUMMARY_OPENROUTER_MODEL, data.get(CONF_OPTIMIZATION_AI_SUMMARY_OPENROUTER_MODEL, "")) or "").strip()
 
 
+def configured_openai_model(entry: Any | None) -> str:
+    """Read the shared model selection for the two OpenAI auth modes."""
+    data = getattr(entry, "data", {}) or {}
+    options = getattr(entry, "options", {}) or {}
+    return str(options.get(CONF_OPTIMIZATION_AI_SUMMARY_OPENAI_MODEL, data.get(CONF_OPTIMIZATION_AI_SUMMARY_OPENAI_MODEL, "gpt-6.1-sol")) or "gpt-6.1-sol").strip()
+
+
 def apply_ai_summary_settings(
     current_options: Mapping[str, Any],
     payload: Mapping[str, Any],
@@ -372,7 +408,7 @@ def apply_ai_summary_settings(
     if not isinstance(requested_provider, str):
         raise AISummaryError(
             "invalid_ai_provider",
-            "Choose Gemini, Grok, OpenRouter, or a local OpenAI-compatible provider for AI plan explanations.",
+            "Choose Gemini, Grok, OpenRouter, OpenAI, ChatGPT, or a local OpenAI-compatible provider for AI plan explanations.",
             http_status=400,
         )
     requested_provider = requested_provider.strip().lower()
@@ -403,12 +439,26 @@ def apply_ai_summary_settings(
     raw_endpoint = payload.get("ai_summary_local_endpoint")
     raw_model = payload.get("ai_summary_local_model")
     raw_openrouter_model = payload.get("ai_summary_openrouter_model")
+    if raw_endpoint is not None and not isinstance(raw_endpoint, str):
+        raise AISummaryError("invalid_local_ai_endpoint", "The local AI endpoint must be text.", http_status=400)
+    if raw_model is not None and not isinstance(raw_model, str):
+        raise AISummaryError("invalid_local_ai_model", "The local AI model identifier must be text.", http_status=400)
+    if isinstance(raw_model, str) and raw_model.strip():
+        provider_model("local_openai_compatible", local_model=raw_model)
+    raw_openai_model = payload.get("ai_summary_openai_model")
+    if raw_openai_model is not None:
+        if not isinstance(raw_openai_model, str) or not raw_openai_model.strip():
+            raise AISummaryError("invalid_openai_model", "Enter a valid OpenAI model identifier.", http_status=400)
+        provider_model("openai", openai_model=raw_openai_model)
+    openai_model = raw_openai_model.strip() if isinstance(raw_openai_model, str) else options.get(CONF_OPTIMIZATION_AI_SUMMARY_OPENAI_MODEL, "gpt-6.1-sol")
     if raw_openrouter_model is not None and not isinstance(raw_openrouter_model, str):
         raise AISummaryError(
             "invalid_openrouter_model",
             "The OpenRouter model identifier must be text.",
             http_status=400,
         )
+    if isinstance(raw_openrouter_model, str) and raw_openrouter_model.strip():
+        provider_model("openrouter", openrouter_model=raw_openrouter_model)
     auto_refresh = payload.get("ai_summary_auto_refresh", options.get(CONF_OPTIMIZATION_AI_SUMMARY_AUTO_REFRESH, False))
     if not isinstance(auto_refresh, bool):
         raise AISummaryError("invalid_ai_settings", "Automatic AI explanation refresh must be true or false.", http_status=400)
@@ -420,6 +470,8 @@ def apply_ai_summary_settings(
         endpoint = normalize_local_endpoint(endpoint)
     elif requested_provider == "openrouter":
         provider_model(requested_provider, openrouter_model=openrouter_model)
+    if requested_provider in {"openai", "chatgpt"}:
+        provider_model(requested_provider, openai_model=openai_model)
     changes: list[str] = []
     if requested_provider != current_provider:
         options[CONF_OPTIMIZATION_AI_SUMMARY_PROVIDER] = requested_provider
@@ -428,16 +480,20 @@ def apply_ai_summary_settings(
         options[CONF_OPTIMIZATION_AI_SUMMARY_PROVIDER] = requested_provider
 
     if clear_key:
-        if options.pop(CONF_OPTIMIZATION_AI_SUMMARY_API_KEY, None) is not None:
+        if options.get(CONF_OPTIMIZATION_AI_SUMMARY_API_KEY):
             changes.append("cleared AI summary API key")
+        # An explicit empty option suppresses an older key in entry.data.
+        options[CONF_OPTIMIZATION_AI_SUMMARY_API_KEY] = ""
     elif replacement_key:
         options[CONF_OPTIMIZATION_AI_SUMMARY_API_KEY] = replacement_key
         changes.append("updated AI summary API key")
     elif requested_provider != current_provider:
         # Provider credentials are never portable. Switching without entering
-        # a replacement leaves the newly selected provider unconfigured.
-        if options.pop(CONF_OPTIMIZATION_AI_SUMMARY_API_KEY, None) is not None:
+        # a replacement leaves the newly selected provider unconfigured. Keep
+        # an empty sentinel so data fallback cannot restore its predecessor.
+        if options.get(CONF_OPTIMIZATION_AI_SUMMARY_API_KEY):
             changes.append("cleared AI summary API key")
+        options[CONF_OPTIMIZATION_AI_SUMMARY_API_KEY] = ""
 
     if requested_provider == "local_openai_compatible":
         if options.get(CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_ENDPOINT) != endpoint:
@@ -452,6 +508,9 @@ def apply_ai_summary_settings(
     if requested_provider == "openrouter" and options.get(CONF_OPTIMIZATION_AI_SUMMARY_OPENROUTER_MODEL) != openrouter_model:
         options[CONF_OPTIMIZATION_AI_SUMMARY_OPENROUTER_MODEL] = openrouter_model
         changes.append("updated OpenRouter AI model")
+    if (requested_provider in {"openai", "chatgpt"} or raw_openai_model is not None) and options.get(CONF_OPTIMIZATION_AI_SUMMARY_OPENAI_MODEL) != openai_model:
+        options[CONF_OPTIMIZATION_AI_SUMMARY_OPENAI_MODEL] = openai_model
+        changes.append("updated OpenAI model")
     if options.get(CONF_OPTIMIZATION_AI_SUMMARY_AUTO_REFRESH, False) != auto_refresh:
         options[CONF_OPTIMIZATION_AI_SUMMARY_AUTO_REFRESH] = auto_refresh
         changes.append("enabled automatic AI explanation refresh" if auto_refresh else "disabled automatic AI explanation refresh")
@@ -1501,6 +1560,185 @@ def _openai_message_text(body: Mapping[str, Any]) -> Mapping[str, Any]:
     return _parse_json_text(text)
 
 
+def _responses_error(status: int, *, subscription: bool, code: str = "") -> AISummaryError:
+    """Expose stable diagnostics without echoing provider bodies or credentials."""
+    if subscription:
+        if status == 429 or code in {"usage_limit_reached", "rate_limit_exceeded", "insufficient_quota"}:
+            return AISummaryError("chatgpt_usage_limit", "The ChatGPT sharing limit has been reached. Try again later.", http_status=429)
+        if status == 401:
+            return AISummaryError("chatgpt_reconnect_required", "Reconnect ChatGPT before generating an explanation.", http_status=400)
+        if status == 403 or code in {"chatgpt_not_enabled", "sharing_not_enabled", "subscription_required"}:
+            return AISummaryError("chatgpt_not_enabled", "ChatGPT sharing is not enabled for this account.", http_status=400)
+    return _provider_error(status)
+
+
+def _response_error_code(value: Any) -> str:
+    if not isinstance(value, Mapping):
+        return ""
+    detail = value.get("error", value)
+    if isinstance(detail, str):
+        return detail
+    return str(detail.get("code", "")) if isinstance(detail, Mapping) else ""
+
+
+async def _read_responses_stream(response: Any, *, subscription: bool) -> Mapping[str, Any]:
+    """Decode bounded UTF-8 SSE, requiring an explicit completed response."""
+    decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    buffer = ""
+    data_lines: list[str] = []
+    output: list[str] = []
+    byte_count = output_chars = event_count = 0
+
+    def event_result() -> Mapping[str, Any] | None:
+        nonlocal output_chars, event_count
+        if not data_lines:
+            return None
+        event_count += 1
+        if event_count > MAX_RESPONSES_EVENTS:
+            raise AISummaryError("invalid_provider_response", "The AI provider returned too many response events.")
+        data = "\n".join(data_lines)
+        data_lines.clear()
+        if data == "[DONE]":
+            return None
+        try:
+            event = json.loads(data)
+        except (ValueError, TypeError) as err:
+            raise AISummaryError("invalid_provider_response", "The AI provider returned an invalid response stream.") from err
+        if not isinstance(event, Mapping):
+            raise AISummaryError("invalid_provider_response", "The AI provider returned an invalid response event.")
+        kind = event.get("type")
+        if kind == "response.output_text.delta":
+            delta = event.get("delta")
+            if not isinstance(delta, str):
+                raise AISummaryError("invalid_provider_response", "The AI provider returned invalid explanation text.")
+            output_chars += len(delta)
+            if output_chars > MAX_RESPONSES_OUTPUT_CHARS:
+                raise AISummaryError("invalid_provider_response", "The AI provider returned too much explanation text.")
+            output.append(delta)
+        elif kind in {"response.failed", "error"}:
+            detail = event.get("response", event)
+            code = _response_error_code(detail)
+            if subscription and code in {"usage_limit_reached", "rate_limit_exceeded", "insufficient_quota", "chatgpt_not_enabled", "sharing_not_enabled", "subscription_required"}:
+                raise _responses_error(502, subscription=True, code=code)
+            raise AISummaryError("provider_unavailable", "The AI provider could not complete the explanation.")
+        elif kind == "response.incomplete":
+            raise AISummaryError("provider_response_truncated", "The AI provider stopped before completing the explanation.")
+        elif kind == "response.completed":
+            final = event.get("response")
+            if isinstance(final, Mapping) and final.get("status") not in {None, "completed"}:
+                raise AISummaryError("invalid_provider_response", "The AI provider returned an incomplete explanation.")
+            # Deltas are the authoritative streamed text; support a final-only
+            # completed event without accepting a partial terminal response.
+            if not output and isinstance(final, Mapping):
+                for item in final.get("output", []) if isinstance(final.get("output"), list) else []:
+                    if isinstance(item, Mapping) and item.get("type") == "message":
+                        for content in item.get("content", []) if isinstance(item.get("content"), list) else []:
+                            if isinstance(content, Mapping) and content.get("type") == "output_text" and isinstance(content.get("text"), str):
+                                output.append(content["text"])
+            text = "".join(output)
+            if len(text) > MAX_RESPONSES_OUTPUT_CHARS:
+                raise AISummaryError("invalid_provider_response", "The AI provider returned too much explanation text.")
+            return _parse_json_text(text)
+        return None
+
+    def consume_lines(*, final: bool = False) -> Mapping[str, Any] | None:
+        nonlocal buffer
+        while buffer:
+            match = re.search(r"[\r\n]", buffer)
+            if match is None:
+                break
+            end = match.start()
+            if buffer[end] == "\r" and end == len(buffer) - 1 and not final:
+                break
+            width = 2 if buffer[end:end + 2] == "\r\n" else 1
+            line, buffer = buffer[:end], buffer[end + width:]
+            if not line:
+                result = event_result()
+                if result is not None:
+                    return result
+            elif line.startswith("data:"):
+                data_lines.append(line[5:].removeprefix(" "))
+        return None
+
+    try:
+        async for chunk in response.content.iter_chunked(8192):
+            byte_count += len(chunk)
+            if byte_count > MAX_RESPONSES_STREAM_BYTES:
+                raise AISummaryError("invalid_provider_response", "The AI provider response stream was too large.")
+            buffer += decoder.decode(chunk)
+            result = consume_lines()
+            if result is not None:
+                return result
+        buffer += decoder.decode(b"", final=True)
+        result = consume_lines(final=True)
+        if result is not None:
+            return result
+    except UnicodeDecodeError as err:
+        raise AISummaryError("invalid_provider_response", "The AI provider returned an invalid response stream.") from err
+    raise AISummaryError("provider_stream_interrupted", "The AI connection ended before completion. The request may still have counted.")
+
+
+async def _post_responses(session: Any, *, token: str, payload: Mapping[str, Any], subscription: bool) -> Mapping[str, Any]:
+    try:
+        async with session.post(
+            "https://api.openai.com/v1/responses",
+            headers={"Content-Type": "application/json", "Accept": "text/event-stream", "Authorization": f"Bearer {token}"},
+            json=dict(payload), timeout=aiohttp.ClientTimeout(total=90), allow_redirects=False,
+        ) as response:
+            if not 200 <= response.status < 300:
+                # Only status codes govern retries. A 401 rejects authentication
+                # before inference; a failed stream must never replay a request.
+                raise _responses_error(response.status, subscription=subscription)
+            content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            if content_type and content_type != "text/event-stream":
+                raise AISummaryError("invalid_provider_response", "The AI provider did not return the expected response stream.")
+            return await _read_responses_stream(response, subscription=subscription)
+    except AISummaryError:
+        raise
+    except asyncio.TimeoutError as err:
+        raise AISummaryError("provider_timeout", "The AI provider timed out. The request may still have counted.", http_status=504) from err
+    except aiohttp.ClientError as err:
+        raise AISummaryError("provider_stream_interrupted", "The AI connection was interrupted. The request may still have counted.") from err
+
+
+class OpenAIResponsesAISummaryProvider:
+    """API-key Responses with strict structured output and no automatic replay."""
+
+    async def generate(self, *, session: Any, api_key: str, model: str, context: Mapping[str, Any]) -> Mapping[str, Any]:
+        payload = {
+            "model": model, "instructions": SYSTEM_PROMPT,
+            "input": [{"role": "user", "content": f"PLAN_CONTEXT_JSON:\n{canonical_context_json(context)}"}],
+            "stream": True, "store": False,
+            "text": {"format": {"type": "json_schema", "name": "powersync_ai_plan_summary", "schema": MODEL_OUTPUT_SCHEMA, "strict": True}},
+        }
+        return await _post_responses(session, token=api_key, payload=payload, subscription=False)
+
+
+class ChatGPTResponsesAISummaryProvider:
+    """SIWC Responses, resolving its OAuth token only when executing a request."""
+
+    async def generate(self, *, session: Any, model: str, context: Mapping[str, Any], access_token: Callable[..., Awaitable[str]]) -> Mapping[str, Any]:
+        # SIWC currently documents text input and instructions, rather than the
+        # Platform structured-output option. Enforce the same schema locally.
+        payload = {
+            "model": model, "instructions": SYSTEM_PROMPT,
+            "input": [{"role": "user", "content": f"OUTPUT_SCHEMA_JSON:\n{json.dumps(MODEL_OUTPUT_SCHEMA)}\n\nPLAN_CONTEXT_JSON:\n{canonical_context_json(context)}"}],
+            "stream": True, "store": False,
+        }
+        token = await access_token()
+        try:
+            for attempt in range(2):
+                try:
+                    return await _post_responses(session, token=token, payload=payload, subscription=True)
+                except AISummaryError as err:
+                    if err.code != "chatgpt_reconnect_required" or attempt:
+                        raise
+                    token = await access_token(force_refresh=True, rejected_token=token)
+        finally:
+            token = ""
+        raise AssertionError("unreachable")
+
+
 class LocalOpenAICompatibleAISummaryProvider:
     """Conservative OpenAI-compatible adapter for an explicitly local server."""
 
@@ -1560,6 +1798,8 @@ PROVIDER_ADAPTERS: dict[str, AISummaryProvider] = {
     "gemini": GeminiAISummaryProvider(),
     "grok": GrokAISummaryProvider(),
     "openrouter": OpenRouterAISummaryProvider(),
+    "openai": OpenAIResponsesAISummaryProvider(),
+    "chatgpt": ChatGPTResponsesAISummaryProvider(),
     "local_openai_compatible": LocalOpenAICompatibleAISummaryProvider(),
 }
 
@@ -1573,19 +1813,49 @@ class _CacheRecord:
 class AISummaryService:
     """Per-config-entry generation, cache, and in-flight coordination."""
 
-    def __init__(self, session: Any, snapshot_getter: Callable[[], Mapping[str, Any]]) -> None:
+    def __init__(self, session: Any, snapshot_getter: Callable[[], Mapping[str, Any]], *, chatgpt_auth: Any | None = None) -> None:
         self._session = session
         self._snapshot_getter = snapshot_getter
+        self._chatgpt_auth = chatgpt_auth
         self._cache: _CacheRecord | None = None
-        self._in_flight: dict[str, asyncio.Task[dict[str, Any]]] = {}
+        self._in_flight: dict[tuple[int, str], asyncio.Task[dict[str, Any]]] = {}
         self._last_error: dict[str, str] | None = None
         self._last_explained_context: dict[str, Any] | None = None
         self._request_lock = asyncio.Lock()
         self._auto_task: asyncio.Task[None] | None = None
-        self._auto_pending: tuple[str, str, str, str, str, str] | None = None
+        self._auto_pending: tuple[str, str, str, str, str, str, str] | None = None
         self._auto_last_material_fingerprint: str | None = None
         self._auto_last_request_at = 0.0
         self._generation = 0
+
+    def _chatgpt_connected(self) -> bool:
+        return bool(self._chatgpt_auth and self._chatgpt_auth.status().get("connected"))
+
+    async def _chatgpt_access_token(self, *, force_refresh: bool = False, rejected_token: str | None = None) -> str:
+        if self._chatgpt_auth is None:
+            raise AISummaryError("chatgpt_reconnect_required", "Connect ChatGPT before generating an explanation.", http_status=400)
+        try:
+            return await self._chatgpt_auth.async_access_token(force_refresh=force_refresh, rejected_token=rejected_token)
+        except Exception as err:
+            # Import lazily: adapters and existing lightweight tests are usable
+            # without Home Assistant's auth storage dependencies installed.
+            from .chatgpt_auth import ChatGPTAuthError, _TERMINAL_ERRORS
+            code = "provider_unavailable"
+            if isinstance(err, ChatGPTAuthError):
+                if err.code in {"chatgpt_usage_limit", "chatgpt_reconnect_required", "chatgpt_not_enabled", "storage_unavailable"}:
+                    code = err.code
+                elif err.code in _TERMINAL_ERRORS | {"not_connected", "invalid_id_token", "account_mismatch",
+                                                    "missing_scope", "invalid_token_response"}:
+                    code = "chatgpt_reconnect_required"
+            messages = {
+                "chatgpt_usage_limit": "The ChatGPT sharing limit has been reached. Try again later.",
+                "chatgpt_reconnect_required": "Reconnect ChatGPT before generating an explanation.",
+                "chatgpt_not_enabled": "ChatGPT sharing is not enabled for this account.",
+                "provider_unavailable": "ChatGPT is temporarily unavailable. Try again shortly.",
+                "storage_unavailable": "Home Assistant could not access or save the ChatGPT connection securely. Check the integration logs and try again.",
+            }
+            status = 503 if code in {"provider_unavailable", "storage_unavailable"} else 429 if code == "chatgpt_usage_limit" else 400
+            raise AISummaryError(code, messages[code], http_status=status) from None
 
     def invalidate(self) -> None:
         """Invalidate cached output after provider credential changes."""
@@ -1596,6 +1866,10 @@ class AISummaryService:
         self._auto_pending = None
         if self._auto_task is not None and not self._auto_task.done():
             self._auto_task.cancel()
+
+    def _require_generation(self, generation: int) -> None:
+        if generation != self._generation:
+            raise AISummaryError("settings_changed", "AI connection settings changed while the explanation was being generated. Try again.", http_status=409)
 
     async def async_shutdown(self) -> None:
         """Cancel detached auto work before its entry can be replaced."""
@@ -1614,6 +1888,7 @@ class AISummaryService:
         endpoint: str = "",
         local_model: str = "",
         openrouter_model: str = "",
+        openai_model: str = "",
     ) -> None:
         """Coalesce detached refreshes after a committed optimizer plan.
 
@@ -1621,8 +1896,10 @@ class AISummaryService:
         optimizer or hardware path.  The newest material plan wins while a
         debounce and cooldown bound local compute use.
         """
+        if provider == "chatgpt" and not self._chatgpt_connected():
+            return
         try:
-            model = provider_model(provider, local_model, openrouter_model)
+            model = provider_model(provider, local_model, openrouter_model, openai_model)
             context = build_compact_context(self._snapshot_getter())
         except AISummaryError:
             return
@@ -1630,7 +1907,7 @@ class AISummaryService:
         if material == self._auto_last_material_fingerprint:
             return
         self._auto_last_material_fingerprint = material
-        self._auto_pending = (material, provider, api_key, endpoint, local_model, openrouter_model)
+        self._auto_pending = (material, provider, "" if provider == "chatgpt" else api_key, endpoint, local_model, openrouter_model, openai_model)
         if self._auto_task is None or self._auto_task.done():
             generation = self._generation
             self._auto_task = asyncio.create_task(self._run_auto_refresh(generation))
@@ -1638,7 +1915,7 @@ class AISummaryService:
     async def _run_auto_refresh(self, generation: int) -> None:
         try:
             while self._auto_pending is not None and generation == self._generation:
-                _material, provider, api_key, endpoint, local_model, openrouter_model = self._auto_pending
+                _material, provider, api_key, endpoint, local_model, openrouter_model, openai_model = self._auto_pending
                 self._auto_pending = None
                 await asyncio.sleep(AUTO_REFRESH_DEBOUNCE_SECONDS)
                 remaining = AUTO_REFRESH_COOLDOWN_SECONDS - (asyncio.get_running_loop().time() - self._auto_last_request_at)
@@ -1649,7 +1926,7 @@ class AISummaryService:
                     continue
                 self._auto_last_request_at = asyncio.get_running_loop().time()
                 try:
-                    await self.generate(provider=provider, api_key=api_key, refresh=False, endpoint=endpoint, local_model=local_model, openrouter_model=openrouter_model)
+                    await self.generate(provider=provider, api_key=api_key, refresh=False, endpoint=endpoint, local_model=local_model, openrouter_model=openrouter_model, openai_model=openai_model)
                 except (AISummaryError, asyncio.CancelledError):
                     if generation != self._generation:
                         return
@@ -1665,9 +1942,10 @@ class AISummaryService:
         endpoint: str = "",
         local_model: str = "",
         openrouter_model: str = "",
+        openai_model: str = "",
     ) -> dict[str, Any]:
         """Return status/cache metadata without contacting a provider."""
-        if provider != "local_openai_compatible" and not api_key:
+        if (provider == "chatgpt" and not self._chatgpt_connected()) or (provider not in {"local_openai_compatible", "chatgpt"} and not api_key):
             return {
                 "configured": False,
                 "state": "not_configured",
@@ -1675,7 +1953,7 @@ class AISummaryService:
                 "last_error": None,
             }
         try:
-            model = provider_model(provider, local_model, openrouter_model)
+            model = provider_model(provider, local_model, openrouter_model, openai_model)
             context = build_compact_context(snapshot)
         except AISummaryError as err:
             state = "plan_stale" if err.code == "plan_stale" else "optimizer_unavailable"
@@ -1716,15 +1994,21 @@ class AISummaryService:
         endpoint: str = "",
         local_model: str = "",
         openrouter_model: str = "",
+        openai_model: str = "",
     ) -> dict[str, Any]:
         """Generate or return a cached explanation after an explicit request."""
-        if provider != "local_openai_compatible" and not api_key:
+        generation = self._generation
+        if provider == "chatgpt":
+            if not self._chatgpt_connected():
+                raise AISummaryError("chatgpt_reconnect_required", "Connect ChatGPT before generating an explanation.", http_status=400)
+            api_key = ""
+        if provider not in {"local_openai_compatible", "chatgpt"} and not api_key:
             raise AISummaryError(
                 "ai_not_configured",
                 "Add a provider key before generating an explanation.",
                 http_status=400,
             )
-        model = provider_model(provider, local_model, openrouter_model)
+        model = provider_model(provider, local_model, openrouter_model, openai_model)
         if provider == "local_openai_compatible":
             endpoint = normalize_local_endpoint(endpoint)
         snapshot = self._snapshot_getter()
@@ -1740,7 +2024,8 @@ class AISummaryService:
                 "last_error": None,
             }
 
-        task = self._in_flight.get(fingerprint)
+        in_flight_key = (generation, fingerprint)
+        task = self._in_flight.get(in_flight_key)
         if task is None:
             provider_context = context_with_feedback(
                 context,
@@ -1756,18 +2041,21 @@ class AISummaryService:
                     fingerprint=fingerprint,
                     guard_fingerprint=guard_fingerprint,
                     endpoint=endpoint,
+                    generation=generation,
                 )
             )
-            self._in_flight[fingerprint] = task
+            self._in_flight[in_flight_key] = task
         try:
             summary = await task
         except AISummaryError as err:
+            self._require_generation(generation)
             self._last_error = {"code": err.code, "message": err.message}
             raise
         finally:
-            if self._in_flight.get(fingerprint) is task and task.done():
-                self._in_flight.pop(fingerprint, None)
+            if self._in_flight.get(in_flight_key) is task and task.done():
+                self._in_flight.pop(in_flight_key, None)
 
+        self._require_generation(generation)
         self._last_error = None
         return {
             "state": "ready",
@@ -1787,14 +2075,19 @@ class AISummaryService:
         base_context: Mapping[str, Any],
         fingerprint: str,
         guard_fingerprint: str,
+        generation: int,
         endpoint: str = "",
     ) -> dict[str, Any]:
         adapter = PROVIDER_ADAPTERS[provider]
         async with self._request_lock:
-            if provider == "local_openai_compatible":
+            self._require_generation(generation)
+            if provider == "chatgpt":
+                raw = await adapter.generate(session=self._session, model=model, context=context, access_token=self._chatgpt_access_token)
+            elif provider == "local_openai_compatible":
                 raw = await adapter.generate(session=self._session, api_key=api_key, model=model, context=context, endpoint=endpoint)
             else:
                 raw = await adapter.generate(session=self._session, api_key=api_key, model=model, context=context)
+        self._require_generation(generation)
         validated = validate_model_output(raw, list(context["action_windows"]))
 
         current_context = build_compact_context(self._snapshot_getter())
