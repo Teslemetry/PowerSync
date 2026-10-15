@@ -9,6 +9,8 @@ soft delivery constraint, and the greedy fallback's known-load treatment.
 from __future__ import annotations
 
 import importlib.util
+import ast
+import math
 import sys
 from pathlib import Path
 
@@ -25,6 +27,21 @@ sys.modules["ev_load_plan"] = ev_load_plan
 SPEC.loader.exec_module(ev_load_plan)
 
 EVChargePlan = ev_load_plan.EVChargePlan
+
+
+def _aligned_schedule_series():
+    coordinator_path = ROOT / "optimization" / "coordinator.py"
+    tree = ast.parse(coordinator_path.read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "OptimizationCoordinator":
+            for child in node.body:
+                if isinstance(child, ast.FunctionDef) and child.name == "_aligned_schedule_series":
+                    module = ast.Module(body=[child], type_ignores=[])
+                    ast.fix_missing_locations(module)
+                    namespace = {"Any": object, "math": math}
+                    exec(compile(module, str(coordinator_path), "exec"), namespace)
+                    return namespace["_aligned_schedule_series"]
+    raise AssertionError("OptimizationCoordinator._aligned_schedule_series not found")
 
 
 def _plan(**overrides):
@@ -70,6 +87,14 @@ def test_plan_with_no_energy_need_disappears():
 
 def test_absent_plan_stays_absent():
     assert ev_load_plan.normalize_ev_charge_plan(None, 8) is None
+
+
+def test_optimizer_chart_series_requires_exact_timestamp_alignment():
+    aligned = _aligned_schedule_series()
+
+    assert aligned([0, 7000, 0], 3) == [0.0, 7000.0, 0.0]
+    assert aligned([0, 7000], 3) is None
+    assert aligned([0, float("nan"), 0], 3) is None
 
 
 def test_implausible_efficiency_falls_back_to_the_default():

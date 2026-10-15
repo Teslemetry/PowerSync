@@ -17322,6 +17322,29 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             for index in range(n_intervals)
         ]
 
+    @staticmethod
+    def _aligned_schedule_series(
+        values: Any,
+        timestamp_count: int,
+    ) -> list[float] | None:
+        """Return a chart series only when it exactly matches the schedule.
+
+        Truncating an older EV plan would quietly shift it against a newer
+        optimizer schedule.  Omit it instead so the browser can fail closed.
+        """
+        if not isinstance(values, (list, tuple)) or len(values) != timestamp_count:
+            return None
+        series: list[float] = []
+        for value in values:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(numeric):
+                return None
+            series.append(numeric)
+        return series
+
     def _canonical_ev_loadpoint_ids(
         self,
         identifiers: list[str],
@@ -20469,10 +20492,6 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     )
                 },
             }
-            plan_snapshot_id = hashlib.sha256(
-                json.dumps(snapshot_payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
-            ).hexdigest()
-            api_response["plan_snapshot_id"] = plan_snapshot_id
             provenance = (
                 getattr(self, "_last_raw_solar_forecast", None),
                 getattr(self, "_last_planned_solar_forecast", None),
@@ -20498,7 +20517,9 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "load_forecast_values_kw": load,
                     }
                     data["forecast_evidence"] = {
-                        "plan_snapshot_id": plan_snapshot_id,
+                        # Updated after every finalized EV schedule series has
+                        # been added to the canonical snapshot below.
+                        "plan_snapshot_id": None,
                         "timestamps": list(api_response["timestamps"]),
                         "solar_forecast_values_kw": list(planned),
                         "load_forecast_values_kw": list(load),
@@ -20510,9 +20531,11 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if display_export:
                 api_response["export_price"] = display_export[:n_sched]
             if self._last_planned_ev_load_forecast_w:
-                api_response["planned_ev_load_w"] = (
-                    self._last_planned_ev_load_forecast_w[:n_sched]
+                planned_ev = self._aligned_schedule_series(
+                    self._last_planned_ev_load_forecast_w, n_sched
                 )
+                if planned_ev is not None:
+                    api_response["planned_ev_load_w"] = planned_ev
             grid_export_limits = getattr(self, "_last_grid_export_limits_w", None)
             if grid_export_limits is not None:
                 api_response["grid_export_limit_w"] = grid_export_limits[:n_sched]
@@ -20546,10 +20569,14 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 api_response["ev_charging_w"] = ev_series
             by_vehicle = getattr(self, "_last_ev_charge_by_vehicle_w", None)
             if by_vehicle:
-                api_response["ev_charging_by_vehicle_w"] = {
-                    vehicle_id: list(series[:n_sched_pts])
+                aligned_by_vehicle = {
+                    vehicle_id: aligned
                     for vehicle_id, series in by_vehicle.items()
+                    if (aligned := self._aligned_schedule_series(series, n_sched_pts))
+                    is not None
                 }
+                if aligned_by_vehicle:
+                    api_response["ev_charging_by_vehicle_w"] = aligned_by_vehicle
             elif self._ev_coordinator and data.get("ev"):
                 # Backward-compatible fallback when no optimizer EV overlay exists.
                 ev_power = [0.0] * n_sched_pts
@@ -20581,6 +20608,27 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 api_response["ev_optimizer_policy_by_vehicle"] = (
                     ev_optimizer_policy
                 )
+
+            # All optional EV lines above now have their final, timestamp-aligned
+            # shape.  Include them in the snapshot so a browser never combines a
+            # series from one plan with a fingerprint from another.
+            snapshot_payload["schedule"].update({
+                key: api_response.get(key)
+                for key in (
+                    "planned_ev_load_w",
+                    "ev_charging_w",
+                    "ev_charging_by_vehicle_w",
+                    "ev_charging_source_by_vehicle_w",
+                )
+            })
+            plan_snapshot_id = hashlib.sha256(
+                json.dumps(snapshot_payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+            ).hexdigest()
+            api_response["plan_snapshot_id"] = plan_snapshot_id
+            if isinstance(data.get("forecast_evidence"), dict):
+                data["forecast_evidence"]["plan_snapshot_id"] = plan_snapshot_id
+            if "ev_charging_by_vehicle_w" in api_response:
+                api_response["ev_charging_plan_snapshot_id"] = plan_snapshot_id
 
             projection_payload = getattr(
                 self, "_last_price_level_projection", None

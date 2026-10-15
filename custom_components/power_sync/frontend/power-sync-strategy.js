@@ -2567,6 +2567,12 @@ class PowerSyncOptimizationPlan extends HTMLElement {
     const consume = detailed ? schedule.battery_consume_w : [];
     const exportPower = detailed ? schedule.battery_export_w : [];
     const ev = Array.isArray(schedule.ev_charging_w) ? schedule.ev_charging_w : [];
+    const evByVehicle = (
+      schedule.ev_charging_plan_snapshot_id === schedule.plan_snapshot_id
+      && schedule.plan_snapshot_id
+      && schedule.ev_charging_by_vehicle_w
+      && typeof schedule.ev_charging_by_vehicle_w === 'object'
+    ) ? schedule.ev_charging_by_vehicle_w : {};
     const projection = schedule.ev_charging_projection?.schema_version === 1
       ? schedule.ev_charging_projection
       : null;
@@ -2603,6 +2609,20 @@ class PowerSyncOptimizationPlan extends HTMLElement {
       charge.length,
       discharge.length,
     );
+    const evVehicleColors = ['#5E35B1', '#00897B', '#D81B60', '#546E7A', '#F4511E'];
+    const evVehicleSeries = Object.keys(evByVehicle).sort().flatMap((vehicleId, index) => {
+      const values = evByVehicle[vehicleId];
+      if (!Array.isArray(values) || values.length !== timestamps.length || !values.every(value => Number.isFinite(Number(value)))) {
+        return [];
+      }
+      return [{
+        key: `evVehicleKw${index}`,
+        values,
+        label: `Planned EV: ${vehicleId}`,
+        color: evVehicleColors[index % evVehicleColors.length],
+        dashed: true,
+      }];
+    });
     const points = [];
     for (let i = 0; i < count; i++) {
       const gridImportValue = gridImport && i < gridImport.length ? gridImport[i] : null;
@@ -2627,6 +2647,9 @@ class PowerSyncOptimizationPlan extends HTMLElement {
         exportPrice: this._minorPrice(exportPrice[i]),
         gridExportLimitKw: this._kw(gridExportLimit[i]),
       });
+      for (const series of evVehicleSeries) {
+        points[points.length - 1][series.key] = this._kw(series.values[i]);
+      }
     }
 
     const hasEv = points.some(p => p.evKw > 0);
@@ -2643,6 +2666,16 @@ class PowerSyncOptimizationPlan extends HTMLElement {
         ];
     if (hasEv) {
       powerSeries.push({ key: 'evKw', label: 'Planned EV load', color: '#7E57C2' });
+    }
+    for (const series of evVehicleSeries) {
+      if (points.some(point => point[series.key] > 0)) {
+        powerSeries.push({
+          key: series.key,
+          label: series.label,
+          color: series.color,
+          dashed: series.dashed,
+        });
+      }
     }
     if (points.some(point => point.conditionalEvKw > 0)) {
       powerSeries.push({
@@ -5189,6 +5222,16 @@ class PowerSyncEVPanel extends HTMLElement {
           background: rgba(127, 127, 127, 0.055);
           margin-bottom: 12px;
         }
+        .planned-window {
+          margin-top: 8px;
+          padding: 8px 9px;
+          border-left: 3px solid #7E57C2;
+          border-radius: 5px;
+          background: rgba(126, 87, 194, 0.08);
+          color: var(--secondary-text-color);
+          font-size: 12px;
+          line-height: 1.4;
+        }
         .loadpoint-name {
           margin: 0 0 5px;
           color: var(--primary-text-color);
@@ -5648,7 +5691,7 @@ class PowerSyncEVPanel extends HTMLElement {
         ${selected ? this._statusHtml(selected, conflict) : ''}
         ${selected ? this._controlsHtml(loadpoints, selected, canStart, canStop) : ''}
         ${selected && !selected.connected ? this._noticeHtml('warn', 'EV is disconnected. Start is disabled until the charger reports a connected vehicle.') : ''}
-        ${conflict ? this._noticeHtml('warn', `${this._title(selected.owner_mode)} currently controls this loadpoint. Manual Start will take over.`) : ''}
+        ${conflict ? this._noticeHtml('warn', `${this._ownerLabel(selected.owner_mode)} currently controls this loadpoint. Manual Start will take over.`) : ''}
         ${this._bydVehiclesHtml()}
         ${this._modeSectionsHtml()}
       </ha-card>
@@ -5674,13 +5717,14 @@ class PowerSyncEVPanel extends HTMLElement {
     const stateClass = loadpoint.actual_charging ? 'on' : (conflict || loadpoint.blocking_reason ? 'warn' : '');
     const stateText = loadpoint.actual_charging ? 'Charging' : (loadpoint.connected ? 'Connected' : 'Disconnected');
     const countdown = this._countdown(loadpoint.expires_at);
-    const owner = this._title(loadpoint.owner_mode || loadpoint.owner || 'idle');
+    const owner = this._ownerLabel(loadpoint.owner_mode || loadpoint.owner || 'idle');
     const source = this._sourceLabel(loadpoint);
     return `
       <div class="status">
         <div>
           <h3 class="loadpoint-name">${this._escHtml(this._loadpointLabel(loadpoint))}</h3>
           <div class="state-line">${this._escHtml(owner)}${source ? ` | ${this._escHtml(source)}` : ''}${countdown ? ` | ${this._escHtml(countdown)}` : ''}</div>
+          ${this._smartSchedulePlanHtml(loadpoint)}
           ${this._delayTimerHtml(loadpoint)}
           ${loadpoint.blocking_reason ? `<div class="state-line">${this._escHtml(loadpoint.blocking_reason)}</div>` : ''}
           <div class="metrics">
@@ -5693,6 +5737,57 @@ class PowerSyncEVPanel extends HTMLElement {
         <div class="pill ${stateClass}">${this._escHtml(stateText)}</div>
       </div>
     `;
+  }
+
+  _ownerLabel(ownerMode) {
+    // This is intentionally display-only.  Raw owner_mode still flows to the
+    // API and all ownership/arbitration checks use that unchanged token.
+    return ownerMode === 'smart_schedule_solar_surplus'
+      ? 'Smart Schedule (solar)'
+      : this._title(ownerMode || 'idle');
+  }
+
+  _smartScheduleStateFor(loadpoint) {
+    const states = this._data?.autoStatus?.states;
+    const loadpointId = String(loadpoint?.loadpoint_id || '');
+    if (!states || !loadpointId || !Object.prototype.hasOwnProperty.call(states, loadpointId)) return null;
+    const state = states[loadpointId];
+    // Do not match aliases, display labels, or the first available state.
+    return state && String(state.vehicle_id || '') === loadpointId ? state : null;
+  }
+
+  _formatPlannedWindowTime(value) {
+    const date = new Date(value || '');
+    return Number.isNaN(date.getTime())
+      ? 'unavailable local time'
+      : date.toLocaleString([], {
+          weekday: 'short', hour: '2-digit', minute: '2-digit',
+          timeZoneName: 'short',
+        });
+  }
+
+  _smartSchedulePlanHtml(loadpoint) {
+    if (!this._data?.autoStatus) {
+      return '<div class="planned-window" role="status">Smart Schedule plan data is unavailable.</div>';
+    }
+    const state = this._smartScheduleStateFor(loadpoint);
+    if (!state) {
+      return '<div class="planned-window" role="status">Smart Schedule plan is unavailable for this selected EV.</div>';
+    }
+    const presentation = state.plan_presentation;
+    if (!state.enabled || presentation?.status === 'no_plan') {
+      return '<div class="planned-window" role="status">No Smart Schedule window is planned for this EV.</div>';
+    }
+    if (presentation?.status === 'stale') {
+      return '<div class="planned-window" role="status">Smart Schedule plan is stale; waiting for a refreshed plan.</div>';
+    }
+    const window = presentation?.window;
+    if (!window || !window.start_time || !window.end_time) {
+      return '<div class="planned-window" role="status">Smart Schedule plan data is unavailable for this EV.</div>';
+    }
+    const label = presentation.status === 'active' ? 'Smart Schedule window active' : 'Next Smart Schedule window';
+    const source = this._title(window.source || 'unknown');
+    return `<div class="planned-window" role="status" aria-label="${this._escAttr(`${label}: ${this._formatPlannedWindowTime(window.start_time)} to ${this._formatPlannedWindowTime(window.end_time)}, ${source}. Planned information only; it does not confirm a charger command.`)}">${this._escHtml(label)}: ${this._escHtml(this._formatPlannedWindowTime(window.start_time))}–${this._escHtml(this._formatPlannedWindowTime(window.end_time))} (${this._escHtml(source)}). Planned information only; charger measurements remain authoritative.</div>`;
   }
 
   _bydVehiclesHtml() {

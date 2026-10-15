@@ -128,6 +128,31 @@ def test_optimizer_windows_use_combined_visual_card():
     source = STRATEGY_PATH.read_text()
 
     assert "customElements.define('power-sync-optimization-plan'" in source
+
+
+def test_ev_panel_renders_exactly_matched_plans_and_friendly_solar_owner():
+    """The selected EV must not borrow a plan from a sibling loadpoint."""
+    source = STRATEGY_PATH.read_text()
+    panel = source[source.index("class PowerSyncEVPanel"):]
+
+    assert "ownerMode === 'smart_schedule_solar_surplus'" in panel
+    assert "Smart Schedule (solar)" in panel
+    assert "Object.prototype.hasOwnProperty.call(states, loadpointId)" in panel
+    assert "String(state.vehicle_id || '') === loadpointId" in panel
+    assert "Smart Schedule plan is stale" in panel
+    assert "No Smart Schedule window is planned" in panel
+    assert "Planned information only; charger measurements remain authoritative" in panel
+    assert "timeZoneName: 'short'" in panel
+
+
+def test_optimizer_chart_omits_misaligned_per_ev_series():
+    source = STRATEGY_PATH.read_text()
+    optimizer = source[source.index("class PowerSyncOptimizationPlan"):source.index("class PowerSyncEVPanel")]
+
+    assert "schedule.ev_charging_plan_snapshot_id === schedule.plan_snapshot_id" in optimizer
+    assert "values.length !== timestamps.length" in optimizer
+    assert "Planned EV load" in optimizer
+    assert "Planned EV: ${vehicleId}" in optimizer
     assert "custom:power-sync-optimization-plan" in source
     assert "optimizationPath: 'power_sync/optimization'" in source
     assert "optimization_force_charge_windows" in source

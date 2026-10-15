@@ -4651,6 +4651,77 @@ class AutoScheduleState:
     last_known_soc: Optional[int] = None
     last_soc_update: Optional[datetime] = None
 
+    def plan_presentation_snapshot(self, now: Optional[datetime] = None) -> dict:
+        """Return a read-only, offset-safe summary for schedule consumers.
+
+        This deliberately describes the plan rather than an EV command.  The
+        executor and measured charger state remain the authority for charging.
+        """
+        now = now or dt_util.now() or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(
+                tzinfo=getattr(dt_util, "DEFAULT_TIME_ZONE", timezone.utc)
+            )
+
+        def _window_data(window: PlannedChargingWindow) -> dict:
+            return {
+                "start_time": window.start_time,
+                "end_time": window.end_time,
+                "source": window.source,
+            }
+
+        def _bounds(window: PlannedChargingWindow) -> tuple[datetime, datetime] | None:
+            try:
+                start = datetime.fromisoformat(window.start_time)
+                end = datetime.fromisoformat(window.end_time)
+            except (AttributeError, TypeError, ValueError):
+                return None
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=now.tzinfo)
+            if end.tzinfo is None:
+                end = end.replace(tzinfo=now.tzinfo)
+            return start, end
+
+        windows = list(getattr(self.current_plan, "windows", ()) or ())
+        if not windows:
+            status = "no_plan" if self.current_plan is None else "stale"
+            return {
+                "status": status,
+                "window": None,
+                "last_plan_update": self.last_plan_update.isoformat()
+                if self.last_plan_update else None,
+            }
+
+        future: list[tuple[datetime, PlannedChargingWindow]] = []
+        for window in windows:
+            bounds = _bounds(window)
+            if bounds is None:
+                continue
+            start, end = bounds
+            if start <= now < end:
+                return {
+                    "status": "active",
+                    "window": _window_data(window),
+                    "last_plan_update": self.last_plan_update.isoformat()
+                    if self.last_plan_update else None,
+                }
+            if start > now:
+                future.append((start, window))
+        if future:
+            _start, window = min(future, key=lambda item: item[0])
+            return {
+                "status": "next",
+                "window": _window_data(window),
+                "last_plan_update": self.last_plan_update.isoformat()
+                if self.last_plan_update else None,
+            }
+        return {
+            "status": "stale",
+            "window": None,
+            "last_plan_update": self.last_plan_update.isoformat()
+            if self.last_plan_update else None,
+        }
+
     def to_dict(self) -> dict:
         """Convert to dictionary for API."""
         return {
@@ -4669,6 +4740,7 @@ class AutoScheduleState:
             "curtailment_override_active": self.curtailment_override_active,
             "last_known_soc": self.last_known_soc,
             "last_soc_update": self.last_soc_update.isoformat() if self.last_soc_update else None,
+            "plan_presentation": self.plan_presentation_snapshot(),
             "plan_summary": {
                 "windows": len(self.current_plan.windows) if self.current_plan else 0,
                 "estimated_solar_kwh": self.current_plan.estimated_solar_kwh if self.current_plan else 0,

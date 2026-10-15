@@ -6,6 +6,7 @@ import asyncio
 import importlib
 import sys
 import types
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -364,6 +365,74 @@ def test_auto_schedule_states_keep_enabled_vehicle_identity_and_plan():
     assert states["w3rt1e"]["display_name"] == "W3RT1E"
     assert states["w3rt1e"]["is_charging"] is True
     assert states["w3rt1e"]["last_decision"] == "charging"
+
+
+def test_auto_schedule_plan_presentation_is_offset_safe_and_read_only():
+    plan = ev_planner.ChargingPlan(
+        vehicle_id="tessy",
+        current_soc=55,
+        target_soc=80,
+        target_time=None,
+        energy_needed_kwh=12,
+        windows=[
+            ev_planner.PlannedChargingWindow(
+                start_time="2026-10-04T01:30:00+10:00",
+                end_time="2026-10-04T02:30:00+10:00",
+                source="solar_surplus",
+                estimated_power_kw=7,
+                estimated_energy_kwh=7,
+                price_cents_kwh=0,
+                reason="solar_forecast",
+            ),
+            ev_planner.PlannedChargingWindow(
+                start_time="2026-10-04T03:30:00+11:00",
+                end_time="2026-10-04T04:30:00+11:00",
+                source="grid_offpeak",
+                estimated_power_kw=7,
+                estimated_energy_kwh=7,
+                price_cents_kwh=12,
+                reason="offpeak_rate",
+            ),
+        ],
+    )
+    state = ev_planner.AutoScheduleState(
+        vehicle_id="tessy",
+        current_plan=plan,
+        last_plan_update=datetime(2026, 10, 3, 14, tzinfo=timezone.utc),
+    )
+
+    snapshot = state.plan_presentation_snapshot(
+        datetime(2026, 10, 3, 16, tzinfo=timezone.utc)
+    )
+
+    assert snapshot == {
+        "status": "active",
+        "window": {
+            "start_time": "2026-10-04T01:30:00+10:00",
+            "end_time": "2026-10-04T02:30:00+10:00",
+            "source": "solar_surplus",
+        },
+        "last_plan_update": "2026-10-03T14:00:00+00:00",
+    }
+    # Presentation does not alter the executable plan or its raw source.
+    assert plan.windows[0].source == "solar_surplus"
+    assert len(plan.windows) == 2
+
+
+def test_auto_schedule_plan_presentation_distinguishes_no_plan_and_stale():
+    now = datetime(2026, 10, 3, 12, tzinfo=timezone.utc)
+    assert ev_planner.AutoScheduleState(vehicle_id="tessy").plan_presentation_snapshot(now)["status"] == "no_plan"
+
+    stale_plan = types.SimpleNamespace(windows=[
+        types.SimpleNamespace(
+            start_time="2026-10-03T08:00:00+00:00",
+            end_time="2026-10-03T09:00:00+00:00",
+            source="grid_offpeak",
+        ),
+    ])
+    assert ev_planner.AutoScheduleState(
+        vehicle_id="tessy", current_plan=stale_plan
+    ).plan_presentation_snapshot(now)["status"] == "stale"
 
 
 def test_auto_schedule_sync_reads_app_vehicle_config_store():
