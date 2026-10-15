@@ -1,0 +1,56 @@
+name: Wiki documentation coverage
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'custom_components/power_sync/config_flow.py'
+      - 'custom_components/power_sync/const.py'
+      - 'custom_components/power_sync/battery_backend/**'
+      - 'custom_components/power_sync/settings_metadata.py'
+      - 'custom_components/power_sync/licensing/presentation.py'
+      - 'custom_components/power_sync/strings.json'
+      - 'custom_components/power_sync/translations/en.json'
+      - 'custom_components/power_sync/services.yaml'
+      - 'custom_components/power_sync/switch.py'
+      - 'custom_components/power_sync/select.py'
+      - 'custom_components/power_sync/number.py'
+      - 'custom_components/power_sync/sensor.py'
+      - 'custom_components/power_sync/binary_sensor.py'
+      - 'custom_components/power_sync/button.py'
+      - 'custom_components/power_sync/automations/actions.py'
+      - 'docs/wiki-configuration-map.json'
+      - 'scripts/check_wiki_docs.py'
+      - '.github/workflows/wiki-docs.yml'
+  pull_request:
+    paths:
+      - 'custom_components/power_sync/config_flow.py'
+      - 'custom_components/power_sync/const.py'
+      - 'custom_components/power_sync/battery_backend/**'
+      - 'custom_components/power_sync/settings_metadata.py'
+      - 'custom_components/power_sync/licensing/presentation.py'
+      - 'custom_components/power_sync/strings.json'
+      - 'custom_components/power_sync/translations/en.json'
+      - 'custom_components/power_sync/services.yaml'
+      - 'custom_components/power_sync/switch.py'
+      - 'custom_components/power_sync/select.py'
+      - 'custom_components/power_sync/number.py'
+      - 'custom_components/power_sync/sensor.py'
+      - 'custom_components/power_sync/binary_sensor.py'
+      - 'custom_components/power_sync/button.py'
+      - 'custom_components/power_sync/automations/actions.py'
+      - 'docs/wiki-configuration-map.json'
+      - 'scripts/check_wiki_docs.py'
+      - '.github/workflows/wiki-docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-coverage:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check source documentation signatures and destinations
+        run: python3.12 scripts/check_wiki_docs.py --source-only
