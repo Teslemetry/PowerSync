@@ -56,6 +56,30 @@ def test_worker_signed_permission_and_denial():
         verify(minimum_epoch=denied.epoch, minimum_revision=denied.revision)
 
 
+def test_billing_verification_keeps_running_without_resume_but_expires_absolutely():
+    trial_end = NOW + 3600
+    billing_end = trial_end + 7200
+    trial = verify(signed({**fixture["claims"], "source_state": "trial", "expires_at": billing_end}))
+    pending = verify(signed({**fixture["claims"], "source_state": "billing_pending", "expires_at": billing_end}))
+    gate = admission.OptimizerAdmission(enforced=True)
+    gate.replace(trial)
+    assert gate.permits(trial_end + 1)
+    gate.replace(pending)
+    assert gate.permits(trial_end + 3600) and not gate.suspended
+    gate.replace(replace(verify(), revision=9, source="paid"))
+    assert gate.permits(trial_end + 3600), "a normal first invoice must not require Resume"
+    gate = admission.OptimizerAdmission(enforced=True)
+    gate.replace(pending)
+    assert not gate.permits(billing_end), "the buffer has a fixed exclusive deadline"
+
+
+def test_worker_signed_billing_pending_contract():
+    at = NOW + 7 * 86400
+    verified = permission.verify_permission(fixture["billing_pending"], keys, ID, at)
+    assert verified.source == "billing_pending" and verified.allows_optimization(at)
+    assert not verified.allows_optimization(at + 7200)
+
+
 @pytest.mark.parametrize("field,value", [
     ("issuer", "attacker"), ("audience", "cloud:controls"), ("installation_id", "other-instance"),
     ("schema", True), ("schema", 2), ("credential_generation", 2),

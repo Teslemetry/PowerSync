@@ -13,7 +13,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 ISSUER = "powersync-ha-licensing"
 AUDIENCE = "power_sync:ha_optimizer"
 MAX_LEASE_SECONDS = 7 * 86400
-SOURCES = {"paid", "trial", "sponsor", "transition", "support", "payment_grace"}
+SOURCES = {"paid", "trial", "billing_pending", "sponsor", "transition", "support", "payment_grace"}
 DENIALS = {"subscription_required", "installation_revoked"}
 
 
