@@ -23,7 +23,7 @@
       "sensor.py": "24006ebbee1b2a78fa790f29e2860228a2284de72cbfce2cbec8d751af278630",
       "binary_sensor.py": "9c1c1517140c01e298e3aabb3bf095574ee1eb2b5525dcb2eaab4535f7021650",
       "button.py": "8648b1b520e66e583875e0e226e3bf7ac46f1d2a8be4c162c03e2abaaa3b435d",
-      "automations/actions.py": "62815b58649a5febca593a160c1e7b6c56d7cbdd0037f162ea074f43691a7185",
+      "automations/actions.py": "7f8122ad6600de8e93ae6bd8516f17cc6362875440b31298df0f3efbb22f7b6d",
       "licensing/presentation.py": "434294026457b72fcd1764fd78b5fd69dff58d9246f5cdcb346427a95404367e"
     },
     "step_methods": [
