@@ -2905,6 +2905,7 @@ async def _get_ev_load_observations(hass, entry, vehicles=None):
     sigenergy_state = await _read_sigenergy_charger_state_for_entry(entry, hass)
     if sigenergy_state is not None:
         entry_data["observed_sigenergy_charger_state"] = sigenergy_state
+        entry_data["observed_sigenergy_charger_state_at"] = observed_at
         charger_type = str(getattr(sigenergy_state, "charger_type", "evac") or "evac").lower()
         observations.append(
             EvLoadObservation(

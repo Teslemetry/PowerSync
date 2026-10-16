@@ -6037,6 +6037,34 @@ class AutoScheduleExecutor:
                     self.config_entry,
                     stored_data.get("vehicle_charging_configs", []),
                 )
+                selected_config = _effective_vehicle_charging_config(
+                    vehicle_configs,
+                    stored_data,
+                    vehicle_id,
+                )
+                if selected_config is not None:
+                    settings.apply_charger_config(selected_config)
+                    opts = {
+                        **getattr(self.config_entry, "data", {}),
+                        **getattr(self.config_entry, "options", {}),
+                    }
+                    settings.charger_type = _effective_auto_schedule_charger_type(
+                        settings,
+                        opts,
+                    )
+                    if settings.charger_type == "generic":
+                        _with_configured_charger_entities(
+                            self.hass, settings.__dict__, opts, "generic"
+                        )
+                    return
+                if _ambiguous_vehicle_profile_selection(
+                    vehicle_configs,
+                    stored_data,
+                    vehicle_id,
+                ):
+                    # No selected profile means no vehicle-specific charger
+                    # settings may be copied onto a shared loadpoint.
+                    continue
                 for vc in vehicle_configs:
                     if any(
                         _vehicle_config_matches(candidate, vc.get("vehicle_id"))
@@ -6715,6 +6743,64 @@ class AutoScheduleExecutor:
                 await self._restore_curtailment(state)
                 state.is_charging = False
                 state.started_at = None
+
+        # An explicit per-mode policy governs an externally started session
+        # before an eligible plan can send a competing start command.
+        if not state.is_charging:
+            policy_loadpoint = vehicle_vin or vehicle_id
+            external_action = _external_session_policy(
+                self.hass,
+                self.config_entry,
+                policy_loadpoint,
+                "smart_schedule",
+            )
+            if external_action:
+                policy_charger_type = _effective_auto_schedule_charger_type(
+                    settings,
+                    {
+                        **getattr(self.config_entry, "data", {}),
+                        **getattr(self.config_entry, "options", {}),
+                    },
+                )
+                externally_charging = (
+                    _has_current_non_tesla_charge(
+                        self.hass,
+                        self.config_entry,
+                        policy_loadpoint,
+                    )
+                    if policy_charger_type != "tesla"
+                    else await is_ev_actively_charging(
+                        self.hass,
+                        self.config_entry,
+                        vehicle_vin=vehicle_vin,
+                    )
+                )
+                if externally_charging:
+                    if external_action == "abort":
+                        stopped = await self._stop_external_charging_if_needed(
+                            vehicle_id,
+                            settings,
+                            state,
+                            reason,
+                        )
+                        state.last_decision = "stopped" if stopped else "waiting"
+                        state.last_decision_reason = (
+                            reason
+                            if stopped
+                            else f"{reason}; external stop unconfirmed"
+                        )
+                    elif external_action == "leave_alone":
+                        state.last_decision = "external"
+                        state.last_decision_reason = (
+                            f"{reason}; external session policy leaves this session alone"
+                        )
+                    self._sync_active_charging_preserve_intent(
+                        vehicle_id,
+                        effective_preserve_home_battery,
+                        state,
+                        state.last_decision_reason,
+                    )
+                    return
 
         # Take action
         if should_charge and (not state.is_charging or switch_active_controller):
@@ -8057,23 +8143,23 @@ class AutoScheduleExecutor:
             if vehicle_id != "_default"
             else None
         )
+        opts = {
+            **getattr(self.config_entry, "data", {}),
+            **getattr(self.config_entry, "options", {}),
+        }
+        charger_type = _effective_auto_schedule_charger_type(settings, opts)
         if vehicle_vin is None:
-            opts = {
-                **getattr(self.config_entry, "data", {}),
-                **getattr(self.config_entry, "options", {}),
-            }
-            if _effective_auto_schedule_charger_type(settings, opts) != "tesla":
-                return False
-            vehicle_vin = await _resolve_unspecified_tesla_start_vin(
-                self.hass,
-                self.config_entry,
-                None,
-            )
-            if vehicle_vin is None:
-                _LOGGER.debug(
-                    "Auto-schedule external stop skipped: no unique Tesla loadpoint"
+            if charger_type == "tesla":
+                vehicle_vin = await _resolve_unspecified_tesla_start_vin(
+                    self.hass,
+                    self.config_entry,
+                    None,
                 )
-                return False
+                if vehicle_vin is None:
+                    _LOGGER.debug(
+                        "Auto-schedule external stop skipped: no unique Tesla loadpoint"
+                    )
+                    return False
         loadpoint_id = vehicle_vin or vehicle_id
         active_mode = _get_active_dynamic_ev_mode(
             self.hass,
@@ -8096,18 +8182,40 @@ class AutoScheduleExecutor:
             )
             return False
 
-        if not await is_ev_actively_charging(
-            self.hass,
-            self.config_entry,
-            vehicle_vin=vehicle_vin,
-        ):
-            return False
-
-        if _claim_external_charging_ownership(
+        external_action = _external_session_policy(
             self.hass,
             self.config_entry,
             loadpoint_id,
-            reason="Tesla charging started outside PowerSync Smart Schedule",
+            "smart_schedule",
+        )
+        if external_action == "leave_alone":
+            _LOGGER.info(
+                "Auto-schedule leaving external session alone for %s by policy",
+                loadpoint_id,
+            )
+            return False
+
+        externally_charging = (
+            _has_current_non_tesla_charge(
+                self.hass,
+                self.config_entry,
+                loadpoint_id,
+            )
+            if charger_type != "tesla"
+            else await is_ev_actively_charging(
+                self.hass,
+                self.config_entry,
+                vehicle_vin=vehicle_vin,
+            )
+        )
+        if not externally_charging:
+            return False
+
+        if external_action != "abort" and _claim_external_charging_ownership(
+            self.hass,
+            self.config_entry,
+            loadpoint_id,
+            reason="Charging started outside PowerSync Smart Schedule",
         ):
             _LOGGER.info(
                 "Auto-schedule leaving externally-started charging alone for %s",
@@ -8297,6 +8405,18 @@ def _claim_external_charging_ownership(
         vehicle_id,
         reason=reason,
     )
+
+
+def _external_session_policy(
+    hass: "HomeAssistant",
+    config_entry: "ConfigEntry",
+    vehicle_id: Optional[str],
+    mode: str,
+) -> Optional[str]:
+    """Return an explicitly configured external-session action, if active."""
+    from .ev_ownership import get_external_session_policy
+
+    return get_external_session_policy(hass, config_entry, vehicle_id, mode)
 
 
 def _dynamic_ev_owner_suspended_control(
@@ -9623,6 +9743,7 @@ def _get_vehicle_charger_params(
     defaults = {"min_charge_amps": 5, "max_charge_amps": 32, "voltage": 230, "phases": 1}
 
     # Try vehicle_charging_configs first (source of truth — app writes charger params here)
+    selection_ambiguous = False
     try:
         entry_data = hass.data.get(domain, {}).get(config_entry.entry_id, {})
         store = entry_data.get("automation_store")
@@ -9632,6 +9753,20 @@ def _get_vehicle_charger_params(
                 config_entry,
                 stored_data.get("vehicle_charging_configs", []),
             )
+            selected_config = _effective_vehicle_charging_config(
+                configs,
+                stored_data,
+                vehicle_vin,
+            )
+            if selected_config is not None:
+                configs = [selected_config]
+            elif _ambiguous_vehicle_profile_selection(
+                configs,
+                stored_data,
+                vehicle_vin,
+            ):
+                selection_ambiguous = True
+                configs = []
             for vc in configs:
                 if vehicle_vin and _vehicle_config_matches(vehicle_vin, vc.get("vehicle_id")):
                     params = {
@@ -9712,7 +9847,7 @@ def _get_vehicle_charger_params(
     try:
         exec_instance = get_auto_schedule_executor()
         if exec_instance:
-            if vehicle_vin:
+            if vehicle_vin and not selection_ambiguous:
                 for vid, settings in exec_instance._settings.items():
                     if _vehicle_config_matches(vehicle_vin, vid):
                         return {
@@ -9733,9 +9868,12 @@ def _get_vehicle_charger_params(
                             "pre_charge_wake_on_service_data": settings.pre_charge_wake_on_service_data,
                             "pre_charge_wake_off_service_data": settings.pre_charge_wake_off_service_data,
                         }
-            # No VIN match — use first available settings
-            for vid, settings in exec_instance._settings.items():
-                return {
+            # No VIN match — use first available settings only for legacy or
+            # unambiguous loadpoints. A shared charger without a selection
+            # must not inherit one profile's schedule or limits.
+            if not selection_ambiguous:
+                for vid, settings in exec_instance._settings.items():
+                    return {
                     "_configured_vehicle_id": vid,
                     "min_charge_amps": settings.min_charge_amps,
                     "max_charge_amps": settings.max_charge_amps,
@@ -9752,11 +9890,53 @@ def _get_vehicle_charger_params(
                     "pre_charge_wake_off_service": settings.pre_charge_wake_off_service,
                     "pre_charge_wake_on_service_data": settings.pre_charge_wake_on_service_data,
                     "pre_charge_wake_off_service_data": settings.pre_charge_wake_off_service_data,
-                }
+                    }
     except Exception:
         pass
 
     return defaults
+
+
+def _effective_vehicle_charging_config(
+    configs: list[Mapping[str, Any]],
+    stored_data: Mapping[str, Any],
+    vehicle_id: Any,
+) -> Mapping[str, Any] | None:
+    """Return the selected profile for a logical or physical loadpoint."""
+    try:
+        from .ev_loadpoint_profiles import effective_profile_for_id
+
+        return effective_profile_for_id(configs, stored_data, vehicle_id)
+    except Exception:
+        return None
+
+
+def _ambiguous_vehicle_profile_selection(
+    configs: list[Mapping[str, Any]],
+    stored_data: Mapping[str, Any],
+    vehicle_id: Any,
+) -> bool:
+    """Return true when a shared loadpoint lacks one effective profile."""
+    try:
+        from .ev_loadpoint_profiles import (
+            effective_profile_for_id,
+            profile_loadpoint_id,
+            profiles_for_loadpoint,
+        )
+
+        loadpoint_id = profile_loadpoint_id(configs, vehicle_id)
+        if loadpoint_id is None:
+            # An anonymous or legacy alias cannot safely choose among more
+            # than one stored profile, even when its physical key is custom.
+            return len(configs) > 1
+        candidates = profiles_for_loadpoint(configs, loadpoint_id)
+        return len(candidates) > 1 and effective_profile_for_id(
+            configs,
+            stored_data,
+            vehicle_id,
+        ) is None
+    except Exception:
+        return False
 
 
 def _get_optimizer_battery_params(
@@ -9799,6 +9979,83 @@ def _get_optimizer_battery_params(
         pass
 
     return {}
+
+
+def _has_current_non_tesla_charge(
+    hass: "HomeAssistant",
+    config_entry: "ConfigEntry",
+    loadpoint_id: str,
+) -> bool:
+    """Return true only for fresh, backend-specific non-Tesla charge evidence."""
+    from .ocpp_status import OCPP_POWER_SUFFIXES, normalize_ocpp_status
+
+    opts = {**config_entry.data, **config_entry.options}
+    params = _build_dynamic_stop_params(
+        hass,
+        DOMAIN,
+        config_entry,
+        opts,
+        vehicle_vin=loadpoint_id,
+    )
+    charger_type = params.get("charger_type")
+    if charger_type == "sigenergy":
+        entry_data = hass.data.get(DOMAIN, {}).get(config_entry.entry_id, {})
+        observed = entry_data.get("observed_sigenergy_charger_state")
+        observed_at = entry_data.get("observed_sigenergy_charger_state_at")
+        if not is_current_ev_power_observation(observed_at):
+            return False
+        try:
+            power_kw = float(getattr(observed, "power_kw", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            power_kw = 0.0
+        return bool(getattr(observed, "is_charging", False) or power_kw > 0.05)
+
+    if charger_type == "zaptec":
+        entry_data = hass.data.get(DOMAIN, {}).get(config_entry.entry_id, {})
+        poll = entry_data.get("zaptec_state_poll") or {}
+        try:
+            completed_at = float(poll.get("completed_at"))
+        except (TypeError, ValueError):
+            return False
+        age = time.monotonic() - completed_at
+        if not math.isfinite(age) or age < 0 or age > 90:
+            return False
+        cached = entry_data.get("zaptec_cached_state") or {}
+        mode = str(cached.get("charger_operation_mode") or "").lower()
+        try:
+            power_w = float(cached.get("total_charge_power_w") or 0.0)
+        except (TypeError, ValueError):
+            power_w = 0.0
+        return mode == "charging" or (math.isfinite(power_w) and power_w > 50)
+
+    if charger_type == "generic":
+        status_ids = [params.get("charger_status_entity")]
+        power_ids = [params.get("charger_power_entity")]
+    elif charger_type == "ocpp":
+        prefix = params.get("ocpp_charger_id")
+        if not prefix:
+            return False
+        status_ids = [f"sensor.{prefix}_status_connector", f"sensor.{prefix}_status"]
+        power_ids = [f"sensor.{prefix}{suffix}" for suffix in OCPP_POWER_SUFFIXES]
+    else:
+        return False
+
+    for entity_id in status_ids + power_ids:
+        entity = hass.states.get(entity_id) if entity_id else None
+        if entity is None or not is_current_ev_power_observation(
+            getattr(entity, "last_reported", None)
+            or getattr(entity, "last_updated", None)
+            or getattr(entity, "last_changed", None)
+        ):
+            continue
+        if entity_id in status_ids:
+            if normalize_ocpp_status(entity.state) == "charging":
+                return True
+        else:
+            power_w = _state_power_w(entity)
+            if power_w is not None and math.isfinite(power_w) and power_w > 50:
+                return True
+    return False
 
 
 class PriceLevelChargingExecutor:
@@ -10889,7 +11146,29 @@ class PriceLevelChargingExecutor:
                 enabled and not state.is_charging and not pending
                 and self._has_current_non_tesla_charge(loadpoint_id)
             )
-            if untracked_charge and _claim_external_charging_ownership(
+            external_action = _external_session_policy(
+                self.hass,
+                self.config_entry,
+                loadpoint_id,
+                "price_level",
+            )
+            if untracked_charge and external_action == "leave_alone":
+                state.last_decision = "external"
+                state.last_decision_reason = (
+                    f"{reason}; external session policy leaves this session alone"
+                )
+            elif untracked_charge and external_action == "abort":
+                stopped = await self._stop_charging(
+                    reason,
+                    vehicle_vin=loadpoint_id,
+                )
+                state.last_decision = "stopped" if stopped else "waiting"
+                state.last_decision_reason = (
+                    reason
+                    if stopped
+                    else f"{reason}; external stop unconfirmed"
+                )
+            elif untracked_charge and _claim_external_charging_ownership(
                 self.hass, self.config_entry, loadpoint_id,
                 reason="Charger started outside PowerSync Price-Level",
             ):
@@ -10903,7 +11182,14 @@ class PriceLevelChargingExecutor:
                 # The action seam rechecks ownership before dispatch. A pending
                 # start belongs to PowerSync and must be cancellable even before
                 # the cloud publishes positive charging telemetry.
-                await self._stop_charging(reason, vehicle_vin=loadpoint_id)
+                stopped = await self._stop_charging(
+                    reason,
+                    vehicle_vin=loadpoint_id,
+                )
+                state.last_decision = "stopped" if stopped else "waiting"
+                state.last_decision_reason = (
+                    reason if stopped else f"{reason}; external stop unconfirmed"
+                )
             else:
                 state.last_decision = "charging" if state.is_charging else "waiting"
                 state.last_decision_reason = reason
@@ -10912,41 +11198,11 @@ class PriceLevelChargingExecutor:
 
     def _has_current_non_tesla_charge(self, loadpoint_id: str) -> bool:
         """Read exact configured charger telemetry; switch-on is not delivered power."""
-        from .ocpp_status import OCPP_POWER_SUFFIXES, normalize_ocpp_status
-
-        opts = {**self.config_entry.data, **self.config_entry.options}
-        params = _build_dynamic_stop_params(
-            self.hass, self._domain, self.config_entry, opts,
-            vehicle_vin=loadpoint_id,
+        return _has_current_non_tesla_charge(
+            self.hass,
+            self.config_entry,
+            loadpoint_id,
         )
-        if params.get("charger_type") == "generic":
-            status_ids = [params.get("charger_status_entity")]
-            power_ids = [params.get("charger_power_entity")]
-        elif params.get("charger_type") == "ocpp":
-            prefix = params.get("ocpp_charger_id")
-            if not prefix:
-                return False
-            status_ids = [f"sensor.{prefix}_status_connector", f"sensor.{prefix}_status"]
-            power_ids = [f"sensor.{prefix}{suffix}" for suffix in OCPP_POWER_SUFFIXES]
-        else:
-            return False
-
-        for entity_id in status_ids + power_ids:
-            entity = self.hass.states.get(entity_id) if entity_id else None
-            if entity is None or not is_current_ev_power_observation(
-                getattr(entity, "last_reported", None)
-                or getattr(entity, "last_updated", None)
-                or getattr(entity, "last_changed", None)
-            ):
-                continue
-            if entity_id in status_ids:
-                if normalize_ocpp_status(entity.state) == "charging":
-                    return True
-            else:
-                power_w = _state_power_w(entity)
-                if power_w is not None and math.isfinite(power_w) and power_w > 50:
-                    return True
-        return False
 
     def _zaptec_cached_charge_state(self) -> Optional[bool]:
         """Return exact cached Zaptec charging state, or None when unknown."""
@@ -11057,6 +11313,51 @@ class PriceLevelChargingExecutor:
                     vehicle_state.last_decision = "stopped"
                     vehicle_state.last_decision_reason = reason
 
+                # Apply an explicit external-session policy only to a fresh
+                # charger-positive session that Price-Level did not start.
+                # Adopt falls through to the normal price decision; abort
+                # stops regardless of that decision; leave_alone has no
+                # ownership or battery-preservation side effect.
+                if (
+                    zaptec_is_charging
+                    and not vehicle_state.is_charging
+                    and not vehicle_state.start_pending
+                ):
+                    external_action = _external_session_policy(
+                        self.hass,
+                        self.config_entry,
+                        "zaptec_standalone",
+                        "price_level",
+                    )
+                    if external_action == "leave_alone":
+                        vehicle_state.last_decision = "external"
+                        vehicle_state.last_decision_reason = (
+                            f"{reason}; external session policy leaves this session alone"
+                        )
+                        await self.apply_preserve_home_battery(False, reason)
+                        return results
+                    if external_action == "abort" or (
+                        external_action == "adopt" and not should_charge
+                    ):
+                        stopped = await self._stop_charging(
+                            reason,
+                            vehicle_vin="zaptec_standalone",
+                        )
+                        vehicle_state.last_decision = (
+                            "stopped" if stopped else "waiting"
+                        )
+                        vehicle_state.last_decision_reason = (
+                            reason
+                            if stopped
+                            else f"{reason}; external stop unconfirmed"
+                        )
+                        await self.apply_preserve_home_battery(
+                            vehicle_state.is_charging
+                            or vehicle_state.stop_pending,
+                            reason,
+                        )
+                        return results
+
                 # Release charger when price-level charging is disabled
                 if not should_charge and reason == "Price-level charging is disabled":
                     if vehicle_state.is_charging or vehicle_state.start_pending:
@@ -11148,25 +11449,11 @@ class PriceLevelChargingExecutor:
                 return results
 
             if opts.get(CONF_SIGENERGY_CHARGER_ENABLED):
-                decision = await self.get_charging_decision(current_price_cents)
-                should_charge, reason, mode = decision
                 pseudo_vin = "sigenergy_charger"
-                results[pseudo_vin] = decision
-
-                vehicle_state = self._get_or_create_vehicle_state(pseudo_vin)
-                _LOGGER.debug(
-                    f"Sigenergy charger decision: should_charge={should_charge}, reason={reason}"
+                results[pseudo_vin] = await self._evaluate_non_tesla_loadpoint(
+                    pseudo_vin,
+                    current_price_cents,
                 )
-
-                if should_charge and not vehicle_state.is_charging:
-                    await self._start_charging(mode, reason, vehicle_vin=pseudo_vin)
-                elif not should_charge and vehicle_state.is_charging:
-                    await self._stop_charging(reason, vehicle_vin=pseudo_vin)
-                else:
-                    vehicle_state.last_decision = "charging" if vehicle_state.is_charging else "waiting"
-                    vehicle_state.last_decision_reason = reason
-
-                await self.apply_preserve_home_battery(vehicle_state.is_charging, reason)
                 return results
 
             # Also check Generic Charger (OCPP via lbbrhzn/ocpp or any switch-based charger)
@@ -11949,6 +12236,7 @@ def set_scheduled_charging_executor(executor: ScheduledChargingExecutor) -> None
 async def _can_stop_external_scheduled_session(
     hass: "HomeAssistant",
     config_entry: "ConfigEntry",
+    vehicle_id: Optional[str] = None,
 ) -> Tuple[bool, str]:
     """Return whether Scheduled Charging may stop an external session."""
     try:
@@ -11956,8 +12244,16 @@ async def _can_stop_external_scheduled_session(
         from .ev_ownership import get_active_ev_owner_mode, owner_family
 
         active_mode = (
-            _get_active_dynamic_ev_mode(hass, config_entry, DEFAULT_VEHICLE_ID)
-            or get_active_ev_owner_mode(hass, config_entry, DEFAULT_VEHICLE_ID)
+            _get_active_dynamic_ev_mode(
+                hass,
+                config_entry,
+                vehicle_id or DEFAULT_VEHICLE_ID,
+            )
+            or get_active_ev_owner_mode(
+                hass,
+                config_entry,
+                vehicle_id or DEFAULT_VEHICLE_ID,
+            )
         )
         if active_mode and owner_family(active_mode) != owner_family("scheduled"):
             return False, f"{active_mode} owns the active loadpoint"
@@ -11984,19 +12280,44 @@ async def _find_external_scheduled_charging_vehicle(
     opts = {**getattr(config_entry, "data", {}), **getattr(config_entry, "options", {})}
     charger_type = _configured_charger_type(opts)
     if charger_type in ("generic", "ocpp", "sigenergy", "zaptec"):
-        can_stop, reason = await _can_stop_external_scheduled_session(hass, config_entry)
+        loadpoint_id = {
+            "generic": "generic_ev",
+            "ocpp": f"ocpp_{opts.get('ocpp_charger_id') or 'ocpp_charger'}",
+            "sigenergy": "sigenergy_charger",
+            "zaptec": "zaptec_standalone",
+        }[charger_type]
+        action = _external_session_policy(
+            hass,
+            config_entry,
+            loadpoint_id,
+            "scheduled",
+        )
+        if action == "leave_alone":
+            return loadpoint_id, False, "external session policy leaves it alone"
+        can_stop, reason = await _can_stop_external_scheduled_session(
+            hass,
+            config_entry,
+            loadpoint_id,
+        )
         if not can_stop:
             return None, False, reason
-        if await is_ev_actively_charging(hass, config_entry):
+        externally_charging = _has_current_non_tesla_charge(
+            hass,
+            config_entry,
+            loadpoint_id,
+        )
+        if externally_charging:
+            if action == "abort":
+                return loadpoint_id, True, reason
             if _claim_external_charging_ownership(
                 hass,
                 config_entry,
-                None,
+                loadpoint_id,
                 reason="Charging started outside PowerSync Scheduled Charging",
             ):
-                return None, False, "external charging controls the loadpoint"
-            return None, True, reason
-        return None, False, "no active external scheduled session"
+                return loadpoint_id, False, "external charging controls the loadpoint"
+            return loadpoint_id, True, reason
+        return loadpoint_id, False, "no active external scheduled session"
 
     blocked_reason = ""
     saw_home_vehicle = False
