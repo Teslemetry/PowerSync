@@ -25,7 +25,7 @@ The full check validates local pages/images/anchors, preserved public anchors, H
 1. Review the source change against both initial setup and existing-install options. Follow helpers and actual grouping; inspect save/live/reload effects and errors, not only the field declaration.
 2. Update the canonical wiki reference. Keep shared feature behaviour in one place and qualify battery capabilities by connection method. Keep configuration, entities/services, app actions and physical outcomes separate.
 3. Update destinations, labels, profile/provider mappings and any explicit exceptions in the manifest. Do not add a coverage waiver merely to make a check pass. Missing UI labels or dropped fields need a source issue and accurate current-behaviour documentation.
-4. Preserve old page URLs and anchors with useful summaries/links when moving sections. Keep Home and sidebar entry points synchronized.
+4. Preserve old page URLs and anchors with useful summaries/links when moving sections. Keep Home, sidebar and repository README entry points synchronized.
 5. After that review, acknowledge the source signatures:
 
    ```bash

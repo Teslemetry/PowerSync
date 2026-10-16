@@ -37,10 +37,10 @@ Monitoring Mode** is explicitly enabled.
 |--------|-----------|---------|
 | **Tesla Powerwall** | PowerSync.cc, Fleet API, or Teslemetry | TOU tariff sync, force charge/discharge, export rules, **off-grid/reconnect** |
 | **FoxESS** (H1, H3, H3-Pro, H3 Smart, KH + OEM rebrands) | Modbus TCP or RS485 | Work mode, force charge/discharge, backup reserve |
-| **Sigenergy** | Cloud API + Modbus TCP | Remote EMS control, force charge/discharge, DC solar curtailment. Smart Optimization requires Remote EMS with Sigenergy AI/native optimisation disabled; see [Sigenergy notes](docs/wiki/Sigenergy.md) |
+| **Sigenergy** | Cloud API + Modbus TCP | Remote EMS control, force charge/discharge, DC solar curtailment. Smart Optimization requires Remote EMS with Sigenergy AI/native optimisation disabled; see [Sigenergy setup](https://github.com/bolagnaise/PowerSync/wiki/Battery-Sigenergy) |
 | **Solax Hybrid** (X1/X3, Gen4/Gen5/Gen6, AC Retro-Fit) | Via [Solax Modbus](https://github.com/wills106/homeassistant-solax-modbus) integration (HACS) | LP optimizer, force charge/discharge, backup reserve, export control |
-| **GoodWe** (ET, EH, BT, BH, ES, EM, BP) | UDP direct control, TCP local, or TCP/502 with HA GoodWe entity mode for LAN/Kit-20 | Force charge/discharge, backup reserve, export limit. LAN/Kit-20 force modes require entity mode; see [GoodWe notes](docs/wiki/GoodWe.md) |
-| **Sungrow SH-series** | Modbus TCP | Force charge/discharge, rate limiting, export control, dual inverter |
+| **GoodWe** (ET, EH, BT, BH, ES, EM, BP) | UDP direct control, TCP local, or TCP/502 with HA GoodWe entity mode for LAN/Kit-20 | Force charge/discharge, backup reserve, export limit. LAN/Kit-20 force modes require entity mode; see [GoodWe setup](https://github.com/bolagnaise/PowerSync/wiki/Battery-GoodWe) |
+| **Sungrow SH-series** | Modbus TCP, or a supported companion integration for monitoring | Force charge/discharge, rate limiting and export control on supported direct routes. See [Sungrow setup](https://github.com/bolagnaise/PowerSync/wiki/Battery-Sungrow) for connection capabilities and retired dual-inverter settings |
 | **AlphaESS** (SMILE5, SMILE-Hi5/Hi10, SMILE-B3, SMILE-T10, SMILE-G3, Storion-T30) | Modbus TCP + optional Cloud API, or Cloud-only monitoring | Force charge/discharge, dispatch SOC targeting, and DC solar curtailment over Modbus; telemetry/planning only in Cloud-only mode |
 | **ESY Sunhome** (HM series) | Via [ESY Sunhome](https://github.com/branko-lazarevic/esysunhome) companion integration (HACS) | LP optimizer, AEMO spike export, Saving Sessions (mode-only control) |
 | **SAJ H2 / HS2** | Via [SAJ H2 Modbus](https://github.com/stanus74/home-assistant-saj-h2-modbus) companion integration (HACS) | LP optimizer, force charge/discharge, AEMO spike export (no backup reserve write) |
@@ -54,8 +54,13 @@ Each battery system has a **Connection method** setting. Choose either the
 PowerSync-owned direct route or a supported Home Assistant battery integration.
 Home Assistant-backed and monitoring-only methods reuse the selected upstream
 config entry and do not open a second PowerSync hardware connection. PowerSync
-validates the source before switching, restores any active temporary battery
+validates the source when changing a connection profile, restores any active temporary battery
 mode through the old route, and blocks the change if cleanup cannot be proven.
+Changing battery brand is a separate flow that saves the selection before the
+new connection form finishes; closing it does not guarantee rollback. Check
+[connection methods](https://github.com/bolagnaise/PowerSync/wiki/Connection-Methods)
+and [current limitations](https://github.com/bolagnaise/PowerSync/wiki/Known-Limitations)
+before changing an existing installation.
 The dashboard can show recommended or all discovered upstream battery, solar,
 grid, load, energy, inverter, and diagnostic sensors without cloning them into
 duplicate PowerSync entities.
@@ -98,9 +103,11 @@ Solar inverters that bypass the battery can be curtailed during negative feed-in
 
 1. **Install** via [HACS](#installation) (custom repository)
 2. **Add Integration** — Settings > Devices & Services > Add Integration > "PowerSync"
-3. **Pick your electricity provider** and enter API credentials if required
-4. **Connect your battery system** and enter connection details, or choose **Custom / external controller** and select your existing Home Assistant telemetry entities
-5. **Done!** Sensors appear automatically and a **PowerSync dashboard** is auto-created in your sidebar. Enable [Smart Optimization](https://github.com/bolagnaise/PowerSync/wiki/Smart-Optimization) for automated scheduling, or install the [Mobile App](#mobile-app) for remote control.
+3. **Pick your [electricity provider](https://github.com/bolagnaise/PowerSync/wiki/Electricity-Providers)** and complete its account, plan and [tariff periods](https://github.com/bolagnaise/PowerSync/wiki/Tariffs-and-Time-Periods) where required
+4. **Choose your [battery and connection method](https://github.com/bolagnaise/PowerSync/wiki/Battery-System-Setup)** and follow the applicable optimizer, sensor and connection screens. **Custom / external controller** uses your existing Home Assistant telemetry and keeps hardware dispatch with your controller
+5. **Verify fresh sensors and prices** using the [setup checks](https://github.com/bolagnaise/PowerSync/wiki/Installation#verify-setup). Before enabling automatic dispatch, configure [Smart Optimization](https://github.com/bolagnaise/PowerSync/wiki/Optimization-Settings), check [HA optimiser access](https://github.com/bolagnaise/PowerSync/wiki/HA-Optimiser-Access), and confirm the selected route supports control
+
+To change an existing installation, open **Settings > Devices & Services > PowerSync > Configure** and follow the [configuration index](https://github.com/bolagnaise/PowerSync/wiki/Configuration). Each section has its own settings; you do not need to repeat initial setup.
 
 > **Tesla Powerwall users — two options:**
 > - **Home Assistant integration (this repo):** Monitoring, dashboards and manual controls remain free. HA optimiser access is A$4/month directly, or qualifying recurring GitHub sponsorship from US$3/month while active. Direct signup requires a card and gives one seven-day HA trial, then automatic monthly billing until cancelled. GitHub sponsorship starts paying immediately. [Activation and subscription guide](https://powersync.cc/ha-optimiser). Tesla provider sign-in remains separate from optimiser activation.
@@ -126,19 +133,30 @@ Or manually:
 2. Add `https://github.com/bolagnaise/PowerSync` (Category: Integration)
 3. Download PowerSync and restart Home Assistant
 4. Settings > Devices & Services > Add Integration > "PowerSync"
-5. Follow the guided setup for your provider and battery system
+5. Follow the [installation guide](https://github.com/bolagnaise/PowerSync/wiki/Installation) for your provider, battery system and setup checks
 
 ---
+
+## Documentation
+
+The [wiki](https://github.com/bolagnaise/PowerSync/wiki) covers the Home Assistant integration across all supported batteries and connection methods. Start with the task you need:
+
+- [Find a setting](https://github.com/bolagnaise/PowerSync/wiki/Configuration) — follows the actual Configure menu, including conditional and Advanced entries
+- [Enter tariffs and time periods](https://github.com/bolagnaise/PowerSync/wiki/Tariffs-and-Time-Periods) — rates, weekdays, overnight periods, seasons and saving changes
+- [Configure optimization](https://github.com/bolagnaise/PowerSync/wiki/Optimization-Settings) — goals, reserves, forecasts and dispatch limits
+- [Use controls and automations](https://github.com/bolagnaise/PowerSync/wiki/Controls-and-Automations) — HA entities/services and PowerSync automation actions
+- [Connect the mobile app](https://github.com/bolagnaise/PowerSync/wiki/Mobile-App) — client setup and navigation
+- [Check current limitations](https://github.com/bolagnaise/PowerSync/wiki/Known-Limitations) — known configuration issues and precautions
 
 ## Features
 
 | Feature | Description | Wiki |
 |---------|-------------|------|
-| **Battery System Setup** | Tesla, FoxESS, Sigenergy, GoodWe, Sungrow, AlphaESS, ESY Sunhome, Solax Hybrid, SAJ H2/HS2, Fronius GEN24 storage, SolarEdge, Anker Solix, and custom/external controller setup guides | [Setup Guide](https://github.com/bolagnaise/PowerSync/wiki/Battery-System-Setup) |
-| **Smart Optimization** | Built-in LP optimizer calculates optimal charge/discharge schedule using prices, solar, and load. Optional controls include Profit Max, Charge By Time, auto-applied forecast reserve, selected household load history, planned EV load, and measured quota settlement for GloBird ZeroHero/ZeroCharge and CovaU SolarMax. **Solar forecasting via Solcast, Open-Meteo Solar Forecast, or Volcast must be configured for accurate scheduling.** Optional [AI Plan Explanation provider eligibility and billing guidance](https://github.com/bolagnaise/PowerSync/wiki/Smart-Optimization#ai-plan-explanation) is available in the Smart Optimization guide. | [Details](https://github.com/bolagnaise/PowerSync/wiki/Smart-Optimization) |
-| **Flexible Exports** | Reads a fail-closed operating envelope from separately certified site equipment exposed in Home Assistant. This release is monitoring-only while the required SAPN site soak is completed; active enforcement remains release-gated. PowerSync is not a CSIP-AUS client and provides no network-limit override. | [Details](https://github.com/bolagnaise/PowerSync/wiki/Smart-Optimization#network-export-limits--flexible-exports) |
-| **EV Smart Charging** | Coordinate EV charging with battery optimization — Solar, Cheapest, Deadline modes | [Details](https://github.com/bolagnaise/PowerSync/wiki/EV-Smart-Charging) |
-| **Advanced Features** | AEMO spike detection, solar curtailment, spike protection, export boost, **off-grid control** | [Details](https://github.com/bolagnaise/PowerSync/wiki/Advanced-Features) |
+| **Battery System Setup** | Tesla, FoxESS, Sigenergy, GoodWe, Sungrow, AlphaESS, ESY Sunhome, Solax Hybrid, SAJ H2/HS2, Fronius GEN24 storage, Neovolt / Bytewatt, SolarEdge, Anker Solix, and custom/external controller setup guides | [Setup Guide](https://github.com/bolagnaise/PowerSync/wiki/Battery-System-Setup) |
+| **Smart Optimization** | Built-in LP optimizer calculates optimal charge/discharge schedule using prices, solar, and load. Optional controls include Profit Max, Charge By Time, auto-applied forecast reserve, selected household load history, planned EV load, and measured quota settlement for GloBird ZeroHero/ZeroCharge and CovaU SolarMax. **Solar forecasting via Solcast, Open-Meteo Solar Forecast, or Volcast must be configured for accurate scheduling.** Optional [AI Plan Explanation provider eligibility and billing guidance](https://github.com/bolagnaise/PowerSync/wiki/Optimization-Settings#ai-plan-explanation) is available in the Smart Optimization guide. | [Details](https://github.com/bolagnaise/PowerSync/wiki/Smart-Optimization) |
+| **Flexible Exports** | Reads a fail-closed operating envelope from separately certified site equipment exposed in Home Assistant. This release is monitoring-only while the required SAPN site soak is completed; active enforcement remains release-gated. PowerSync is not a CSIP-AUS client and provides no network-limit override. | [Details](https://github.com/bolagnaise/PowerSync/wiki/Network-Export-Limits) |
+| **EV Smart Charging** | Coordinate EV charging with battery optimization. Smart Schedule offers Solar Only, Prefer Solar, Cheapest and Meet Deadline strategies; Solar Surplus, Scheduled Charging and Price-Level Charging are separate modes | [Details](https://github.com/bolagnaise/PowerSync/wiki/EV-Smart-Charging) |
+| **Advanced Features** | Curtailment, network monitoring, demand charges, weather and solar forecasts, updates, and the optional Cloud energy-flow reporter | [Details](https://github.com/bolagnaise/PowerSync/wiki/Advanced-Features) |
 | **Sensors** | Core power sensors, daily energy tracking, FoxESS Modbus sensors, optimizer status | [Full List](https://github.com/bolagnaise/PowerSync/wiki/Sensors) |
 | **Services** | Force charge/discharge, hold SOC, TOU sync, backup reserve, inverter curtailment, **off-grid/reconnect** | [Reference](https://github.com/bolagnaise/PowerSync/wiki/Services-Reference) |
 | **Troubleshooting** | Connection issues, debug logging, common fixes | [Guide](https://github.com/bolagnaise/PowerSync/wiki/Troubleshooting) |
