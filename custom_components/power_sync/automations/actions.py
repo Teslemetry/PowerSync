@@ -6090,6 +6090,7 @@ _BATTERY_ACCEPTANCE_MARGIN_KW = 0.3
 _BATTERY_ACCEPTANCE_STABLE_SAMPLES = 2
 _BATTERY_ACCEPTANCE_EMA_ALPHA = 0.35
 _ACTIVE_EV_POWER_EPSILON_KW = 0.05
+_BATTERY_FLOOR_STOP_RETRY_SECONDS = 30
 
 # Lock to prevent duplicate dynamic EV charging sessions from concurrent triggers
 _start_dynamic_lock = asyncio.Lock()
@@ -9677,8 +9678,6 @@ async def _dynamic_ev_update_surplus(
             continue
         if v_state.get("paused") and not (
             vid == vehicle_id
-            and str((v_state.get("params") or {}).get("charger_type") or "").lower()
-            == "generic"
             and v_state.get("stop_outcome")
         ):
             continue
@@ -10096,6 +10095,69 @@ async def _dynamic_ev_update_surplus(
         state["low_surplus_start"] = None
         state["high_surplus_start"] = None
 
+    async def _request_battery_floor_stop() -> None:
+        """Retain unsuccessful stops and reconcile them while the floor holds."""
+        stop_outcome = state.get("stop_outcome") or {}
+        if (
+            stop_outcome
+            and params.get("charger_type", "tesla") == "tesla"
+            and current_vehicle_power_available
+            and observed_current_power_kw <= _ACTIVE_EV_POWER_EPSILON_KW
+            and current_vehicle_charging_state in _TESLA_NON_CHARGING_STATES
+            and not restart_telemetry_pending
+            and _datetime_is_after(
+                current_vehicle_charging_state_changed_at,
+                stop_outcome.get("requested_at"),
+            )
+        ):
+            # Independent readback settles the physical state without claiming
+            # that the earlier failed/unconfirmed request caused the stop.
+            state.pop("stop_outcome", None)
+            state.pop("_battery_floor_stop_retry_at", None)
+            state["current_amps"] = 0
+            state["target_amps"] = 0
+            return
+        if state.get("current_amps", 0) <= 0 and not stop_outcome:
+            return
+        if (
+            stop_outcome.get("battery_floor")
+            and time.monotonic() < state.get("_battery_floor_stop_retry_at", 0)
+        ):
+            return
+
+        state["target_amps"] = 0
+        state["stop_outcome"] = {
+            "status": "pending",
+            "requested_at": datetime.now(dt_timezone.utc),
+            "reason": "Battery floor stop requested; awaiting result",
+            "battery_floor": True,
+        }
+        # Keep retries slower than the BLE update loop and preserve the
+        # actuator's own wake/backoff gates.
+        state["_battery_floor_stop_retry_at"] = (
+            time.monotonic() + _BATTERY_FLOOR_STOP_RETRY_SECONDS
+        )
+        success = await _set_vehicle_amps(hass, config_entry, vehicle_id, 0, params)
+        if _session_was_replaced("battery-floor stop"):
+            return
+        record_ev_command(
+            hass, config_entry, vehicle_id, command="stop",
+            success=bool(success), reason=state.get("paused_reason"),
+        )
+        if success:
+            state.pop("stop_outcome", None)
+            state.pop("_battery_floor_stop_retry_at", None)
+            state["current_amps"] = 0
+        else:
+            state["stop_outcome"].update(
+                status="unconfirmed" if success is None else "failed",
+                reason=(
+                    "Battery floor stop unconfirmed; retry pending"
+                    if success is None
+                    else "Battery floor stop unsuccessful; retry pending"
+                ),
+            )
+
     # Calculate available surplus after the household buffer and any configured
     # parallel battery reserve.
     raw_surplus_kw = _calculate_solar_surplus(
@@ -10149,10 +10211,7 @@ async def _dynamic_ev_update_surplus(
                 state["paused"] = True
                 state["paused_reason"] = f"Strict surplus paused - {unsafe_reason}"
                 _LOGGER.info(f"⚡ Solar surplus EV: {state['paused_reason']}")
-            await _set_vehicle_amps(hass, config_entry, vehicle_id, 0, params)
-            if _session_was_replaced("strict-surplus pause"):
-                return
-            state["current_amps"] = 0
+            await _request_battery_floor_stop()
             return
 
     # Don't start charging until battery reaches min_soc (unless strict solar surplus is available)
@@ -10203,15 +10262,15 @@ async def _dynamic_ev_update_surplus(
                 state["paused_reason"] = None
         else:
             # Normal mode: pause below pause_soc threshold
-            if not state.get("paused"):
+            newly_paused = not state.get("paused")
+            if newly_paused:
                 state["paused"] = True
                 state["paused_reason"] = f"Battery dropped to {battery_soc:.0f}% (pause threshold: {pause_soc}%)"
                 _LOGGER.info(f"⚡ Solar surplus EV: Pausing - {state['paused_reason']}")
-                await _set_vehicle_amps(hass, config_entry, vehicle_id, 0, params)
-                if _session_was_replaced("battery-floor pause"):
-                    return
-                state["current_amps"] = 0
-
+            await _request_battery_floor_stop()
+            if _session_was_replaced("battery-floor pause"):
+                return
+            if newly_paused:
                 # Send pause notification
                 notify_on_error = params.get("notify_on_error", True)
                 if notify_on_error:
@@ -10224,7 +10283,8 @@ async def _dynamic_ev_update_surplus(
                         await _send_expo_push(
                             hass,
                             "EV Charging",
-                            f"{vehicle_name} paused - battery low ({battery_soc:.0f}%)"
+                            f"{vehicle_name} {'stop pending' if state.get('stop_outcome') else 'paused'} "
+                            f"- battery low ({battery_soc:.0f}%)"
                         )
                     except Exception as e:
                         _LOGGER.debug(f"Could not send pause notification: {e}")
@@ -10288,6 +10348,8 @@ async def _dynamic_ev_update_surplus(
             # A paused session must not fall through to the surplus allocator.
             # Otherwise sustained solar can issue a new current/start command
             # while the battery is still below its resume threshold.
+            if (state.get("stop_outcome") or {}).get("battery_floor"):
+                await _request_battery_floor_stop()
             return
 
     # Calculate current EV power for THIS vehicle. Prefer measured charger

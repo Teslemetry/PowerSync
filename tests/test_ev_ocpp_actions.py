@@ -12913,6 +12913,149 @@ def test_surplus_stop_outcome_lifecycle(monkeypatch, recovery):
     assert state["current_amps"] == 5
 
 
+@pytest.mark.parametrize("parallel", [False, True])
+@pytest.mark.parametrize("outcome", [False, None])
+@pytest.mark.parametrize("charger_type", ["tesla", "ocpp", "generic"])
+def test_battery_floor_stop_retains_failed_command_and_retries(monkeypatch, parallel, outcome, charger_type):
+    """Discord #364: a floor pause cannot turn a failed Tesla stop into 0 A."""
+    from power_sync.automations.loadpoint_status import build_loadpoint_status
+
+    hass = _Hass([])
+    state = _solar_surplus_state(current_amps=5)
+    state["params"].update(
+        min_battery_soc=80, pause_below_soc=70,
+        allow_parallel_charging=parallel, notify_on_error=False,
+        charger_type=charger_type,
+    )
+    actions._dynamic_ev_state.clear()
+    actions._dynamic_ev_state["entry-1"] = {"ble_car": state}
+    _install_solar_surplus_runtime_stubs(monkeypatch, {
+        "battery_soc": 46, "grid_power": 0, "battery_power": 2400,
+        "solar_power": 0, "load_power": 2400,
+    })
+    stop = AsyncMock(return_value=outcome)
+    monkeypatch.setattr(actions, "_set_vehicle_amps", stop)
+
+    def tick():
+        asyncio.run(actions._dynamic_ev_update_surplus(hass, _Entry(), "entry-1", "ble_car"))
+
+    tick()
+    row = build_loadpoint_status({"ble_car": state})[0]
+    assert state["current_amps"] == 5
+    assert row["target_amps"] == 0
+    assert row["commanded_power_kw"] == 1.2
+    assert row["stop_outcome"]["status"] == ("failed" if outcome is False else "unconfirmed")
+    assert "retry" in row["blocking_reason"].lower()
+    assert row["delay_timer"] is None
+    tick()
+    assert stop.await_count == 1  # No repeated write on the next BLE tick.
+    state["_battery_floor_stop_retry_at"] = 0
+    tick()
+    assert stop.await_count == 2
+    stop.return_value = True
+    state["_battery_floor_stop_retry_at"] = 0
+    tick()
+    assert state["current_amps"] == 0
+    assert state.get("stop_outcome") is None
+    tick()
+    assert stop.await_count == 3
+
+
+def test_battery_floor_stop_keeps_retrying_between_pause_and_resume_thresholds(monkeypatch):
+    hass = _Hass([])
+    state = _solar_surplus_state(current_amps=5)
+    state["params"].update(min_battery_soc=80, pause_below_soc=70, notify_on_error=False)
+    actions._dynamic_ev_state.clear()
+    actions._dynamic_ev_state["entry-1"] = {"ble_car": state}
+    live = {
+        "battery_soc": 46, "grid_power": 0, "battery_power": 2400,
+        "solar_power": 0, "load_power": 2400,
+    }
+    _install_solar_surplus_runtime_stubs(monkeypatch, live)
+    stop = AsyncMock(return_value=False)
+    monkeypatch.setattr(actions, "_set_vehicle_amps", stop)
+    asyncio.run(actions._dynamic_ev_update_surplus(hass, _Entry(), "entry-1", "ble_car"))
+    live["battery_soc"] = 75
+    state["_battery_floor_stop_retry_at"] = 0
+    asyncio.run(actions._dynamic_ev_update_surplus(hass, _Entry(), "entry-1", "ble_car"))
+    assert stop.await_count == 2
+    assert all(call.args[3] == 0 for call in stop.await_args_list)
+    assert state["current_amps"] == 5
+
+
+@pytest.mark.parametrize("observation", [
+    "fresh_own", "stale_own", "fresh_other", "still_charging", "stale_power", "positive_power",
+])
+def test_battery_floor_stop_reconciles_only_new_same_vehicle_readback(monkeypatch, observation):
+    now = datetime.now(timezone.utc)
+    charging = _State("sensor.car_charging_state", "stopped")
+    charging.last_changed = now if observation != "stale_own" else now - timedelta(hours=1)
+    if observation == "fresh_other":
+        charging.entity_id = "sensor.other_charging_state"
+    if observation == "still_charging":
+        charging.state = "charging"
+    hass = _Hass([
+        charging,
+        _State(
+            "sensor.car_power", "1200" if observation == "positive_power" else "0",
+            {"unit_of_measurement": "W"},
+            last_updated=now - timedelta(hours=1) if observation == "stale_power" else now,
+        ),
+    ])
+    state = _solar_surplus_state(current_amps=5)
+    state.update(paused=True, stop_outcome={
+        "status": "unconfirmed", "requested_at": now - timedelta(minutes=1),
+        "reason": "Stop unconfirmed; retry pending", "battery_floor": True,
+    }, _battery_floor_stop_retry_at=float("inf"))
+    state["params"].update(
+        min_battery_soc=80, pause_below_soc=70, vehicle_vin="ble_car",
+        charger_power_entity="sensor.car_power", notify_on_error=False,
+    )
+    actions._dynamic_ev_state.clear()
+    actions._dynamic_ev_state["entry-1"] = {"ble_car": state}
+    _install_solar_surplus_runtime_stubs(monkeypatch, {
+        "battery_soc": 46, "grid_power": 0, "battery_power": 2400,
+        "solar_power": 0, "load_power": 2400,
+    })
+    stop = AsyncMock(return_value=False)
+    monkeypatch.setattr(actions, "_set_vehicle_amps", stop)
+    asyncio.run(actions._dynamic_ev_update_surplus(hass, _Entry(), "entry-1", "ble_car"))
+    if observation == "fresh_own":
+        assert state.get("stop_outcome") is None
+        assert state["current_amps"] == 0
+    else:
+        assert state["stop_outcome"]["status"] == "unconfirmed"
+        assert state["current_amps"] == 5
+    stop.assert_not_awaited()
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+def test_battery_floor_stop_does_not_settle_a_replacement_session(monkeypatch, parallel):
+    hass = _Hass([])
+    state = _solar_surplus_state(current_amps=5)
+    state["params"].update(
+        min_battery_soc=80, pause_below_soc=70,
+        allow_parallel_charging=parallel, notify_on_error=False,
+    )
+    replacement = _solar_surplus_state(current_amps=16)
+    actions._dynamic_ev_state.clear()
+    actions._dynamic_ev_state["entry-1"] = {"ble_car": state}
+    _install_solar_surplus_runtime_stubs(monkeypatch, {
+        "battery_soc": 46, "grid_power": 0, "battery_power": 2400,
+        "solar_power": 0, "load_power": 2400,
+    })
+
+    async def stop(*args):
+        actions._dynamic_ev_state["entry-1"]["ble_car"] = replacement
+        return True
+
+    monkeypatch.setattr(actions, "_set_vehicle_amps", stop)
+    asyncio.run(actions._dynamic_ev_update_surplus(hass, _Entry(), "entry-1", "ble_car"))
+    assert replacement["current_amps"] == replacement["target_amps"] == 16
+    assert replacement.get("stop_outcome") is None
+    assert state["current_amps"] == 5
+
+
 @pytest.mark.parametrize("confirmation", ["fresh_own", "stale_own", "fresh_other"])
 def test_ble_stop_confirmation_stays_prefix_and_timestamp_scoped(monkeypatch, confirmation):
     monkeypatch.setattr(actions, "_wake_tesla_ble", AsyncMock(return_value=True))
