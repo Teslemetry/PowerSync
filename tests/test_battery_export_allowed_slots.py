@@ -4351,6 +4351,49 @@ def test_persistent_provenance_restores_after_midnight_and_blends_cost(opt_modul
     )
 
 
+def test_persistent_all_solar_inventory_preserves_known_zero_for_fallback(
+    opt_module,
+):
+    """A persisted solar-only battery at the reported SOC remains known-free."""
+    coordinator = _provenance_coordinator(opt_module)
+    coordinator._battery_provenance_available = True
+    coordinator._battery_provenance_solar_kwh = 8.505
+    coordinator._battery_provenance_grid_kwh = 0.0
+    coordinator._battery_provenance_grid_cost = 0.0
+    coordinator._battery_provenance_unknown_kwh = 0.0
+
+    acquisition_cost = coordinator._acquisition_cost_for_run(
+        import_prices=[0.43] * 24 + [0.05] * 24,
+        current_soc=0.63,
+        capacity_wh=13_500,
+    )
+
+    assert acquisition_cost == pytest.approx(0.0)
+    assert coordinator._last_acquisition_cost_known_zero is True
+    assert coordinator._last_acquisition_cost_diagnostics["known_zero_cost"] is True
+
+
+def test_persistent_zero_cost_grid_inventory_preserves_known_zero_for_fallback(
+    opt_module,
+):
+    """A persisted free-grid inventory is also explicitly known-free."""
+    coordinator = _provenance_coordinator(opt_module)
+    coordinator._battery_provenance_available = True
+    coordinator._battery_provenance_solar_kwh = 0.0
+    coordinator._battery_provenance_grid_kwh = 8.505
+    coordinator._battery_provenance_grid_cost = 0.0
+    coordinator._battery_provenance_unknown_kwh = 0.0
+
+    acquisition_cost = coordinator._acquisition_cost_for_run(
+        import_prices=[0.43] * 24 + [0.05] * 24,
+        current_soc=0.63,
+        capacity_wh=13_500,
+    )
+
+    assert acquisition_cost == pytest.approx(0.0)
+    assert coordinator._last_acquisition_cost_known_zero is True
+
+
 def test_persistent_provenance_discharge_reduces_energy_and_grid_cost_proportionally(
     opt_module,
 ):

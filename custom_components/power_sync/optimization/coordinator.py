@@ -6246,6 +6246,9 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             proven_solar_kwh = float(
                 components.get("proven_solar_kwh", 0.0) or 0.0
             )
+            proven_free_grid_kwh = float(
+                components.get("proven_free_grid_kwh", 0.0) or 0.0
+            )
             measured_grid_kwh = float(
                 components.get("measured_grid_kwh", 0.0) or 0.0
             )
@@ -6254,6 +6257,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 and unknown_carry_over_kwh <= 1e-6
                 and (
                     proven_solar_kwh > 1e-6
+                    or proven_free_grid_kwh > 1e-6
                     or (
                         measured_grid_kwh > 1e-6
                         and measured_grid_unit_cost is not None
@@ -6378,6 +6382,12 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     persistent_grid_cost=persistent_grid_cost,
                     persistent_unknown_kwh=unknown_kwh,
                     persistent_total_kwh=persistent_total_kwh,
+                    proven_solar_kwh=solar_kwh,
+                    proven_free_grid_kwh=(
+                        persistent_grid_kwh
+                        if persistent_grid_cost <= 1e-9
+                        else 0.0
+                    ),
                 )
 
         if tracking_known:
