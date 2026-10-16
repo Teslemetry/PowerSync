@@ -8669,8 +8669,13 @@ class BatteryOptimizer:
                 # exactly where a discharge-to-floor then same-price recharge
                 # happens.
                 economic_hold = soc > self.backup_reserve
+                # Disable Idle is a command policy, so its effective
+                # self-consumption must be included in the projected SOC
+                # trajectory. An IDLE hold cannot make a deadline feasible
+                # when runtime will replace that hold with self-consumption.
                 preserve_charge_by_time_hold = (
-                    _charge_by_time_hold_required(t, soc)
+                    not disable_idle
+                    and _charge_by_time_hold_required(t, soc)
                 )
                 preserve_recovery_hold = (
                     not disable_idle

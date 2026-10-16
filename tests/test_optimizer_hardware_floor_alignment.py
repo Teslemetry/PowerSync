@@ -1160,7 +1160,7 @@ def test_disable_idle_preserves_already_satisfied_charge_by_time_constraint(
     battery_optimizer_module,
     monkeypatch,
 ):
-    """Disable Idle must not spend SOC reserved for an explicit deadline."""
+    """Disable Idle must not certify an idle-dependent deadline."""
     module = battery_optimizer_module
     _select_backend(module, monkeypatch, "highs")
     optimizer = _optimizer(
@@ -1186,13 +1186,14 @@ def test_disable_idle_preserves_already_satisfied_charge_by_time_constraint(
     )
 
     assert result.solver_used == "highs"
-    assert result.feasible is True
-    assert result.lp_stats["mode_converged"] is True
+    assert result.feasible is False
+    assert result.lp_stats["mode_converged"] is False
     assert [action.action for action in result.schedule.actions] == [
-        "idle",
-        "idle",
+        "self_consumption",
+        "self_consumption",
         "self_consumption",
     ]
+    assert result.lp_stats["deadline_unmet_after_mode_projection"] is True
     assert all(
         action.battery_charge_w == pytest.approx(0.0)
         for action in result.schedule.actions
@@ -1273,17 +1274,17 @@ def test_disable_idle_deadline_reachability_respects_grid_charge_soc_cap(
     assert result.solver_used == "highs"
     assert result.feasible is True
     assert result.lp_stats["mode_converged"] is True
-    assert result.schedule.actions[0].action == "idle"
-    assert result.schedule.actions[0].battery_discharge_w == pytest.approx(0.0)
+    assert result.schedule.actions[0].action == "self_consumption"
+    assert result.schedule.actions[0].battery_discharge_w == pytest.approx(1000.0)
     assert result.schedule.actions[1].soc <= 0.5001
 
 
-def test_disable_idle_preserves_deadline_after_last_charge(
+def test_disable_idle_reports_deadline_missed_after_last_charge(
     battery_optimizer_module,
     monkeypatch,
     caplog,
 ):
-    """A deadline hold remains visible after the last permitted charge slot."""
+    """No Idle reports a deadline missed after its last permitted charge slot."""
     module = battery_optimizer_module
     _select_backend(module, monkeypatch, "highs")
     optimizer = _optimizer(
@@ -1309,14 +1310,14 @@ def test_disable_idle_preserves_deadline_after_last_charge(
     )
 
     assert result.solver_used == "highs"
-    assert result.feasible is True
-    assert result.lp_stats["mode_converged"] is True
+    assert result.feasible is False
+    assert result.lp_stats["mode_converged"] is False
     assert result.schedule.actions[0].action == "charge"
-    assert result.schedule.actions[2].action == "idle"
-    assert result.schedule.actions[2].battery_discharge_w == pytest.approx(0.0)
-    assert result.schedule.actions[2].soc >= 0.595
-    assert result.grid_import_w[2] == pytest.approx(1000.0)
-    assert not any(
+    assert result.schedule.actions[2].action == "self_consumption"
+    assert result.schedule.actions[2].battery_discharge_w == pytest.approx(1000.0)
+    assert result.schedule.actions[2].soc == pytest.approx(0.50, abs=1e-6)
+    assert result.grid_import_w[2] == pytest.approx(0.0)
+    assert any(
         "using the previous physically projected HiGHS plan" in message
         for message in caplog.messages
     )
@@ -1325,6 +1326,52 @@ def test_disable_idle_preserves_deadline_after_last_charge(
         or message.startswith("LP infeasible — holding in self-consumption")
         for message in caplog.messages
     )
+
+
+@pytest.mark.parametrize("cost_neutral_enabled", [False, True])
+def test_disable_idle_deadline_projection_uses_effective_runtime_action(
+    battery_optimizer_module,
+    monkeypatch,
+    cost_neutral_enabled,
+):
+    """The reported five-minute deadline variant must not retain an idle hold."""
+    module = battery_optimizer_module
+    _select_backend(module, monkeypatch, "highs")
+    optimizer = module.BatteryOptimizer(
+        capacity_wh=24_180,
+        max_charge_w=12_600,
+        max_discharge_w=14_400,
+        efficiency=0.95,
+        backup_reserve=0.05,
+        hardware_reserve=0.05,
+        interval_minutes=5,
+        horizon_hours=2 / 12,
+        terminal_weight=0.0,
+    )
+    optimizer.pre_window_slot = 2
+    optimizer.pre_window_soc_target = 1.0
+
+    result = optimizer.optimize(
+        import_prices=[0.10, 0.10],
+        export_prices=[0.0, 0.0],
+        solar_forecast=[0.0, 0.0],
+        load_forecast=[1.49, 1.49],
+        current_soc=1.0,
+        allow_battery_export=[False, False],
+        allow_grid_charge=True,
+        disable_idle=True,
+        cost_neutral_earnings_cap=(3.7987 if cost_neutral_enabled else None),
+        cost_neutral_slots=[cost_neutral_enabled] * 2,
+    )
+
+    assert result.solver_used == "highs"
+    assert result.feasible is False
+    assert [action.action for action in result.schedule.actions] == [
+        "self_consumption",
+        "self_consumption",
+    ]
+    assert result.lp_stats["deadline_unmet_after_mode_projection"] is True
+    assert result.schedule.actions[-1].soc < 0.995
 
 
 def test_primary_infeasible_solve_still_logs_selected_safe_hold(
