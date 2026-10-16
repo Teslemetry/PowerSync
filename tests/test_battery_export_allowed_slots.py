@@ -5945,6 +5945,29 @@ def test_api_external_self_consumption_overrides_planned_charge_status(
     assert data["current_power_w"] == -838
     assert data["actual_battery_power_w"] == -838
 
+    # A manual takeover is still the effective status after the optimizer
+    # relinquishes its cached plan.  Exercise both cleared-plan shapes seen in
+    # runtime state: None and an empty schedule object.
+    for empty_schedule in (
+        None,
+        SimpleNamespace(
+            actions=[],
+            to_api_response=lambda: {
+                "timestamps": [],
+                "soc": [],
+                "actions": [],
+            },
+        ),
+    ):
+        coordinator._current_schedule = empty_schedule
+        data = coordinator.get_api_data()
+
+        assert data["planned_current_action"] == "idle"
+        assert data["planned_current_power_w"] == -838
+        assert data["effective_current_action"] == "self_consumption"
+        assert data["current_action"] == "self_consumption"
+        assert data["current_power_w"] == -838
+
 
 @pytest.mark.parametrize("planned_action", ["charge", "export"])
 @pytest.mark.parametrize(

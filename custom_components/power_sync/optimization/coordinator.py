@@ -19972,6 +19972,15 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         next_action_time = None
         next_action_power_w = 0
         ca = None
+        force_state = self._get_active_force_state()
+        force_type = force_state.get("type") if force_state.get("active") else None
+        if force_type == "self_consumption":
+            # A user-owned override remains the effective action while a solve is
+            # unavailable or its cached plan has been cleared.  Planned fields
+            # stay at their independent default until a schedule is available.
+            effective_current_action = "self_consumption"
+            current_action = effective_current_action
+            current_power_w = actual_battery_power_w
 
         if self._current_schedule and self._current_schedule.actions:
             ca = self._get_current_action()
@@ -19980,8 +19989,6 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 current_power_w = ca.power_w
                 planned_current_action = current_action
                 planned_current_power_w = current_power_w
-                force_state = self._get_active_force_state()
-                force_type = force_state.get("type") if force_state.get("active") else None
                 last_executed_action = getattr(self, "_last_executed_action", None)
                 last_executed_planned_action = getattr(
                     self,
