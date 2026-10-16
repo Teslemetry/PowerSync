@@ -823,20 +823,22 @@ def test_tesla_tou_upload_waits_for_site_info_readback():
     tree = ast.parse(source)
     function = _find_function(tree, "send_tariff_to_tesla")
     confirm = _find_function(tree, "_confirm_tesla_tariff_uploaded")
-    matcher = _find_function(tree, "_tesla_tariff_matches_readback")
+    status = _find_function(tree, "_tesla_tariff_readback_status")
     function_source = ast.get_source_segment(source, function)
     confirm_source = ast.get_source_segment(source, confirm)
-    matcher_source = ast.get_source_segment(source, matcher)
+    status_source = ast.get_source_segment(source, status)
 
     assert function_source is not None
     assert confirm_source is not None
-    assert matcher_source is not None
+    assert status_source is not None
     assert "confirm_readback: bool = True" in function_source
     assert "await _confirm_tesla_tariff_uploaded(" in function_source
     assert "site_info" in confirm_source
     assert "_extract_tesla_tariff_content(site_info)" in confirm_source
-    assert "_tesla_tariff_matches_readback(tariff_data, observed)" in confirm_source
-    assert "_tariff_charge_rates(expected, sell=False)" in matcher_source
+    assert "_tesla_tariff_readback_status(tariff_data, observed)" in confirm_source
+    assert "_tesla_tariff_rate_maps_match" in status_source
+    assert "_tariff_charge_rates(expected, sell=False)" in status_source
+    assert "TESLA_TOU_READBACK_ZERO_NORMALIZED" in status_source
 
 
 def test_tesla_tou_readback_uses_deadline_safe_eventual_consistency_window():
@@ -931,9 +933,11 @@ def test_tesla_tou_readback_accepts_delayed_match_without_reupload():
             site_info.get("tariff_content_v2")
             or site_info.get("tariff_content")
         ),
-        "_tesla_tariff_matches_readback": lambda expected, observed: (
-            expected == observed
+        "_tesla_tariff_readback_status": lambda expected, observed: (
+            "exact" if expected == observed else None
         ),
+        "TESLA_TOU_READBACK_EXACT": "exact",
+        "TESLA_TOU_READBACK_ZERO_NORMALIZED": "tesla_zero_normalized",
     }
     extracted = ast.Module(
         body=[
@@ -960,6 +964,7 @@ def test_tesla_tou_readback_accepts_delayed_match_without_reupload():
         ]
     )
 
+    readback_status = {}
     confirmed = asyncio.run(
         namespace["_confirm_tesla_tariff_uploaded"](
             session,
@@ -967,6 +972,7 @@ def test_tesla_tou_readback_accepts_delayed_match_without_reupload():
             "site",
             {"Authorization": "redacted"},
             tariff,
+            readback_status=readback_status,
         )
     )
 
@@ -974,6 +980,7 @@ def test_tesla_tou_readback_accepts_delayed_match_without_reupload():
     assert len(session.calls) == 6
     assert clock.now == 25.0
     assert [call[2] for call in session.calls] == [5.0] * 6
+    assert readback_status == {"status": "exact"}
 
 
 def test_tesla_force_charge_exposes_optional_optimizer_result():
@@ -1121,7 +1128,22 @@ def test_tesla_tou_upload_reports_accepted_before_readback_failure():
     assert function_source.index('accepted_status["accepted"] = True') < function_source.index(
         "await _confirm_tesla_tariff_uploaded("
     )
+    assert "Tesla accepted TOU schedule; awaiting site_info readback" in function_source
+    assert "readback_status: dict[str, str] | None = None" in function_source
     assert function_source.index("site_info did not confirm") < function_source.index("return False")
+
+
+def test_tesla_tou_sync_labels_zero_normalized_readback_without_rewriting_local_rates():
+    source = INIT_PATH.read_text()
+    tree = ast.parse(source)
+    sync = _find_function(tree, "_handle_sync_tou_internal")
+    sync_source = ast.get_source_segment(source, sync)
+
+    assert sync_source is not None
+    assert "normalized_sites: list[str] = []" in sync_source
+    assert "readback_status=site_readback_status" in sync_source
+    assert "TESLA_TOU_READBACK_ZERO_NORMALIZED" in sync_source
+    assert "local signed rates remain unchanged" in sync_source
 
 
 def test_optimizer_restore_keeps_tesla_self_consumption_during_handoff():

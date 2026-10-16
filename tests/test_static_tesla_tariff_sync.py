@@ -429,6 +429,8 @@ def _readback_helpers() -> dict[str, object]:
         "_tariff_charge_rates_by_season",
         "_strict_static_tariff_rates_by_season",
         "_tariff_charge_rates",
+        "_tesla_tariff_rate_maps_match",
+        "_tesla_tariff_readback_status",
         "_tesla_tariff_matches_readback",
     }
     nodes = [
@@ -436,7 +438,12 @@ def _readback_helpers() -> dict[str, object]:
         for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in wanted
     ]
-    namespace: dict[str, object] = {"Any": Any, "math": math}
+    namespace: dict[str, object] = {
+        "Any": Any,
+        "math": math,
+        "TESLA_TOU_READBACK_EXACT": "exact",
+        "TESLA_TOU_READBACK_ZERO_NORMALIZED": "tesla_zero_normalized",
+    }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "__init__.py", "exec"), namespace)
     return namespace
 
@@ -524,6 +531,45 @@ def test_dynamic_readback_still_accepts_missing_all_sentinel_season():
     observed["energy_charges"].pop("ALL")
     observed["sell_tariff"]["energy_charges"].pop("ALL")
     assert matches(expected, observed)
+
+
+def test_dynamic_readback_identifies_tesla_zero_normalized_negative_rates():
+    helpers = _readback_helpers()
+    matches = helpers["_tesla_tariff_matches_readback"]
+    status = helpers["_tesla_tariff_readback_status"]
+    expected = {
+        "code": "POWER_SYNC:AMBER",
+        "energy_charges": {
+            "Summer": {
+                "rates": {
+                    "PERIOD_12_00": -0.0123,
+                    "PERIOD_18_00": 0.0461,
+                }
+            }
+        },
+        "sell_tariff": {
+            "energy_charges": {
+                "Summer": {
+                    "rates": {
+                        "PERIOD_12_00": -0.0050,
+                        "PERIOD_18_00": 0.1672,
+                    }
+                }
+            }
+        },
+    }
+    observed = copy.deepcopy(expected)
+    observed["energy_charges"]["Summer"]["rates"]["PERIOD_12_00"] = 0.0
+    observed["sell_tariff"]["energy_charges"]["Summer"]["rates"]["PERIOD_12_00"] = 0.0
+
+    assert matches(expected, observed)
+    assert status(expected, observed) == "tesla_zero_normalized"
+    assert status(expected, expected) == "exact"
+
+    positive_mismatch = copy.deepcopy(expected)
+    positive_mismatch["energy_charges"]["Summer"]["rates"]["PERIOD_18_00"] = 0.0
+    assert not matches(expected, positive_mismatch)
+    assert status(expected, positive_mismatch) is None
 
 
 def test_static_manual_branch_uses_normalized_payload_only_for_tesla_upload():

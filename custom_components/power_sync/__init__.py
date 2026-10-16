@@ -44,6 +44,8 @@ DISCREPANCY_ALERT_COOLDOWN = timedelta(minutes=30)
 DISCREPANCY_ALERT_DAILY_MAX = 4
 AEMO_SETTLED_SYNC_DELAY_SECONDS = 5.0
 DEMAND_GRID_CHARGING_MAX_RESTORE_ATTEMPTS = 3
+TESLA_TOU_READBACK_EXACT = "exact"
+TESLA_TOU_READBACK_ZERO_NORMALIZED = "tesla_zero_normalized"
 
 
 async def _tesla_grid_export_write_result(
@@ -5545,13 +5547,33 @@ def _tariff_charge_rates(tariff: dict[str, Any] | None, *, sell: bool) -> dict[s
     return _normalise_tariff_rate_map(summer)
 
 
-def _tesla_tariff_matches_readback(
+def _tesla_tariff_rate_maps_match(
+    expected: dict[str, float],
+    observed: dict[str, float],
+) -> tuple[bool, bool]:
+    """Compare rates, allowing Tesla's documented negative-to-zero conversion."""
+    if set(expected) != set(observed):
+        return False, False
+
+    zero_normalized = False
+    for period, expected_value in expected.items():
+        observed_value = observed[period]
+        if expected_value == observed_value:
+            continue
+        if expected_value < 0 and observed_value == 0:
+            zero_normalized = True
+            continue
+        return False, False
+    return True, zero_normalized
+
+
+def _tesla_tariff_readback_status(
     expected: dict[str, Any],
     observed: dict[str, Any] | None,
-) -> bool:
-    """Return True when site_info reflects the tariff we just uploaded."""
+) -> str | None:
+    """Return the verified Tesla representation, or ``None`` on mismatch."""
     if not isinstance(observed, dict):
-        return False
+        return None
 
     # Static custom payloads carry a stable marker and must verify every
     # non-empty buy and sell season. This prevents a correct All Year map from
@@ -5561,23 +5583,45 @@ def _tesla_tariff_matches_readback(
         observed_buy_by_season = _strict_static_tariff_rates_by_season(observed, sell=False)
         expected_sell_by_season = _strict_static_tariff_rates_by_season(expected, sell=True)
         observed_sell_by_season = _strict_static_tariff_rates_by_season(observed, sell=True)
-        return bool(expected_buy_by_season) and bool(expected_sell_by_season) and (
-            observed_buy_by_season is not None
+        if (
+            bool(expected_buy_by_season)
+            and bool(expected_sell_by_season)
+            and observed_buy_by_season is not None
             and observed_sell_by_season is not None
             and expected_buy_by_season == observed_buy_by_season
             and expected_sell_by_season == observed_sell_by_season
-        )
+        ):
+            return TESLA_TOU_READBACK_EXACT
+        return None
 
     # Dynamic payloads retain the original preferred-Summer comparison and
     # optional-sell semantics. Tesla may omit its sentinel ALL season on readback.
     expected_buy = _tariff_charge_rates(expected, sell=False)
     observed_buy = _tariff_charge_rates(observed, sell=False)
     if expected_buy and observed_buy:
-        if expected_buy != observed_buy:
-            return False
+        buy_matches, buy_zero_normalized = _tesla_tariff_rate_maps_match(
+            expected_buy, observed_buy
+        )
+        if not buy_matches:
+            return None
+
         expected_sell = _tariff_charge_rates(expected, sell=True)
         observed_sell = _tariff_charge_rates(observed, sell=True)
-        return not expected_sell or not observed_sell or expected_sell == observed_sell
+        if not expected_sell or not observed_sell:
+            return (
+                TESLA_TOU_READBACK_ZERO_NORMALIZED
+                if buy_zero_normalized
+                else TESLA_TOU_READBACK_EXACT
+            )
+
+        sell_matches, sell_zero_normalized = _tesla_tariff_rate_maps_match(
+            expected_sell, observed_sell
+        )
+        if not sell_matches:
+            return None
+        if buy_zero_normalized or sell_zero_normalized:
+            return TESLA_TOU_READBACK_ZERO_NORMALIZED
+        return TESLA_TOU_READBACK_EXACT
 
     matched = 0
     for field in ("name", "utility", "code"):
@@ -5586,9 +5630,17 @@ def _tesla_tariff_matches_readback(
         if expected_value is None or observed_value is None:
             continue
         if str(expected_value) != str(observed_value):
-            return False
+            return None
         matched += 1
-    return matched > 0
+    return TESLA_TOU_READBACK_EXACT if matched > 0 else None
+
+
+def _tesla_tariff_matches_readback(
+    expected: dict[str, Any],
+    observed: dict[str, Any] | None,
+) -> bool:
+    """Return True when site_info reflects the tariff we just uploaded."""
+    return _tesla_tariff_readback_status(expected, observed) is not None
 
 
 async def _confirm_tesla_tariff_uploaded(
@@ -5600,6 +5652,7 @@ async def _confirm_tesla_tariff_uploaded(
     *,
     schedule_seconds: tuple[float, ...] = (0.0, 1.0, 3.0, 7.0, 15.0, 25.0),
     timeout_seconds: float = 30.0,
+    readback_status: dict[str, str] | None = None,
 ) -> bool:
     """Poll Tesla site_info within a bounded eventual-consistency window."""
     url = f"{api_base}/api/1/energy_sites/{site_id}/site_info"
@@ -5652,16 +5705,28 @@ async def _confirm_tesla_tariff_uploaded(
                 data = await response.json()
                 site_info = data.get("response", {})
                 observed = _extract_tesla_tariff_content(site_info)
-                if _tesla_tariff_matches_readback(tariff_data, observed):
+                status = _tesla_tariff_readback_status(tariff_data, observed)
+                if status is not None:
+                    if readback_status is not None:
+                        readback_status["status"] = status
                     elapsed_seconds = loop.time() - started_at
-                    _LOGGER.info(
-                        "Confirmed Tesla TOU tariff readback for site %s "
-                        "after %.1fs (attempt %d/%d)",
-                        site_id,
-                        elapsed_seconds,
-                        attempt,
-                        attempts,
-                    )
+                    if status == TESLA_TOU_READBACK_ZERO_NORMALIZED:
+                        _LOGGER.warning(
+                            "Confirmed Tesla TOU readback for site %s after %.1fs "
+                            "with Tesla zero-normalized non-positive rate(s) "
+                            "(signed local rates remain unchanged)",
+                            site_id,
+                            elapsed_seconds,
+                        )
+                    else:
+                        _LOGGER.info(
+                            "Confirmed Tesla TOU tariff readback for site %s "
+                            "after %.1fs (attempt %d/%d)",
+                            site_id,
+                            elapsed_seconds,
+                            attempt,
+                            attempts,
+                        )
                     return True
                 _LOGGER.debug(
                     "Tesla TOU readback for site %s did not match yet (attempt %d/%d)",
@@ -5691,6 +5756,7 @@ async def send_tariff_to_tesla(
     fleet_base_url: str | None = None,
     confirm_readback: bool = True,
     accepted_status: dict[str, bool] | None = None,
+    readback_status: dict[str, str] | None = None,
 ) -> bool:
     """Send tariff data to Tesla via the configured provider with retry logic.
 
@@ -5706,6 +5772,8 @@ async def send_tariff_to_tesla(
         confirm_readback: Confirm the uploaded tariff appears in site_info before returning success.
         accepted_status: Optional mutable status populated with ``accepted=True``
             after Tesla accepts the upload, even if readback confirmation fails.
+        readback_status: Optional mutable status populated with the confirmed
+            representation (``exact`` or ``tesla_zero_normalized``).
 
     Returns:
         True if successful, False otherwise
@@ -5802,7 +5870,8 @@ async def send_tariff_to_tesla(
                     if accepted_status is not None:
                         accepted_status["accepted"] = True
                     _LOGGER.info(
-                        "Successfully synced TOU schedule to Tesla (attempt %d/%d)",
+                        "Tesla accepted TOU schedule; awaiting site_info readback "
+                        "(attempt %d/%d)",
                         attempt + 1,
                         max_retries
                     )
@@ -5815,8 +5884,11 @@ async def send_tariff_to_tesla(
                         site_id,
                         headers,
                         tariff_data,
+                        readback_status=readback_status,
                     ):
                         return True
+                    if readback_status is not None:
+                        readback_status["status"] = "unconfirmed"
                     _LOGGER.error(
                         "TOU upload to Tesla was accepted but site_info did not confirm the tariff for site %s",
                         site_id,
@@ -27668,7 +27740,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             return
 
         success = True
+        normalized_sites: list[str] = []
         for site_id, s_token, s_provider in site_configs:
+            site_readback_status: dict[str, str] = {}
             site_success = await send_tariff_to_tesla(
                 hass,
                 site_id,
@@ -27676,15 +27750,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 s_token,
                 s_provider,
                 fleet_base_url=entry.data.get(CONF_FLEET_API_BASE_URL),
+                readback_status=site_readback_status,
             )
             if not site_success:
                 _LOGGER.error("Failed to sync TOU to Tesla site %s", site_id)
                 success = False
+            elif site_readback_status.get("status") == TESLA_TOU_READBACK_ZERO_NORMALIZED:
+                # This is a verified provider-applied representation, so the
+                # normal post-sync handling may continue. It does not rewrite
+                # the signed rates retained by local planning and display.
+                normalized_sites.append(site_id)
 
         if success:
             if _aemo_dispatch_entry_data() is None:
                 return
-            _LOGGER.info(f"TOU schedule synced to Tesla gateway ({sync_mode})")
+            if normalized_sites:
+                _LOGGER.warning(
+                    "TOU schedule was accepted and read back by Tesla with "
+                    "zero-normalized non-positive rate(s) for site(s) %s; "
+                    "local signed rates remain unchanged (%s)",
+                    ", ".join(normalized_sites),
+                    sync_mode,
+                )
+            else:
+                _LOGGER.info(f"TOU schedule synced to Tesla gateway ({sync_mode})")
 
             # --- Calibration detection helper ---
             def _record_mode_stick_failure(hass, entry_id):
