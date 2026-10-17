@@ -1,6 +1,6 @@
 # Stop solar during negative import prices
 
-Unreleased implementation for Home Assistant feature request #434. The policy is
+Available from PowerSync v2.12.1418 for Home Assistant. The policy is
 **off by default**. It stops PV generation when the customer's current retail
 import price is below zero, allowing existing household loads and permitted
 battery charging to use paid grid imports. Zero export is a different operation:
@@ -12,6 +12,17 @@ SOC limits, electrical limits and EV settings continue to determine consumption.
 The feature does not create extra loads or override those limits. Choosing to
 stop solar can forgo export income; this is an explicit import-price policy,
 not a calculation that selling solar is always less valuable.
+
+## Configuration fields
+
+| Setting | Use |
+| --- | --- |
+| Stop solar when the import price is negative | Opt in to stopping generation below zero retail import price. Off by default. |
+| PV production controls (optional with supported native inverter) | Select verified PV-only switches or production-limit numbers, or leave empty for a supported native control. |
+| These controls cover all solar generation | Enable only when every PV source is controlled, allowing the optimiser to plan without solar in negative-price intervals. |
+| Controlled solar production power sensor (optional) | Select power from the PV sources being controlled so fresh readings can confirm a production stop. |
+| Retail import price sensor (optional) | Supply a timestamped retail import interval when the provider cannot supply one directly. |
+| Grid connected sensor (optional for Tesla) | Required for non-Tesla systems. The selected sensor must provide fresh proof of utility-grid connection. |
 
 ## Controls and inverter coverage
 

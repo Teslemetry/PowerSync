@@ -9,18 +9,18 @@
   },
   "source_state": {
     "components": {
-      "config_flow.py": "4998f82517b16b91b8100dcb599c79d526119979980c7ee660f446e7d3c692e2",
+      "config_flow.py": "441f02d9326ff3b72aec6f2a4d159a39f4ea77bdff6968d3a133249437614bbc",
       "const.py": "9f9835e66191159c3963955bb4bb34570e984f29458c759e9bdc91cd4aba398c",
       "battery_backend/profiles.py": "d8d0631ab789653483f01a04ac1fab2f7245d2e8f164118be2297b36efab4ae5",
       "battery_backend/discovery.py": "3a8c88c00d6c57f6101d55056968524d7971d1ac3b8e16365923bca978f9489b",
       "settings_metadata.py": "7d942632666c27c60793ce26cc5bb0a783721a5347863aca4c5e4e8a5a18b0e7",
-      "strings.json": "8bd6a6b08071fcf4cd59881ada032d04771dd4e71f8ebfa764f5cf479633d604",
-      "translations/en.json": "3bb1598fc533539a4a6b2651f003eeee0c9f5cd031ecb2257b922cc0c4a9bb04",
+      "strings.json": "d1232fa9e35562d3cd74820ef27fbb4ab6670946b13bf1ea76161db57796e97b",
+      "translations/en.json": "7b10cc888f6ce7c279254bd19b2692dc0af0ffdbe427b006b23f5fbde9c17d97",
       "services.yaml": "44c376885c0d4877b8112cfee9b08ccc8a07064d5ecea8c12a67978221360121",
       "switch.py": "f52d03e794bdeaad0f0cf52053bcf6715edb644e371a2e6cd42e6c8abe9ece11",
       "select.py": "78e64714e13add7ee5fc36c475597e42be4fb241b7268fac5aff93203e9eb0eb",
       "number.py": "bfd496974b5e2a458ef00fc9e336b8c00fd73bd4a326b526d33d9ca50d8f2548",
-      "sensor.py": "24006ebbee1b2a78fa790f29e2860228a2284de72cbfce2cbec8d751af278630",
+      "sensor.py": "7d2f4f499e4ab5c74c7e2daafcfab0e446ea8c057825973023c69f77abae8505",
       "binary_sensor.py": "9c1c1517140c01e298e3aabb3bf095574ee1eb2b5525dcb2eaab4535f7021650",
       "button.py": "8648b1b520e66e583875e0e226e3bf7ac46f1d2a8be4c162c03e2abaaa3b435d",
       "automations/actions.py": "7f8122ad6600de8e93ae6bd8516f17cc6362875440b31298df0f3efbb22f7b6d",
@@ -589,9 +589,15 @@
       "options.curtailment_options.battery_curtailment_enabled": "Enable battery export curtailment",
       "options.curtailment_options.curtailment_control_in_monitoring_mode": "Allow curtailment control in Monitoring Mode",
       "options.curtailment_options.curtailment_export_threshold_cents": "Curtail below export earnings",
+      "options.curtailment_options.negative_import_solar_controls_all_pv": "These controls cover all solar generation",
+      "options.curtailment_options.negative_import_solar_enabled": "Stop solar when the import price is negative",
       "options.curtailment_options.openweathermap_api_key": "OpenWeatherMap API key",
       "options.curtailment_options.powerwall_offgrid_as_curtailment": "Enable Powerwall off-grid fallback",
       "options.curtailment_options.sigenergy_dc_curtailment_enabled": "Enable DC solar curtailment",
+      "options.curtailment_options.solar_production_control_entities": "PV production controls (optional with supported native inverter)",
+      "options.curtailment_options.solar_production_grid_connected_entity": "Grid connected sensor (optional for Tesla)",
+      "options.curtailment_options.solar_production_import_price_entity": "Retail import price sensor (optional)",
+      "options.curtailment_options.solar_production_power_entity": "Controlled solar production power sensor (optional)",
       "options.custom_battery.custom_battery_level_entity": "Battery level sensor",
       "options.custom_battery.custom_battery_power_entity": "Battery power sensor",
       "options.custom_battery.custom_grid_power_entity": "Grid power sensor",
@@ -8259,6 +8265,66 @@
       "source_line": 18433,
       "group": null,
       "rendering": "conditional union; see page availability notes"
+    },
+    {
+      "scope": "options",
+      "form": "curtailment_options",
+      "field": "negative_import_solar_enabled",
+      "label": "Stop solar when the import price is negative",
+      "page": "Negative-Import-Solar.md",
+      "source_line": 15282,
+      "group": null,
+      "rendering": "curtailment options; optional policy and PV-only control selection"
+    },
+    {
+      "scope": "options",
+      "form": "curtailment_options",
+      "field": "solar_production_control_entities",
+      "label": "PV production controls (optional with supported native inverter)",
+      "page": "Negative-Import-Solar.md",
+      "source_line": 15283,
+      "group": null,
+      "rendering": "curtailment options; optional policy and PV-only control selection"
+    },
+    {
+      "scope": "options",
+      "form": "curtailment_options",
+      "field": "negative_import_solar_controls_all_pv",
+      "label": "These controls cover all solar generation",
+      "page": "Negative-Import-Solar.md",
+      "source_line": 15284,
+      "group": null,
+      "rendering": "curtailment options; optional policy and PV-only control selection"
+    },
+    {
+      "scope": "options",
+      "form": "curtailment_options",
+      "field": "solar_production_power_entity",
+      "label": "Controlled solar production power sensor (optional)",
+      "page": "Negative-Import-Solar.md",
+      "source_line": 15286,
+      "group": null,
+      "rendering": "curtailment options; optional policy and PV-only control selection"
+    },
+    {
+      "scope": "options",
+      "form": "curtailment_options",
+      "field": "solar_production_import_price_entity",
+      "label": "Retail import price sensor (optional)",
+      "page": "Negative-Import-Solar.md",
+      "source_line": 15286,
+      "group": null,
+      "rendering": "curtailment options; optional policy and PV-only control selection"
+    },
+    {
+      "scope": "options",
+      "form": "curtailment_options",
+      "field": "solar_production_grid_connected_entity",
+      "label": "Grid connected sensor (optional for Tesla)",
+      "page": "Negative-Import-Solar.md",
+      "source_line": 15290,
+      "group": null,
+      "rendering": "curtailment options; optional policy and PV-only control selection"
     }
   ],
   "profiles": [
@@ -12186,6 +12252,30 @@
     },
     "options.zaptec_cloud_options.zaptec_username": {
       "page": "EV-Smart-Charging",
+      "status": "documented"
+    },
+    "options.curtailment_options.negative_import_solar_enabled": {
+      "page": "Negative-Import-Solar",
+      "status": "documented"
+    },
+    "options.curtailment_options.solar_production_control_entities": {
+      "page": "Negative-Import-Solar",
+      "status": "documented"
+    },
+    "options.curtailment_options.negative_import_solar_controls_all_pv": {
+      "page": "Negative-Import-Solar",
+      "status": "documented"
+    },
+    "options.curtailment_options.solar_production_power_entity": {
+      "page": "Negative-Import-Solar",
+      "status": "documented"
+    },
+    "options.curtailment_options.solar_production_import_price_entity": {
+      "page": "Negative-Import-Solar",
+      "status": "documented"
+    },
+    "options.curtailment_options.solar_production_grid_connected_entity": {
+      "page": "Negative-Import-Solar",
       "status": "documented"
     }
   }
