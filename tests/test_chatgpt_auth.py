@@ -875,6 +875,76 @@ def test_load_retry_keeps_dirty_reconnect_state_while_storage_is_unavailable():
     asyncio.run(run())
 
 
+def test_unused_chatgpt_load_does_not_require_a_storage_write(tmp_path):
+    async def run():
+        class Hass:
+            async def async_add_executor_job(self, function, *args):
+                return function(*args)
+
+        class DiskStore:
+            path = tmp_path / "credentials"
+
+            async def async_load(self):
+                return None
+
+            async def async_save(self, record):
+                pass  # HA's Store can swallow a write error.
+
+        session = Session()
+        store = DiskStore()
+        manager = auth.ChatGPTAuthManager(session, auth._PrivateCredentialStore(Hass(), store))
+        await manager.async_load()
+        await manager.async_load()
+        assert manager.status()["status"] == "disconnected"
+        assert not manager.status()["connected"]
+        assert not store.path.exists()
+        assert session.calls == []
+        with pytest.raises(auth.ChatGPTAuthError) as failure:
+            await manager.async_access_token()
+        assert failure.value.code == "not_connected"
+        # A sign-in must still durably save its host identity before contacting
+        # the provider or exposing a URL; an unused feature needs no such write.
+        with pytest.raises(auth.ChatGPTAuthError) as failure:
+            await manager.async_start_login("admin")
+        assert failure.value.code == "storage_unavailable"
+        assert manager.status()["pending"] is None
+        assert session.calls == []
+        await manager.async_shutdown()
+        assert not store.path.exists()
+
+    asyncio.run(run())
+
+
+def test_first_sign_in_persists_host_identity_after_startup_and_save_retry():
+    async def run():
+        class RecoverableStore(Store):
+            available = False
+
+            async def async_save(self, record):
+                if not self.available:
+                    raise OSError("SECRET-storage-details")
+                await super().async_save(record)
+
+        store, session = RecoverableStore(), Session()
+        manager = auth.ChatGPTAuthManager(session, store)
+        await manager.async_load()
+        assert store.record is None and store.saves == []
+        with pytest.raises(auth.ChatGPTAuthError) as failure:
+            await manager.async_start_login("admin")
+        assert failure.value.code == "storage_unavailable"
+        assert "SECRET" not in str(failure.value)
+        store.available = True
+        start = await manager.async_start_login("admin")
+        host_id = parse_qs(urlsplit(start["auth_url"]).query)["ext_agent_host_id"][0]
+        assert store.record["host_id"] == host_id
+        replacement = auth.ChatGPTAuthManager(session, store)
+        await replacement.async_load()
+        restarted = await replacement.async_start_login("admin")
+        assert parse_qs(urlsplit(restarted["auth_url"]).query)["ext_agent_host_id"] == [host_id]
+
+    asyncio.run(run())
+
+
 def test_private_store_rejects_silent_failure_and_unsafe_permissions(tmp_path):
     async def run():
         path = tmp_path / "credentials"

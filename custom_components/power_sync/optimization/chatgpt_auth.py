@@ -132,6 +132,11 @@ class ChatGPTAuthManager:
                 return
             saved = await self._store.async_load()
             self._record = saved if isinstance(saved, dict) else {}
+            if saved is None:
+                # An unused optional connection needs no registration or write.
+                # Create its durable host identity only when sign-in starts.
+                self._loaded = True
+                return
             host_id = self._record.get("host_id")
             if not isinstance(host_id, str) or not _valid_host_id(host_id):
                 self._record["host_id"] = f"urn:uuid:{uuid.uuid4()}"
@@ -267,6 +272,8 @@ class ChatGPTAuthManager:
             self.status()
             if self._pending and self._pending.owner_id != owner_id:
                 raise ChatGPTAuthError("login_owned", "Another administrator has a pending ChatGPT sign-in.", 409)
+            if "host_id" not in self._record:
+                await self._save({**self._record, "host_id": f"urn:uuid:{uuid.uuid4()}"})
             config = await self._configuration()
             pending = _PendingLogin(owner_id, secrets.token_urlsafe(32), secrets.token_urlsafe(32),
                                     secrets.token_urlsafe(32), secrets.token_urlsafe(32),
