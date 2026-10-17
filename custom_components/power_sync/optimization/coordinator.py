@@ -7177,6 +7177,18 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             capped, curtail_threshold * 100,
                         )
 
+            from ..solar_production import planned_solar
+
+            production = self.hass.data.get(DOMAIN, {}).get(
+                self._entry.entry_id, {}
+            ).get("solar_production_runtime") if self._entry else None
+            production_covers_site = bool(
+                production and production.can_project()
+            )
+            solar_forecast = planned_solar(
+                solar_forecast, import_prices, enabled=production_covers_site
+            )
+
             solver_solar_forecast = list(solar_forecast)
 
             if solar_forecast and load_forecast:
@@ -7786,7 +7798,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # negative export price periods.
             if self._should_apply_offgrid_overlay():
                 schedule = self._apply_offgrid_overlay(
-                    schedule, export_prices,
+                    schedule, export_prices, import_prices=import_prices,
                 )
             schedule = self._annotate_manual_control_schedule(
                 schedule,
@@ -7895,7 +7907,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 if self._should_apply_offgrid_overlay():
                     schedule = self._apply_offgrid_overlay(
-                        schedule, export_prices,
+                        schedule, export_prices, import_prices=import_prices,
                     )
                 schedule = self._annotate_manual_control_schedule(
                     schedule,
@@ -15355,6 +15367,8 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 for key, value in runtime.items()
             ):
                 reason = "curtailment"
+            if isinstance(runtime, dict) and runtime.get("solar_production_stop", {}).get("restore_required"):
+                reason = "curtailment"
 
         try:
             actual_kw = float(data.get("solar_power"))
@@ -15407,6 +15421,11 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         Solcast forecast.
         """
         if not solar_forecast:
+            return solar_forecast
+        runtime = getattr(getattr(self, "hass", None), "data", {}).get(
+            "power_sync", {}
+        ).get(getattr(self, "entry_id", ""), {})
+        if runtime.get("solar_production_stop", {}).get("restore_required"):
             return solar_forecast
         if soc >= 0.98:
             # Near-full batteries and curtailment can make measured solar lower
@@ -18331,6 +18350,8 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self,
         schedule: "OptimizationSchedule",
         export_prices: list[float],
+        *,
+        import_prices: list[float] | None = None,
     ) -> "OptimizationSchedule":
         """Post-LP overlay: mark eligible slots as OFF_GRID.
 
@@ -18361,8 +18382,11 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             price = export_prices[t] if t < len(export_prices) else 1.0
             soc = action.soc
 
+            from ..solar_production import finite_number
+            import_price = finite_number(import_prices[t]) if import_prices is not None and t < len(import_prices) else None
             is_eligible = (
-                price < self._OFFGRID_EXPORT_THRESHOLD
+                import_price is not None and import_price >= 0
+                and price < self._OFFGRID_EXPORT_THRESHOLD
                 and act in ("self_consumption", "idle")
                 and soc is not None
                 and soc >= soc_floor

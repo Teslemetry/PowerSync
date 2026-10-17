@@ -1270,7 +1270,10 @@
       "battery_integration_missing_telemetry": "The selected integration does not currently expose all required battery SOC, battery power, grid power, solar power, and home load sensors.",
       "unknown": "An unexpected error occurred. Check the Home Assistant logs for details and try again.",
       "invalid_phase_load_management": "These phase-load management settings are not usable. The reason is shown above the form.",
-      "storage_unavailable": "PowerSync storage is not available. Reload the integration and try again."
+      "storage_unavailable": "PowerSync storage is not available. Reload the integration and try again.",
+      "solar_production_control_required": "Select PV production controls or enable and configure a supported separate AC inverter.",
+      "invalid_solar_production_entity": "Select available PV production switches or production-limit numbers that support zero.",
+      "solar_production_grid_status_required": "Select a sensor that confirms the utility grid is connected before stopping solar."
     },
     "step": {
       "optimizer_access": {
@@ -2504,7 +2507,7 @@
       },
       "curtailment_options": {
         "title": "Curtailment settings",
-        "description": "Configure automatic curtailment. By default, it begins only when export earnings are negative; earnings of 0 c/kWh are not curtailed. Changes take effect immediately.",
+        "description": "Configure export curtailment and optional PV production stopping during negative retail import prices. Each has its own permission and controls.",
         "data": {
           "battery_curtailment_enabled": "Enable battery export curtailment",
           "ac_inverter_curtailment_enabled": "Enable separate AC-coupled inverter shutdown",
@@ -2512,7 +2515,13 @@
           "curtailment_control_in_monitoring_mode": "Allow curtailment control in Monitoring Mode",
           "powerwall_offgrid_as_curtailment": "Enable Powerwall off-grid fallback",
           "sigenergy_dc_curtailment_enabled": "Enable DC solar curtailment",
-          "openweathermap_api_key": "OpenWeatherMap API key"
+          "openweathermap_api_key": "OpenWeatherMap API key",
+          "negative_import_solar_enabled": "Stop solar when the import price is negative",
+          "solar_production_control_entities": "PV production controls (optional with supported native inverter)",
+          "negative_import_solar_controls_all_pv": "These controls cover all solar generation",
+          "solar_production_power_entity": "Controlled solar production power sensor (optional)",
+          "solar_production_import_price_entity": "Retail import price sensor (optional)",
+          "solar_production_grid_connected_entity": "Grid connected sensor (optional for Tesla)"
         },
         "data_description": {
           "battery_curtailment_enabled": "Stop battery export when earnings fall below the configured threshold (negative earnings by default). This controls the battery/Tesla path only; supported DC solar curtailment has its own opt-in.",
@@ -2521,7 +2530,13 @@
           "curtailment_control_in_monitoring_mode": "When explicitly enabled, automatic curtail and restore commands may run while Monitoring Mode continues to block every unrelated battery, EV, and inverter dispatch command. Curtailment can change solar output or inverter export settings.",
           "powerwall_offgrid_as_curtailment": "Allow PowerSync to temporarily island the Powerwall when export curtailment is needed but no AC inverter curtailment path is configured or available.",
           "sigenergy_dc_curtailment_enabled": "Reduce DC solar output when export earnings drop below the configured threshold (negative earnings by default). This is independent of battery export curtailment and requires Modbus write access; Monitoring Mode also requires curtailment-control permission.",
-          "openweathermap_api_key": "Free API key from openweathermap.org for weather-based automations (sunny, cloudy, rain, snow, and storm triggers). Leave blank to disable."
+          "openweathermap_api_key": "Free API key from openweathermap.org for weather-based automations (sunny, cloudy, rain, snow, and storm triggers). Leave blank to disable.",
+          "negative_import_solar_enabled": "Stop PV generation below 0 c/kWh retail import price, independently of export earnings or battery SOC. Restores the saved production setting at 0 or above, or when the current price expires. Disabled by default.",
+          "solar_production_control_entities": "For any inverter brand, select PV-only production-enable switches (on produces, off stops) or production-limit numbers that accept zero. Never select export limits, grid/islanding switches, battery controls or general load relays. Multiple controls are supported. Leave empty to use a separate native Enphase DPEL, Fronius, Sungrow SG, SolarEdge or Zeversolar inverter. Sigenergy can use its native DC PV limit when Remote EMS is already in a supported mode.",
+          "negative_import_solar_controls_all_pv": "Enable only if these controls cover every PV source at the site. The optimiser will then plan zero solar during negative import slots. Leave off for mixed sites with uncontrolled PV.",
+          "solar_production_power_entity": "Power in W or kW from the PV sources being controlled. A fresh sample after the command is needed to confirm that production has stopped; command acceptance alone is shown as pending.",
+          "solar_production_import_price_entity": "Optional retail import sensor with c/kWh, p/kWh or currency/kWh units and startTime/endTime (or valid_from/valid_to) attributes with timezone offsets. Required for providers without timestamped retail intervals. Raw wholesale prices must not be used.",
+          "solar_production_grid_connected_entity": "Fresh grid connection proof is required before stopping solar. For a binary sensor, on must mean connected to the utility grid. A sensor can report Active, Connected, SystemGridConnected or On-Grid. Non-Tesla systems require this selection; Tesla can use its own fresh grid status. Lost or stale grid status restores owned PV controls."
         },
         "submit": "Save"
       },
@@ -2816,6 +2831,9 @@
         },
         "submit": "Save"
       }
+    },
+    "abort": {
+      "solar_production_restore_pending": "The saved PV production setting could not be restored. Settings were not changed. Check inverter availability and retry."
     }
   },
   "issues": {

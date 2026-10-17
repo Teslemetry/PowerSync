@@ -41,6 +41,10 @@ from .history_migration import (
     preview_history_relink,
 )
 from .curtailment_config import normalize_curtailment_export_threshold_cents
+from .solar_production import (
+    ENABLED as SOLAR_STOP_ENABLED, ENTITIES as SOLAR_STOP_ENTITIES,
+    ALL_PV as SOLAR_STOP_ALL_PV, validate_production_entities,
+)
 from .demand_charge_config import (
     normalize_demand_charge_billing_day,
     normalize_demand_charge_days,
@@ -15065,7 +15069,39 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
         is_sungrow = battery_system == BATTERY_SYSTEM_SUNGROW
         is_tesla = battery_system == BATTERY_SYSTEM_TESLA
 
+        errors = {}
         if user_input is not None:
+            if user_input.get(SOLAR_STOP_ENABLED, False):
+                error = validate_production_entities(
+                    self.hass, user_input.get(SOLAR_STOP_ENTITIES, [])
+                )
+                if error:
+                    errors["base"] = error
+                elif not is_tesla and not user_input.get("solar_production_grid_connected_entity"):
+                    errors["base"] = "solar_production_grid_status_required"
+                elif not user_input.get(SOLAR_STOP_ENTITIES) and not user_input.get(CONF_AC_INVERTER_CURTAILMENT_ENABLED, False) and not is_sigenergy:
+                    errors["base"] = "solar_production_control_required"
+            if errors:
+                user_input = None
+
+        if user_input is not None:
+            production = self.hass.data.get(DOMAIN, {}).get(
+                self.config_entry.entry_id, {}
+            ).get("solar_production_runtime")
+            production_keys = (
+                SOLAR_STOP_ENABLED, SOLAR_STOP_ENTITIES, SOLAR_STOP_ALL_PV,
+                "solar_production_power_entity", "solar_production_import_price_entity",
+                "solar_production_grid_connected_entity",
+                CONF_CURTAILMENT_CONTROL_IN_MONITORING_MODE,
+                CONF_AC_INVERTER_CURTAILMENT_ENABLED,
+            )
+            if production and any(
+                user_input.get(key) != self._get_option(key)
+                for key in production_keys
+            ):
+                if not await production.shutdown():
+                    return self.async_abort(reason="solar_production_restore_pending")
+
             # Check if solar curtailment is being disabled
             was_curtailment_enabled = self._get_option(
                 CONF_BATTERY_CURTAILMENT_ENABLED, False
@@ -15097,6 +15133,12 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
 
             # Store curtailment settings (no weather options here)
             self._curtailment_options = {
+                SOLAR_STOP_ENABLED: bool(user_input.get(SOLAR_STOP_ENABLED, False)),
+                SOLAR_STOP_ENTITIES: list(user_input.get(SOLAR_STOP_ENTITIES, [])),
+                SOLAR_STOP_ALL_PV: bool(user_input.get(SOLAR_STOP_ALL_PV, False)),
+                "solar_production_power_entity": user_input.get("solar_production_power_entity", ""),
+                "solar_production_import_price_entity": user_input.get("solar_production_import_price_entity", ""),
+                "solar_production_grid_connected_entity": user_input.get("solar_production_grid_connected_entity", ""),
                 CONF_BATTERY_CURTAILMENT_ENABLED: new_curtailment_enabled,
                 CONF_CURTAILMENT_EXPORT_THRESHOLD_CENTS: (
                     normalize_curtailment_export_threshold_cents(
@@ -15236,6 +15278,19 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
             ): BooleanSelector(),
         }
 
+        schema_dict.update({
+            vol.Optional(SOLAR_STOP_ENABLED, default=self._get_option(SOLAR_STOP_ENABLED, False)): BooleanSelector(),
+            vol.Optional(SOLAR_STOP_ENTITIES, default=self._get_option(SOLAR_STOP_ENTITIES, [])): EntitySelector(EntitySelectorConfig(domain=["switch", "number"], multiple=True)),
+            vol.Optional(SOLAR_STOP_ALL_PV, default=self._get_option(SOLAR_STOP_ALL_PV, False)): BooleanSelector(),
+        })
+        for key in ("solar_production_power_entity", "solar_production_import_price_entity"):
+            current = self._get_option(key)
+            schema_dict[vol.Optional(key, description={"suggested_value": current} if current else None)] = EntitySelector(EntitySelectorConfig(domain="sensor"))
+
+        grid_key = "solar_production_grid_connected_entity"
+        grid_entity = self._get_option(grid_key)
+        schema_dict[vol.Optional(grid_key, description={"suggested_value": grid_entity} if grid_entity else None)] = EntitySelector(EntitySelectorConfig(domain=["binary_sensor", "sensor"]))
+
         if is_sigenergy:
             # Sigenergy DC curtailment option
             schema_dict[
@@ -15259,6 +15314,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
 
         return self.async_show_form(
             step_id="curtailment_options",
+            errors=errors,
             data_schema=vol.Schema(schema_dict),
         )
 

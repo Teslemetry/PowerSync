@@ -9373,6 +9373,21 @@ def _apply_inverter_physical_convergence_status(
     state_dict: dict[str, Any], entry_data: dict[str, Any]
 ) -> None:
     """Keep API status pending until physical curtailment is proven."""
+    production = entry_data.get("solar_production_stop", {})
+    if production.get("native_ac_owned"):
+        confirmed = production.get("physical_converged") is True
+        state_dict.update(
+            production_control=dict(production),
+            control_mode=INVERTER_CONTROL_MODE_SHUTDOWN,
+            target_power_w=0,
+            device_limit_confirmed=production.get("device_limit_confirmed"),
+            physical_converged=production.get("physical_converged"),
+            is_curtailment_requested=True,
+            is_curtailed=confirmed,
+        )
+        if state_dict.get("status") not in {"offline", "error"}:
+            state_dict["status"] = "curtailed" if confirmed else "curtailment_pending"
+        return
     control_mode = entry_data.get("inverter_control_mode")
     physical_converged = entry_data.get(
         "inverter_curtailment_physical_converged"
@@ -24235,6 +24250,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "_calibration_check_unsub": None,
     }
 
+    # PV-production stopping runs independently of export-price and battery
+    # routes. It must also reconcile a durable restore journal after restart.
+    from .solar_production_runtime import SolarProductionRuntime
+
+    solar_production_runtime = SolarProductionRuntime(
+        hass, entry, hass.data[DOMAIN][entry.entry_id],
+        lambda: _aemo_dispatch_entry_data() is not None
+        and _monitoring_mode_allows_curtailment(True),
+        (amber_coordinator, localvolts_coordinator, octopus_coordinator, epex_coordinator),
+        ac_inverter_is_same_hybrid,
+    )
+    hass.data[DOMAIN][entry.entry_id]["solar_production_runtime"] = solar_production_runtime
+
     if globird_coordinator and globird_initial_refresh_failed:
         globird_coordinator.async_start_initial_retry()
 
@@ -25352,6 +25380,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         configured, incompatible brand) or fails. The helper handles all
         safety gates itself — we just dispatch the intent.
         """
+        if curtail and reason == "negative_import_price":
+            _LOGGER.info("Skipping off-grid fallback: negative import prices require a grid connection")
+            return False
         try:
             from .powerwall_local.curtailment_fallback import get_fallback
             fallback = get_fallback(hass, entry)
@@ -25498,6 +25529,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if inverter_control_lock is not None:
             await inverter_control_lock.acquire()
         try:
+            production = entry_data.get("solar_production_runtime")
+            if production and production.blocks_export_control:
+                return False
             controller = entry_data.get("inverter_controller")
             if controller is None:
                 controller = get_inverter_controller(
@@ -41347,6 +41381,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
         _LOGGER.info(f"🔴 Manual inverter curtailment requested (mode: {mode})")
 
+        production = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("solar_production_runtime")
+        if production and not await production.manual_handoff():
+            raise HomeAssistantError("PV production restore is still pending; manual inverter control was deferred")
+
         inverter_enabled = entry.options.get(
             CONF_AC_INVERTER_CURTAILMENT_ENABLED,
             entry.data.get(CONF_AC_INVERTER_CURTAILMENT_ENABLED, False)
@@ -41434,6 +41472,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         success = False
         await inverter_control_lock.acquire()
         try:
+            production = entry_data.get("solar_production_runtime")
+            if production and production.blocks_export_control:
+                return False
             controller = entry_data.get("inverter_controller")
             if controller is None:
                 controller = get_inverter_controller(
@@ -41522,6 +41563,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         """Manually restore the AC-coupled inverter to normal operation."""
         _LOGGER.info("🟢 Manual inverter restore requested")
 
+        production = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("solar_production_runtime")
+        if production and not await production.manual_handoff():
+            raise HomeAssistantError("PV production restore is still pending; manual inverter control was deferred")
+
         inverter_enabled = entry.options.get(
             CONF_AC_INVERTER_CURTAILMENT_ENABLED,
             entry.data.get(CONF_AC_INVERTER_CURTAILMENT_ENABLED, False)
@@ -41609,6 +41654,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         success = False
         await inverter_control_lock.acquire()
         try:
+            production = entry_data.get("solar_production_runtime")
+            if production and production.blocks_export_control:
+                return False
             controller = entry_data.get("inverter_controller")
             if controller is None:
                 controller = get_inverter_controller(
@@ -43119,6 +43167,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.data[DOMAIN][entry.entry_id]["fp_account_cancel"] = fp_account_cancel
             _LOGGER.info("Flow Power API account data refresh scheduled (every 30min)")
 
+    async def _reconcile_export_after_production_restore():
+        data = _aemo_dispatch_entry_data()
+        if data is None or not _monitoring_mode_allows_curtailment(True):
+            return
+        feedin, import_price, _ = get_current_prices_for_curtailment(
+            data, (amber_coordinator, localvolts_coordinator,
+                   aemo_sensor_coordinator, flow_power_kwatch_coordinator,
+                   octopus_coordinator),
+        )
+        if feedin is not None:
+            await apply_inverter_curtailment(
+                export_earnings_are_uneconomic(-feedin, False, entry),
+                import_price=import_price, export_earnings=-feedin,
+            )
+
+    solar_production_runtime.after_restore = _reconcile_export_after_production_restore
+    await solar_production_runtime.tick()
+
     # Set up fast load-following update for responsive power limiting.
     # Enphase DPEL can time out quickly, so it is checked every 15 seconds;
     # other brands keep the existing effective 30-second cadence.
@@ -43128,6 +43194,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             entry_data = _aemo_dispatch_entry_data()
             if entry_data is None:
                 return
+            production = entry_data.get("solar_production_runtime")
+            if production:
+                await production.tick()
+                if production.blocks_export_control:
+                    return
 
             if ac_inverter_is_same_hybrid():
                 return
@@ -43200,6 +43271,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                             if entry_data.get("inverter_last_state") == "curtailed"
                             else INVERTER_CONTROL_MODE_NORMAL
                         )
+                    production = entry_data.get("solar_production_runtime")
+                    if production and production.blocks_export_control:
+                        return None
                     if (
                         _aemo_dispatch_entry_data() is not entry_data
                         or entry_data.get("inverter_controller") is not controller
@@ -46933,6 +47007,13 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     for key in ("aemo_spike_cancel", "generic_aemo_spike_cancel", "vpp_aemo_cancel"):
         if cancel := entry_data.pop(key, None):
             cancel()
+    if production := entry_data.get("solar_production_runtime"):
+        try:
+            if not await production.shutdown():
+                _LOGGER.warning("PV production restore remains pending; durable recovery will retry on setup")
+        except Exception:
+            _LOGGER.exception("PV production cleanup failed; durable restore journal retained")
+
     if initial_task := entry_data.pop("vpp_aemo_initial_task", None):
         # Let a started service call finish, then clean up under the same lock.
         await asyncio.gather(initial_task, return_exceptions=True)

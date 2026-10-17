@@ -177,6 +177,7 @@ class SungrowController(InverterController):
 
         # Select register map based on model
         model_key = (model or "").lower().replace(".", "").replace("-", "").replace(" ", "")
+        self.production_stop_model_supported = model_key in MODEL_MAP and model_key.startswith("sg")
         map_name = MODEL_MAP.get(model_key, "sg10rs")  # Default to sg10rs
         self._reg_map = REGISTER_MAPS[map_name]
 

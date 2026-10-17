@@ -133,6 +133,11 @@ class PowerwallCurtailmentFallback:
         which case the caller should fall back to whatever was next on its
         own error path.
         """
+        production = self._hass.data.get(DOMAIN, {}).get(
+            self._entry.entry_id, {}
+        ).get("solar_production_runtime")
+        if reason == "negative_import_price" or (production and production.wants_import()):
+            return False
         if not self._is_enabled():
             return False
         if self._active:
@@ -320,6 +325,13 @@ class PowerwallCurtailmentFallback:
         """
         if not self._active:
             return True
+
+        production = self._hass.data.get(DOMAIN, {}).get(
+            self._entry.entry_id, {}
+        ).get("solar_production_runtime")
+        if production and production.wants_import():
+            await self.release(trigger_reason="negative_import_price")
+            return False
 
         soc_ok, soc_val, floor = self._check_soc_floor()
         if not soc_ok:

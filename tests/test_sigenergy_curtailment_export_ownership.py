@@ -89,7 +89,13 @@ def _optimization_coordinator_method(name: str):
     )
     module = ast.Module(body=[method], type_ignores=[])
     ast.fix_missing_locations(module)
+    async def fenced_call(_owner, factory, _operation=None):
+        # This harness models an admitted optimizer. Access fencing has its
+        # own runtime suite; these cases exercise export-curtailment ownership.
+        return await factory()
+
     namespace: dict[str, Any] = {
+        "fenced_call": fenced_call,
         "Any": Any,
         "_LOGGER": logging.getLogger(__name__),
         **_stub_package_namespace(),

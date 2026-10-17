@@ -2381,6 +2381,10 @@ async def async_setup_entry(
     )
     _LOGGER.info("Tariff schedule sensor added for TOU visualization")
 
+    from .solar_production_sensor import SolarProductionControlSensor
+
+    entities.append(SolarProductionControlSensor(entry))
+
     # Add solar curtailment sensor if curtailment is enabled
     if any(get_effective_solar_curtailment_configuration(entry)):
         entities.append(
@@ -6104,6 +6108,12 @@ class InverterStatusSensor(RestoreEntity, SensorEntity):
         elif self._cached_state == "error":
             return "Error"
 
+        production = self._entry_data().get("solar_production_stop", {})
+        if production.get("native_ac_owned"):
+            if production.get("restore_pending"):
+                return "Restore Pending"
+            return "Shutdown" if production.get("physical_converged") is True else "Shutdown Pending"
+
         control_mode = self._control_mode()
         physical_converged = self._entry_data().get(
             "inverter_curtailment_physical_converged"
@@ -6169,6 +6179,22 @@ class InverterStatusSensor(RestoreEntity, SensorEntity):
         attrs.update(self._cached_attrs)
         attrs["control_mode"] = control_mode
         attrs["target_power_w"] = target_power_w
+
+        production = self._entry_data().get("solar_production_stop", {})
+        if production.get("native_ac_owned"):
+            attrs.update(
+                production_control=dict(production),
+                control_mode=INVERTER_CONTROL_MODE_SHUTDOWN,
+                target_power_w=0,
+                device_limit_confirmed=production.get("device_limit_confirmed"),
+                physical_converged=production.get("physical_converged"),
+                description=(
+                    "PV production restoration pending" if production.get("restore_pending")
+                    else "PV production stopped" if production.get("physical_converged") is True
+                    else "PV production stop pending physical confirmation"
+                ),
+            )
+            return attrs
 
         # Add description based on state after cached attrs so the public
         # dashboard text remains specific to PowerSync's active control mode.
