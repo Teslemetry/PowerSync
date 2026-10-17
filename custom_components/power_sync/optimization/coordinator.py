@@ -73,6 +73,7 @@ from .solar_provenance import derive_solar_forecast_provenance
 from .solar_export import SolarExportHoldController, resolve_solar_export_adapter
 from .ev_coordinator import EVCoordinator, EVConfig, EVChargingMode
 from ..const import (
+    DOMAIN,
     CONF_OPTIMIZATION_BATTERY_CAPACITY_WH,
     CONF_OPTIMIZATION_MAX_CHARGE_W,
     CONF_OPTIMIZATION_MAX_DISCHARGE_W,

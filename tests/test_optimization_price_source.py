@@ -2589,6 +2589,277 @@ def test_current_action_execution_failure_still_publishes_new_plan(opt_module):
     assert published == [{"planned_current_power_w": 8347}]
 
 
+@pytest.mark.parametrize("runtime_state", ["absent", "disabled"])
+def test_configured_optimizer_builds_and_publishes_without_solar_runtime(
+    opt_module,
+    monkeypatch,
+    runtime_state,
+):
+    """A normal entry must reach the solver when optional solar control is off."""
+
+    solar_module = types.ModuleType("power_sync.solar_production")
+    solar_calls = []
+
+    def planned_solar(solar, prices, *, enabled):
+        solar_calls.append(enabled)
+        return list(solar)
+
+    solar_module.planned_solar = planned_solar
+    monkeypatch.setitem(sys.modules, "power_sync.solar_production", solar_module)
+    for name in (
+        "CONF_AC_INVERTER_CURTAILMENT_ENABLED",
+        "CONF_BATTERY_CURTAILMENT_ENABLED",
+        "CONF_SIGENERGY_DC_CURTAILMENT_ENABLED",
+    ):
+        monkeypatch.setattr(sys.modules["power_sync.const"], name, name, raising=False)
+    monkeypatch.setattr(
+        opt_module,
+        "build_manual_control_projection",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        opt_module,
+        "derive_solar_forecast_provenance",
+        lambda *args, **kwargs: None,
+    )
+
+    class Projection:
+        expected_w = [0.0, 0.0, 0.0]
+        expected_by_loadpoint = {}
+
+        def with_suppressed_expected(self, **kwargs):
+            return self
+
+    class Learner:
+        def ensure_topology(self, fingerprint):
+            return False
+
+        def resolved_parameters(self, **kwargs):
+            return object()
+
+        def allowance_kwh(self, source):
+            return 0.0
+
+        def confidence(self, source):
+            return 1.0
+
+    class Schedule:
+        def __init__(self):
+            self.actions = [SimpleNamespace(action="idle")]
+
+    class Result:
+        feasible = True
+        solver_used = "fake"
+        solve_time_s = 0.0
+        future_export_protection_floor_slots = []
+        solar_curtailment_w = [0.0, 0.0, 0.0]
+        reserve_recommendation = {}
+
+        def __init__(self):
+            self.schedule = Schedule()
+            self.lp_stats = {}
+
+    solve_calls = []
+
+    class Optimizer:
+        suppress_reserve_warning = False
+        hardware_reserve = 0.2
+        efficiency = 1.0
+        pre_window_slot = None
+        pre_window_soc_target = 0.0
+        pre_window_solar_error_margin_kwh = 0.0
+        pre_window_solar_learning_confidence = 1.0
+
+        def apply_resolved_parameters(self, parameters):
+            pass
+
+        def set_quota_bonus_groups(self, **kwargs):
+            pass
+
+        def update_config(self, **kwargs):
+            pass
+
+        def optimize(self, *args):
+            solve_calls.append(args)
+            return Result()
+
+        def reconcile_result_with_schedule(self, result, schedule, **kwargs):
+            result.schedule = schedule
+            return result
+
+    async def executor_job(function, *args):
+        return function(*args)
+
+    entry_data = {}
+    if runtime_state == "disabled":
+        entry_data["solar_production_runtime"] = SimpleNamespace(
+            can_project=lambda: False,
+        )
+    published = []
+    errors = []
+    monkeypatch.setattr(
+        opt_module._LOGGER,
+        "error",
+        lambda *args, **kwargs: errors.append((args, kwargs)),
+    )
+    hass = SimpleNamespace(
+        data={"power_sync": {"entry-1": entry_data}},
+        async_add_executor_job=executor_job,
+    )
+    coordinator = object.__new__(opt_module.OptimizationCoordinator)
+    coordinator.hass = hass
+    coordinator.entry_id = "entry-1"
+    coordinator._entry = SimpleNamespace(entry_id="entry-1", data={}, options={})
+    coordinator._optimizer = Optimizer()
+    coordinator._enabled = True
+    coordinator._energy_telemetry_ready = lambda: True
+    coordinator._wait_for_deferred_enable_restore = lambda: asyncio.sleep(
+        0,
+        result=True,
+    )
+    coordinator._wait_for_restart_force_restore = lambda: asyncio.sleep(
+        0,
+        result=False,
+    )
+    coordinator._optimization_lock = asyncio.Lock()
+    coordinator._battery_specs_source = "configured"
+    coordinator._battery_efficiency_learner = Learner()
+    coordinator._battery_efficiency_topology_fingerprint = lambda capacity: "test"
+    coordinator._schedule_battery_efficiency_learning_save = lambda: None
+    coordinator._ev_integration_enabled = False
+    coordinator._config = opt_module.OptimizationConfig(
+        horizon_hours=1,
+        allow_grid_charge=False,
+    )
+    coordinator._cost_function = opt_module.CostFunction()
+    coordinator._current_schedule = None
+    coordinator._solar_forecaster = SimpleNamespace(last_forecast_source=None)
+    coordinator._solar_forecast_learner = coordinator._battery_efficiency_learner
+    coordinator._force_state_getter = None
+    coordinator._planned_ev_load_entity_id = None
+    coordinator._warned_dual_ev_overlay = False
+    coordinator._actual_cost_today = 0.0
+    coordinator._last_zerohero_bonus_prices = []
+    coordinator._last_zerohero_bonus_cap_kwh = None
+    coordinator._last_zerocharge_bonus_prices = []
+    coordinator._last_zerocharge_bonus_cap_kwh = None
+    coordinator._last_import_bonus_group_ids = []
+    coordinator._last_import_bonus_caps_by_group = {}
+    coordinator._last_export_bonus_group_ids = []
+    coordinator._last_export_bonus_caps_by_group = {}
+    coordinator._last_optimizer_price_valid_slots = None
+    coordinator._last_acquisition_reference_import_prices = []
+    coordinator._last_priced_import_mask = None
+    coordinator._last_grid_charge_blackout_slots = []
+    coordinator._grid_charge_blackout_status = {}
+    coordinator._charge_by_time_blackout_diagnostic = None
+    coordinator._last_update_time = None
+    coordinator._last_solar_forecast = None
+    coordinator._last_load_forecast = None
+
+    async def projection_async(intervals):
+        return Projection()
+
+    async def result_async(result, **kwargs):
+        return result
+
+    async def _prices():
+        return [0.20, 0.20, 0.20], [0.10, 0.10, 0.10]
+
+    async def _solar():
+        return [2000.0, 2000.0, 2000.0]
+
+    async def _load():
+        return [500.0, 500.0, 500.0]
+
+    async def _battery():
+        return 0.5, 13500.0
+
+    coordinator._get_price_forecast = _prices
+    coordinator._get_solar_forecast = _solar
+    coordinator._get_load_forecast = _load
+    coordinator._get_battery_state = _battery
+    coordinator._provider_priced_reference_prices = lambda: [0.20, 0.20, 0.20]
+    coordinator._acquisition_reference_prices_for_run = lambda values: values
+    coordinator._acquisition_cost_for_run = lambda **kwargs: 0.20
+    coordinator._reconcile_battery_provenance = lambda *args, **kwargs: None
+    coordinator._observe_battery_efficiency = lambda *args, **kwargs: None
+    coordinator._capture_provider_quota_measurements_before_plan = lambda: None
+    coordinator._build_price_level_projection = (
+        projection_async
+    )
+    coordinator._get_planned_ev_load_forecast = lambda intervals: [0.0] * intervals
+    coordinator._merge_internal_ev_load_components = (
+        lambda **kwargs: ([0.0] * kwargs["n_intervals"], [0.0] * kwargs["n_intervals"], [0.0] * kwargs["n_intervals"])
+    )
+    coordinator._price_level_projection_payload = lambda **kwargs: {}
+    coordinator._observe_solar_forecast_accuracy = lambda *args, **kwargs: None
+    coordinator._apply_solar_nowcast_derate = lambda solar, soc: solar
+    coordinator._solar_error_margin_after_nowcast = lambda **kwargs: (
+        kwargs["learned_margin_kwh"],
+        0.0,
+    )
+    coordinator._cost_neutral_settlement_prices = lambda imports, exports: (
+        imports,
+        exports,
+    )
+    coordinator._apply_provider_quota_optimizer_inputs = lambda *args: None
+    coordinator._battery_export_allowed_slots = lambda count, prices: [True] * count
+    coordinator._battery_charge_blocked_slots = lambda count: [False] * count
+    coordinator._grid_charge_cap_import_prices = lambda imports: imports
+    coordinator._grid_charge_allowed_slots = lambda *args: [False, False, False]
+    coordinator._apply_custom_tariff_quota_grid_charge_limit = lambda allowed, *args: allowed
+    coordinator._coerce_optional_price = lambda value: value
+    coordinator._soc_ratio = lambda value, default: default if value is None else value
+    coordinator._reserve_ratio = lambda value, default: default if value is None else value
+    coordinator._sync_grid_export_cap_to_optimizer = lambda: None
+    coordinator._sync_optimizer_discharge_limits = lambda: None
+    origin = datetime(2026, 10, 17, 23, 0, tzinfo=timezone.utc)
+    coordinator._price_timestamps = lambda count: [
+        origin + timedelta(minutes=5 * index) for index in range(count)
+    ]
+    coordinator._profit_max_solar_export_slots = lambda *args: [False, False, False]
+    coordinator._priority_export_slots_for_run = lambda count, prices: [False] * count
+    coordinator._spread_export_prices_for_run = lambda exports: exports
+    coordinator._cost_neutral_solve_inputs = lambda **kwargs: (None, {})
+    coordinator._should_spread_import_schedule = lambda: False
+    coordinator._should_spread_export_schedule = lambda: False
+    coordinator._should_apply_offgrid_overlay = lambda: False
+    coordinator._reference_export_bridge_windows = lambda *args: []
+    coordinator._merge_export_protection_floors = lambda *args: []
+    coordinator._bridge_short_export_gaps = lambda schedule, *args, **kwargs: schedule
+    coordinator._annotate_manual_control_schedule = lambda schedule, *args: schedule
+    coordinator._restore_bridged_export_gap_provenance = lambda *args: None
+    coordinator._set_forecast_bridge_reserve_recommendation = lambda *args: None
+    coordinator._adopt_solved_ev_series = lambda *args: None
+    coordinator._commit_price_forecast_cache = lambda *args: None
+    coordinator._apply_auto_reserve_recommendation = lambda *args: False
+    coordinator._apply_external_energy_plan = (
+        result_async
+    )
+    coordinator._set_active_export_reserve_floor_slots = lambda *args: None
+    coordinator._record_solar_forecast_availability = lambda *args: None
+    coordinator._track_actual_cost = lambda: None
+    coordinator._get_daily_cost = lambda: 0.0
+    coordinator._get_daily_savings = lambda: 0.0
+    coordinator._get_predicted_cost_to_midnight = lambda: (0.0, 0.0)
+    coordinator._get_current_action = lambda: None
+    coordinator._executor = None
+    coordinator.get_api_data = lambda: {"has_plan": coordinator._current_schedule is not None}
+    coordinator.async_set_updated_data = published.append
+
+    run_optimization = inspect.unwrap(
+        opt_module.OptimizationCoordinator._run_optimization
+    )
+    result = asyncio.run(run_optimization(coordinator))
+
+    assert result is True, errors
+    assert len(solve_calls) == 1
+    assert solar_calls == [False]
+    assert coordinator._current_schedule is not None
+    assert published == [{"has_plan": True}]
+
+
 def test_flow_power_aemo_price_source_is_provider_gated():
     tree = ast.parse((COMPONENT_ROOT / "__init__.py").read_text())
     assignments = [
