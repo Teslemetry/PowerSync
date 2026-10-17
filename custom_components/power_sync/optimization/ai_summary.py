@@ -285,8 +285,8 @@ def provider_model(
     return AI_SUMMARY_MODELS[provider]
 
 
-def ai_summary_settings(entry: Any | None, *, chatgpt_status: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """Return public, write-only-safe settings metadata for a config entry."""
+def configured_ai_provider(entry: Any | None) -> str:
+    """Resolve the selected provider without evaluating optional connection settings."""
     data = getattr(entry, "data", {}) or {}
     options = getattr(entry, "options", {}) or {}
     provider = str(
@@ -300,6 +300,14 @@ def ai_summary_settings(entry: Any | None, *, chatgpt_status: Mapping[str, Any] 
     ).strip().lower()
     if provider not in AI_SUMMARY_PROVIDERS:
         provider = DEFAULT_OPTIMIZATION_AI_SUMMARY_PROVIDER
+    return provider
+
+
+def ai_summary_settings(entry: Any | None, *, chatgpt_status: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Return public, write-only-safe settings metadata for a config entry."""
+    data = getattr(entry, "data", {}) or {}
+    options = getattr(entry, "options", {}) or {}
+    provider = configured_ai_provider(entry)
     api_key = options.get(
         CONF_OPTIMIZATION_AI_SUMMARY_API_KEY,
         data.get(CONF_OPTIMIZATION_AI_SUMMARY_API_KEY),

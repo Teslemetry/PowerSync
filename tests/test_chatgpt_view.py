@@ -25,6 +25,22 @@ SELECTED = {"OptimizationChatGPTView", "OptimizationSettingsView", "_optimizatio
 VIEW_AST = ast.Module(body=[node for node in TREE.body if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
                            and node.name in SELECTED], type_ignores=[])
 
+# Exercise the actual setup block, including its provider gate, without loading
+# the hardware coordinators in the rest of async_setup_entry.
+SETUP = next(node for node in TREE.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "async_setup_entry")
+SETUP_START = next(index + 1 for index, node in enumerate(SETUP.body)
+                   if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+                   and any(isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name)
+                           and arg.func.id == "OptimizationChatGPTView" for arg in node.value.args))
+SETUP_END = next(index for index in range(SETUP_START, len(SETUP.body))
+                 if isinstance(SETUP.body[index], ast.Expr) and isinstance(SETUP.body[index].value, ast.Call)
+                 and any(isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+                         and arg.value.startswith("Optimization HTTP endpoints registered")
+                         for arg in SETUP.body[index].value.args))
+SETUP_AUTH = ast.parse("async def setup_chatgpt_auth(hass, entry): pass").body[0]
+SETUP_AUTH.body = SETUP.body[SETUP_START:SETUP_END]
+SETUP_AUTH_AST = ast.fix_missing_locations(ast.Module(body=[SETUP_AUTH], type_ignores=[]))
+
 
 class Request(dict):
     def __init__(self, payload=None, user=None, invalid_json=False):
@@ -132,6 +148,7 @@ def fixture(monkeypatch):
                  "DOMAIN": "power_sync", "_LOGGER": logging.getLogger("powersync-chatgpt-view-test"),
                  "async_get_clientsession": lambda hass: "test-session"}
     exec(compile(VIEW_AST, str(COMPONENT / "__init__.py"), "exec"), namespace)
+    exec(compile(SETUP_AUTH_AST, str(COMPONENT / "__init__.py"), "exec"), namespace)
     view = namespace["OptimizationChatGPTView"](hass)
     admin = SimpleNamespace(id="admin-one", is_admin=True)
     return SimpleNamespace(view=view, hass=hass, entry=entry, entry_data=entry_data, manager=manager, service=service,
@@ -141,6 +158,113 @@ def fixture(monkeypatch):
 
 def body(response): return json.loads(response.text)
 def post(fixture, payload, **kwargs): return asyncio.run(fixture.view.post(Request(payload, fixture.admin, **kwargs)))
+
+
+@pytest.mark.parametrize("provider", [None, "gemini", "openai", "openrouter", "local_openai_compatible"])
+def test_startup_does_not_load_unused_chatgpt_storage(fixture, provider, tmp_path, caplog):
+    """Old startup may have left public registration metadata, without a login."""
+    path = tmp_path / "chatgpt-auth"
+    record = {"host_id": "urn:uuid:00000000-0000-0000-0000-000000000001"}
+    path.write_text(json.dumps({"data": record}))
+    path.chmod(0o644)
+    original = path.read_bytes()
+    calls = []
+
+    class DiskStore:
+        async def async_load(self):
+            calls.append("load")
+            return copy.deepcopy(record)
+
+        async def async_save(self, data):
+            pytest.fail("Unused ChatGPT storage must not be written")
+
+    async def executor(function, *args):
+        return function(*args)
+
+    fixture.hass.async_add_executor_job = executor
+    store = DiskStore()
+    store.path = path
+    manager = fixture.auth.ChatGPTAuthManager(None, fixture.auth._PrivateCredentialStore(fixture.hass, store))
+    fixture.monkeypatch.setattr(fixture.auth, "get_chatgpt_auth", lambda *_: manager)
+    fixture.entry.data.clear()
+    fixture.entry.options.clear()
+    if provider is not None:
+        # Explicit options must override a previously selected ChatGPT provider.
+        fixture.entry.data[fixture.const.CONF_OPTIMIZATION_AI_SUMMARY_PROVIDER] = "chatgpt"
+        fixture.entry.options[fixture.const.CONF_OPTIMIZATION_AI_SUMMARY_PROVIDER] = provider
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(fixture.namespace["setup_chatgpt_auth"](fixture.hass, fixture.entry))
+    assert calls == []
+    assert "ChatGPT connection unavailable during setup" not in caplog.text
+    assert path.read_bytes() == original and path.stat().st_mode & 0o777 == 0o644
+
+
+@pytest.mark.parametrize("source", ["data", "options"])
+def test_startup_restores_selected_chatgpt_connection(fixture, source):
+    fixture.entry.options.clear()
+    # Legacy optional model validation must not prevent integration startup.
+    fixture.entry.options[fixture.const.CONF_OPTIMIZATION_AI_SUMMARY_OPENAI_MODEL] = "invalid model?"
+    getattr(fixture.entry, source)[fixture.const.CONF_OPTIMIZATION_AI_SUMMARY_PROVIDER] = "chatgpt"
+    asyncio.run(fixture.namespace["setup_chatgpt_auth"](fixture.hass, fixture.entry))
+    assert fixture.manager.calls == [("load",)]
+
+
+def test_startup_reports_selected_chatgpt_storage_failure_without_aborting(fixture, caplog):
+    fixture.entry.options[fixture.const.CONF_OPTIMIZATION_AI_SUMMARY_PROVIDER] = "chatgpt"
+
+    async def fail_load():
+        raise fixture.auth.ChatGPTAuthError("storage_unavailable", "Storage unavailable", 503)
+
+    fixture.manager.async_load = fail_load
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(fixture.namespace["setup_chatgpt_auth"](fixture.hass, fixture.entry))
+    assert "ChatGPT connection unavailable during setup: storage_unavailable" in caplog.text
+
+
+@pytest.mark.parametrize("endpoint", ["chatgpt", "optimization_settings"])
+def test_selecting_chatgpt_restores_saved_account_without_a_prior_status_request(fixture, endpoint):
+    from test_chatgpt_auth import Session, Store, connect
+    import time
+
+    async def run():
+        clock, store, session = [time.time()], Store(), Session()
+        original = fixture.auth.ChatGPTAuthManager(session, store, lambda: clock[0])
+        await connect(original, session, clock)
+        saved = copy.deepcopy(store.record)
+        manager = fixture.auth.ChatGPTAuthManager(session, store, lambda: clock[0])
+        fixture.monkeypatch.setattr(fixture.auth, "get_chatgpt_auth", lambda *_: manager)
+        await fixture.namespace["setup_chatgpt_auth"](fixture.hass, fixture.entry)
+        assert not manager.status()["connected"]
+        network_calls = len(session.calls)
+        view = (fixture.view if endpoint == "chatgpt" else
+                fixture.namespace["OptimizationSettingsView"](fixture.hass))
+        payload = {"ai_summary_provider": "chatgpt"}
+        if endpoint == "chatgpt":
+            payload["action"] = "settings"
+        response = await view.post(Request(payload, fixture.admin))
+        assert response.status == 200
+        settings = body(response).get("settings", body(response))
+        assert settings["ai_summary_key_configured"]
+        assert manager.status()["connected"]
+        assert store.record == saved and len(session.calls) == network_calls
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("endpoint", ["chatgpt", "optimization_settings"])
+def test_selecting_chatgpt_preserves_storage_errors(fixture, endpoint):
+    async def fail_load():
+        raise fixture.auth.ChatGPTAuthError("storage_unavailable", "Storage unavailable", 503)
+
+    fixture.manager.async_load = fail_load
+    view = (fixture.view if endpoint == "chatgpt" else
+            fixture.namespace["OptimizationSettingsView"](fixture.hass))
+    payload = {"ai_summary_provider": "chatgpt"}
+    if endpoint == "chatgpt":
+        payload["action"] = "settings"
+    response = asyncio.run(view.post(Request(payload, fixture.admin)))
+    assert response.status == 503 and body(response)["code"] == "storage_unavailable"
+    assert "SECRET" not in response.text
 
 
 @pytest.fixture
