@@ -177,6 +177,7 @@ def _run_fronius_curtailment(
     should_curtail_result: bool | None = True,
     inverter_last_state: str | None = None,
     expect_state: bool = True,
+    native_result: bool | None = None,
 ) -> dict:
     """Drive the real apply_inverter_curtailment() fronius success branch."""
     entry_id = "entry-id"
@@ -195,7 +196,7 @@ def _run_fronius_curtailment(
         },
         data={},
     )
-    recorded: dict = {"state": None, "constructed": 0, "restore_calls": 0}
+    recorded: dict = {"state": None, "constructed": 0, "restore_calls": 0, "fallback_calls": []}
 
     controller, _writes = _recording_controller(load_following=load_following)
     original_restore = controller.restore
@@ -205,6 +206,14 @@ def _run_fronius_curtailment(
         return await original_restore()
 
     controller.restore = _record_restore
+    if native_result is not None:
+        async def native_curtail(home_load_w=None):
+            controller.native_export_control = True
+            if native_result:
+                controller.last_curtail_mode = "native_export"
+                controller.last_curtail_limit_w = 0
+            return native_result
+        controller.curtail = native_curtail
     if load_following:
         # get_rated_capacity() reads the SunSpec model block; the reported site
         # is a Primo GEN24 10.0 Plus.
@@ -231,6 +240,7 @@ def _run_fronius_curtailment(
         }
 
     async def _fallback(_curtail, _reason):
+        recorded["fallback_calls"].append(_curtail)
         return False
 
     def _record_state(control_mode, target_power_w=None, **kwargs):
@@ -289,7 +299,7 @@ def _run_fronius_curtailment(
     exec(_function_source("apply_inverter_curtailment"), namespace)
     result = asyncio.run(namespace["apply_inverter_curtailment"](True, 10.67, 0.14))
 
-    assert result is True
+    assert result is (native_result is not False)
     assert recorded["constructed"] == 1
     if expect_state:
         assert recorded["state"] is not None
@@ -349,3 +359,16 @@ def test_unavailable_live_status_never_restores_an_existing_curtailment():
     )
     assert recorded["state"] is None
     assert recorded["restore_calls"] == 0
+
+
+def test_native_site_limit_does_not_claim_device_or_physical_confirmation():
+    state = _run_fronius_curtailment(load_following=True, native_result=True)
+    assert state["target_power_w"] == 0
+    assert state["device_limit_confirmed"] is False
+    assert "physical_converged" not in state
+
+
+def test_native_failure_does_not_escalate_to_offgrid_fallback():
+    recorded = _run_fronius_curtailment(load_following=True, native_result=False, expect_state=False)
+    assert recorded["fallback_calls"] == []
+    assert recorded["state"] is None

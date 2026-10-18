@@ -324,6 +324,8 @@ def get_inverter_controller(
             slave_id=slave_id,
             model=model,
             load_following=load_following,
+            hass=hass,
+            entry_id=entry_id,
         )
 
     if brand_lower == "goodwe":

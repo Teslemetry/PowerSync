@@ -70,6 +70,8 @@ class FroniusController(InverterController):
         slave_id: int = 1,
         model: Optional[str] = None,
         load_following: bool = False,
+        hass=None,
+        entry_id: str = "",
     ):
         """Initialize Fronius controller.
 
@@ -102,6 +104,16 @@ class FroniusController(InverterController):
         # callers must not report a device limit for it.
         self.last_curtail_mode: Optional[str] = None
         self.last_curtail_limit_w: Optional[int] = None
+        self._native_export = None
+        self._native_ac_cleared = False
+        self.native_export_control = False
+        if hass is not None and entry_id:
+            from .fronius_native import FroniusNativeExportLimit
+
+            self._native_export = FroniusNativeExportLimit(
+                hass, entry_id, host, port, slave_id
+            )
+            self._request_lock = self._native_export.request_lock
 
     async def connect(self) -> bool:
         """Connect to the Fronius inverter via Modbus TCP."""
@@ -392,6 +404,22 @@ class FroniusController(InverterController):
     ) -> bool:
         """Serialize and verify one Fronius curtailment transaction."""
         async with self._request_lock:
+            if self._native_export is not None:
+                result = await self._native_export.curtail()
+                self.native_export_control = result is not None
+                if result is not None:
+                    if not result:
+                        return False
+                    # Set the site cap first, then remove our previous AC cap.
+                    # Otherwise a formerly curtailed unit can remain restricted
+                    # below household demand even with native load following.
+                    if not self._native_ac_cleared:
+                        if not await self._restore_locked():
+                            return False
+                        self._native_ac_cleared = True
+                    self.last_curtail_mode = "native_export"
+                    self.last_curtail_limit_w = 0
+                    return True
             return await self._curtail_locked(home_load_w, rated_capacity_w)
 
     async def _curtail_locked(
@@ -534,6 +562,20 @@ class FroniusController(InverterController):
     async def restore(self) -> bool:
         """Serialize and verify restoration of unrestricted output."""
         async with self._request_lock:
+            if self._native_export is not None:
+                try:
+                    has_snapshot = await self._native_export.has_snapshot()
+                except Exception as err:
+                    _LOGGER.warning("Cannot load Fronius export restore state: %s", err)
+                    return False
+                if has_snapshot:
+                    # Do not lift the site cap until legacy AC cleanup succeeds.
+                    if not await self._restore_locked():
+                        return False
+                    if not await self._native_export.restore():
+                        return False
+                    self._native_ac_cleared = False
+                    return True
             return await self._restore_locked()
 
     async def _restore_locked(self) -> bool:

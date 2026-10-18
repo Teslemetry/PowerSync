@@ -25667,7 +25667,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         else None
                     )
                     if inverter_brand == "fronius":
-                        if fronius_applied_limit_w is None:
+                        if getattr(controller, "last_curtail_mode", None) == "native_export":
+                            _LOGGER.info(
+                                "Fronius native 0W site export limit acknowledged at %s; "
+                                "physical site convergence is checked on the next cycle",
+                                inverter_host,
+                            )
+                        elif fronius_applied_limit_w is None:
                             _LOGGER.info(
                                 "Fronius simple-mode curtailment applied at %s; "
                                 "no device power limit is set (physical site "
@@ -25703,6 +25709,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         update_dpel_time=inverter_brand == "enphase",
                         device_limit_confirmed=(
                             fronius_applied_limit_w is not None
+                            and getattr(controller, "last_curtail_mode", None) != "native_export"
                             if inverter_brand == "fronius"
                             else None
                         ),
@@ -25735,6 +25742,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                                 ),
                                 1,
                             )
+                    if getattr(controller, "native_export_control", False):
+                        # A native site-limit transaction must retain its own
+                        # restore obligation; do not escalate to off-grid control.
+                        return False
                     # Inverter refused or errored — try the Powerwall off-grid
                     # path as the last-resort curtailment lever.
                     if _aemo_dispatch_entry_data() is not entry_data:
@@ -25781,7 +25792,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             # Exception path: if the caller wanted curtailment and the
             # inverter blew up, at least try the Powerwall fallback before
             # giving up entirely.
-            if curtail:
+            if curtail and not getattr(controller, "native_export_control", False):
                 try:
                     if _aemo_dispatch_entry_data() is not entry_data:
                         return False
@@ -43432,6 +43443,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 else None
             )
 
+            if (
+                inverter_brand == "fronius"
+                and getattr(controller, "last_curtail_mode", None) == "native_export"
+            ):
+                home_load_w = 0
+
             # Get current power limit to avoid unnecessary updates
             current_limit = entry_data.get("inverter_power_limit_w")
 
@@ -43461,6 +43478,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                                     controller, "last_curtail_limit_w", None
                                 )
                                 is not None
+                                and getattr(controller, "last_curtail_mode", None) != "native_export"
                             ),
                             physical_converged=fronius_physical_converged,
                             residual_export_w=fronius_residual_export_w,
@@ -43525,7 +43543,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                                 else home_load_w,
                                 update_dpel_time=inverter_brand == "enphase",
                                 device_limit_confirmed=(
-                                    True if inverter_brand == "fronius" else None
+                                    getattr(controller, "last_curtail_mode", None) != "native_export"
+                                    if inverter_brand == "fronius" else None
                                 ),
                                 physical_converged=fronius_physical_converged,
                                 residual_export_w=fronius_residual_export_w,
