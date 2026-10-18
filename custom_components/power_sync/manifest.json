@@ -1,14 +1,30 @@
 {
   "domain": "power_sync",
   "name": "PowerSync",
-  "after_dependencies": ["lovelace", "recorder", "tesla_fleet", "zeroconf", "esy_sunhome"],
-  "codeowners": ["@benboller"],
+  "after_dependencies": [
+    "lovelace",
+    "recorder",
+    "tesla_fleet",
+    "zeroconf",
+    "esy_sunhome"
+  ],
+  "codeowners": [
+    "@benboller"
+  ],
   "config_flow": true,
-  "dependencies": ["frontend", "http"],
+  "dependencies": [
+    "frontend",
+    "http"
+  ],
   "documentation": "https://github.com/bolagnaise/PowerSync",
   "integration_type": "hub",
   "iot_class": "cloud_polling",
   "issue_tracker": "https://discord.gg/eaWDWxEWE3",
-  "requirements": ["aemo-to-tariff>=0.7.15", "goodwe>=0.4.9", "protobuf>=4.25.0", "highspy>=1.7.0"],
-  "version": "2.12.1423"
+  "requirements": [
+    "aemo-to-tariff>=0.7.15",
+    "goodwe>=0.4.9",
+    "protobuf>=4.25.0",
+    "highspy>=1.7.0"
+  ],
+  "version": "2.12.1424"
 }
