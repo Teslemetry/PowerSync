@@ -18,6 +18,7 @@ INVERTER_BRANDS = {
     "goodwe_entity": "GoodWe (Home Assistant entities)",
     "huawei": "Huawei",
     "enphase": "Enphase",
+    "enphase_envoy": "Enphase (Envoy Installer integration)",
     "zeversolar": "Zeversolar",
     "sigenergy": "Sigenergy",
     "foxess": "FoxESS",
@@ -279,6 +280,13 @@ def get_inverter_controller(
         InverterController instance or None if brand not supported
     """
     brand_lower = brand.lower() if brand else ""
+
+    if brand_lower == "enphase_envoy":
+        if hass is None or not entity_prefix:
+            return None
+        from .enphase_envoy import EnphaseEnvoyController
+
+        return EnphaseEnvoyController(hass, entity_prefix, entry_id, model or "export")
 
     if brand_lower == "goodwe_entity":
         if hass is None or not entity_prefix:

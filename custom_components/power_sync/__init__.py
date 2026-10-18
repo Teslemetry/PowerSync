@@ -9524,7 +9524,7 @@ class InverterStatusView(HomeAssistantView):
             entry.data.get(CONF_ENPHASE_IS_INSTALLER, False)
         )
 
-        if not inverter_host and inverter_brand != "goodwe_entity":
+        if not inverter_host and inverter_brand not in ("goodwe_entity", "enphase_envoy"):
             return web.json_response({
                 "success": True,
                 "enabled": True,
@@ -25521,7 +25521,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             entry.data.get(CONF_ENPHASE_IS_INSTALLER, False)
         )
 
-        if not inverter_host and inverter_brand != "goodwe_entity":
+        if not inverter_host and inverter_brand not in ("goodwe_entity", "enphase_envoy"):
             _LOGGER.warning("Inverter curtailment enabled but no host configured")
             return False
 
@@ -25606,7 +25606,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 # Limit = home load + battery charge rate (so we don't export but still charge battery)
                 home_load_w = None
                 curtail_live_status = None
-                if inverter_brand in ("zeversolar", "sigenergy", "sungrow", "enphase", "foxess", "huawei", "goodwe", "solax", "alphaess", "solaredge", "fronius"):
+                if inverter_brand in ("zeversolar", "sigenergy", "sungrow", "enphase", "enphase_envoy", "foxess", "huawei", "goodwe", "solax", "alphaess", "solaredge", "fronius"):
                     live_status = await get_live_status()
                     curtail_live_status = live_status
                     if _aemo_dispatch_entry_data() is not entry_data:
@@ -41563,7 +41563,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             entry.data.get(CONF_ENPHASE_IS_INSTALLER, False)
         )
 
-        if not inverter_host and inverter_brand != "goodwe_entity":
+        if not inverter_host and inverter_brand not in ("goodwe_entity", "enphase_envoy"):
             _LOGGER.warning("No inverter host configured")
             return
 
@@ -41612,11 +41612,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 _LOGGER.info(f"🔴 Shutting down {inverter_brand} inverter at {inverter_host}")
                 # For Zeversolar, home_load_w=0 triggers 0% shutdown
                 # For others, curtail() does their native shutdown/zero-export
-                if inverter_brand == "zeversolar":
+                if inverter_brand in ("zeversolar", "enphase_envoy"):
                     home_load_w = 0
             else:
                 # Load-following mode - get home load for dynamic limiting
-                if inverter_brand in ("zeversolar", "sigenergy", "sungrow", "enphase", "foxess", "huawei", "goodwe", "solax", "alphaess", "solaredge"):
+                if inverter_brand in ("zeversolar", "sigenergy", "sungrow", "enphase", "enphase_envoy", "foxess", "huawei", "goodwe", "solax", "alphaess", "solaredge"):
                     live_status = await get_live_status()
                     if live_status and live_status.get("load_power"):
                         home_load_w = int(live_status.get("load_power", 0))
@@ -41624,8 +41624,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
                 _LOGGER.info(f"🔴 Curtailing {inverter_brand} inverter at {inverter_host}")
 
-            # Call curtail with appropriate parameters
-            if home_load_w is not None and hasattr(controller, 'curtail'):
+            # Keep native zero-export mode distinct from an explicit PV stop.
+            if inverter_brand == "enphase_envoy" and mode == "shutdown":
+                success = await controller.curtail(shutdown=True)
+            elif home_load_w is not None and hasattr(controller, 'curtail'):
                 import inspect
                 sig = inspect.signature(controller.curtail)
                 if 'home_load_w' in sig.parameters:
@@ -41745,7 +41747,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             entry.data.get(CONF_ENPHASE_IS_INSTALLER, False)
         )
 
-        if not inverter_host and inverter_brand != "goodwe_entity":
+        if not inverter_host and inverter_brand not in ("goodwe_entity", "enphase_envoy"):
             _LOGGER.warning("No inverter host configured")
             return
 
@@ -43357,15 +43359,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 return
 
             # Only brands with load-following curtail() support
-            if inverter_brand not in ("zeversolar", "sigenergy", "sungrow", "enphase", "foxess", "huawei", "goodwe", "solax", "alphaess", "solaredge", "fronius"):
+            if inverter_brand not in ("zeversolar", "sigenergy", "sungrow", "enphase", "enphase_envoy", "foxess", "huawei", "goodwe", "solax", "alphaess", "solaredge", "fronius"):
                 return
 
-            if not inverter_host:
+            if not inverter_host and inverter_brand != "enphase_envoy":
                 return
 
             # Get inverter controller
             controller = entry_data.get("inverter_controller")
             if not controller:
+                return
+            if inverter_brand == "enphase_envoy" and controller.model == "export":
+                # Envoy's CT loop follows local demand without software rewrites.
                 return
 
             async def _curtail_current_controller(**kwargs):

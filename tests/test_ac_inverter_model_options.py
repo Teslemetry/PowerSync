@@ -66,3 +66,10 @@ def test_solaredge_ac_inverter_options_are_available():
     assert "energy-hub" in models
     assert "three-phase" in models
     assert models != const["SUNGROW_MODELS"]
+
+
+def test_envoy_installer_modes_are_explicit_and_require_no_modbus_endpoint():
+    const = _load_ac_inverter_namespace()
+    assert const["INVERTER_BRANDS"]["enphase_envoy"] == "Enphase (Envoy Installer integration)"
+    assert list(const["get_models_for_brand"]("enphase_envoy")) == ["export", "production"]
+    assert const["get_brand_defaults"]("enphase_envoy") == {"port": 0, "slave_id": 1}

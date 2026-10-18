@@ -5932,7 +5932,7 @@ class InverterStatusSensor(RestoreEntity, SensorEntity):
         enphase_normal_profile = self._get_config_value(CONF_ENPHASE_NORMAL_PROFILE)
         enphase_zero_export_profile = self._get_config_value(CONF_ENPHASE_ZERO_EXPORT_PROFILE)
 
-        if not inverter_host and inverter_brand != "goodwe_entity":
+        if not inverter_host and inverter_brand not in ("goodwe_entity", "enphase_envoy"):
             _LOGGER.debug("Inverter host not configured - skipping poll")
             self._cached_state = "not_configured"
             self.async_write_ha_state()

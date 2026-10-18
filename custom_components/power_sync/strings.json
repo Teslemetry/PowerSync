@@ -1191,6 +1191,8 @@
       "modbus_conflict": "Connected but received invalid data (SOC > 100%). Another integration is likely using Modbus on the same port. Disable other Modbus integrations for this inverter and retry.",
       "sungrow_modbus_conflict": "The AC inverter curtailment path cannot use the same Sungrow Modbus IP, port, and slave ID as the battery system. Disable this option for a hybrid-only setup, or configure a separate AC-coupled/string inverter endpoint.",
       "alphaess_cloud_required": "AlphaESS Cloud monitoring requires both an App ID and App Secret.",
+      "envoy_entity_prefix_required": "Enter the Envoy Installer entity prefix, for example envoy_123456789012.",
+      "envoy_entity_unavailable": "Enable the DPEL switch, limit number and mode select entities from the same Envoy Installer gateway. Check that they are available and the limit uses watts.",
       "goodwe_entity_prefix_required": "Enter the GoodWe Experimental entity prefix, for example goodwe.",
       "goodwe_entity_unavailable": "PowerSync could not validate the GoodWe PV power, grid export limit, and grid export limit switch entities for that prefix.",
       "foxess_host_required": "IP address is required -- enter the local IP of your FoxESS inverter.",
@@ -1271,6 +1273,8 @@
       "invalid_ai_summary_settings": "Check the AI provider and model settings. Clear the saved provider key or enter a replacement, not both.",
       "invalid_grid_charge_blackout_windows": "Enter one or more valid HH:MM blackout ranges with different start and end times.",
       "alphaess_cloud_required": "AlphaESS Cloud monitoring requires both an App ID and App Secret.",
+      "envoy_entity_prefix_required": "Enter the Envoy Installer entity prefix, for example envoy_123456789012.",
+      "envoy_entity_unavailable": "Enable the DPEL switch, limit number and mode select entities from the same Envoy Installer gateway. Check that they are available and the limit uses watts.",
       "goodwe_entity_prefix_required": "Enter the GoodWe Experimental entity prefix, for example goodwe.",
       "goodwe_entity_unavailable": "PowerSync could not validate the GoodWe PV power, grid export limit, and grid export limit switch entities for that prefix.",
       "invalid_globird_auth": "Email or password is incorrect. Check your GloBird portal login credentials.",
@@ -2167,13 +2171,13 @@
           "ac_inverter_curtailment_enabled": "Enable separate AC-coupled inverter shutdown",
           "inverter_brand": "Inverter brand",
           "inverter_model": "Inverter model",
-          "inverter_entity_prefix": "GoodWe entity prefix",
+          "inverter_entity_prefix": "Inverter entity prefix",
           "inverter_host": "IP address / hostname",
           "inverter_port": "Port",
           "inverter_slave_id": "Modbus slave ID"
         },
         "data_description": {
-          "inverter_entity_prefix": "Prefix used by GoodWe Experimental entities. For sensor.goodwe_pv_power, enter goodwe.",
+          "inverter_entity_prefix": "Prefix of the inverter entities. For number.envoy_123_dpel_limit, enter envoy_123; for sensor.goodwe_pv_power, enter goodwe.",
           "update_amber_token": "Paste a new Amber API token to rotate it. Leave blank to keep your current token.",
           "auto_sync_enabled": "When enabled, PowerSync uploads a new TOU tariff schedule to your battery every 5 minutes based on current Amber prices.",
           "amber_forecast_type": "Predicted is balanced. Low assumes cheaper prices (more aggressive charging). High assumes expensive prices (more conservative).",
@@ -2788,7 +2792,7 @@
         "description": "Update your {brand} inverter connection settings. Changes take effect immediately.",
         "data": {
           "inverter_model": "Inverter model",
-          "inverter_entity_prefix": "GoodWe entity prefix",
+          "inverter_entity_prefix": "Inverter entity prefix",
           "inverter_host": "IP address / hostname",
           "inverter_port": "Port",
           "inverter_slave_id": "Modbus slave ID",
@@ -2803,7 +2807,7 @@
           "fronius_load_following": "Enable load following mode"
         },
         "data_description": {
-          "inverter_entity_prefix": "Prefix used by GoodWe Experimental entities. For sensor.goodwe_pv_power, enter goodwe.",
+          "inverter_entity_prefix": "Prefix of the inverter entities. For number.envoy_123_dpel_limit, enter envoy_123; for sensor.goodwe_pv_power, enter goodwe.",
           "inverter_host": "Local IP address of your inverter or gateway.",
           "inverter_port": "502 for Modbus (Sungrow, Fronius, GoodWe, Huawei), 443 for Enphase.",
           "inverter_slave_id": "Usually 1. GoodWe uses 247 by default.",

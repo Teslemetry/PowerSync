@@ -419,6 +419,8 @@ def _run_fast_load_following_case(
     kind: str,
     *,
     brand: str = "sungrow",
+    model: str = "production",
+    host: str = "192.0.2.10",
     current_limit: int | None = None,
     load_power: int | None = 100,
     site_load_power: int | None = None,
@@ -446,6 +448,7 @@ def _run_fast_load_following_case(
     controller = SimpleNamespace(
         curtail=_curtail,
         last_curtail_limit_w=applied_device_limit_w,
+        model=model,
     )
     live_entry_data = {
         "aemo_dispatch_generation": old_generation,
@@ -472,7 +475,7 @@ def _run_fast_load_following_case(
         data={
             "ac_inverter_curtailment_enabled": True,
             "inverter_brand": brand,
-            "inverter_host": "192.0.2.10",
+            "inverter_host": host,
         },
     )
 
@@ -649,7 +652,7 @@ def test_fronius_ac_inverter_uses_load_following_and_fast_refresh():
     ]
     assert '"fronius"' in refresh_source[
         refresh_source.index("if inverter_brand not in ("):
-        refresh_source.index("if not inverter_host:")
+        refresh_source.index("# Get inverter controller")
     ]
 
 
@@ -1763,3 +1766,27 @@ def test_sungrow_failed_curtailment_restore_does_not_latch_curtailed():
     state = hass.data["power_sync"]["entry-1"]
     assert state["sungrow_curtailment_state"] == "pending"
     assert state["sungrow_power_limit_w"] is None
+
+
+def test_envoy_production_mode_refreshes_without_a_network_host():
+    _, status_calls, commands, _, _ = _run_fast_load_following_case(
+        "live", brand="enphase_envoy", model="production", host="", load_power=1800
+    )
+    assert status_calls == [True]
+    assert commands == [1800]
+
+
+def test_envoy_native_export_mode_needs_no_software_refresh():
+    _, status_calls, commands, _, _ = _run_fast_load_following_case(
+        "live", brand="enphase_envoy", model="export", host="", load_power=1800
+    )
+    assert status_calls == []
+    assert commands == []
+
+
+def test_envoy_production_refresh_respects_monitoring_mode():
+    _, status_calls, commands, _, _ = _run_fast_load_following_case(
+        "live", brand="enphase_envoy", model="production", host="", monitoring_mode=True
+    )
+    assert status_calls == []
+    assert commands == []

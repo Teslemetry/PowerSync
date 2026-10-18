@@ -15523,9 +15523,13 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                 ):
                     errors["base"] = "sungrow_modbus_conflict"
 
-            if inverter_brand == "goodwe_entity":
+            if inverter_brand in ("goodwe_entity", "enphase_envoy"):
+                prefix_error = ("envoy_entity_prefix_required" if inverter_brand == "enphase_envoy"
+                                else "goodwe_entity_prefix_required")
+                unavailable_error = ("envoy_entity_unavailable" if inverter_brand == "enphase_envoy"
+                                     else "goodwe_entity_unavailable")
                 if not inverter_entity_prefix:
-                    errors["base"] = "goodwe_entity_prefix_required"
+                    errors["base"] = prefix_error
                 else:
                     from .inverters import get_inverter_controller
 
@@ -15537,17 +15541,17 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                         hass=self.hass,
                     )
                     if controller is None:
-                        errors["base"] = "goodwe_entity_unavailable"
+                        errors["base"] = unavailable_error
                     else:
                         try:
                             connected = await controller.connect()
                             if not connected:
-                                errors["base"] = "goodwe_entity_unavailable"
+                                errors["base"] = unavailable_error
                         except Exception as err:
                             _LOGGER.warning(
-                                "GoodWe HA entity validation failed: %s", err
+                                "%s HA entity validation failed: %s", inverter_brand, err
                             )
-                            errors["base"] = "goodwe_entity_unavailable"
+                            errors["base"] = unavailable_error
                         finally:
                             await controller.disconnect()
 
@@ -15561,7 +15565,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                     final_data[CONF_AC_INVERTER_CURTAILMENT_ENABLED] = True
                 final_data[CONF_INVERTER_BRAND] = inverter_brand
                 final_data[CONF_INVERTER_MODEL] = inverter_model
-                if inverter_brand == "goodwe_entity":
+                if inverter_brand in ("goodwe_entity", "enphase_envoy"):
                     final_data[CONF_INVERTER_ENTITY_PREFIX] = inverter_entity_prefix
                     final_data[CONF_INVERTER_HOST] = ""
                     final_data[CONF_INVERTER_PORT] = 0
@@ -15574,7 +15578,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
                     )
 
                 # Only include slave ID for Modbus brands (not Enphase/Zeversolar which use HTTP)
-                if inverter_brand not in ("enphase", "zeversolar", "goodwe_entity"):
+                if inverter_brand not in ("enphase", "zeversolar", "goodwe_entity", "enphase_envoy"):
                     final_data[CONF_INVERTER_SLAVE_ID] = inverter_slave_id
                 else:
                     final_data[CONF_INVERTER_SLAVE_ID] = (
@@ -15666,7 +15670,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
             )),
         }
 
-        if brand == "goodwe_entity":
+        if brand in ("goodwe_entity", "enphase_envoy"):
             schema_dict[
                 vol.Required(
                     CONF_INVERTER_ENTITY_PREFIX,
@@ -15684,7 +15688,7 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
             ))
 
         # Only show Slave ID for Modbus brands (not Enphase/Zeversolar which use HTTP)
-        if brand not in ("enphase", "zeversolar", "goodwe_entity"):
+        if brand not in ("enphase", "zeversolar", "goodwe_entity", "enphase_envoy"):
             schema_dict[
                 vol.Required(
                     CONF_INVERTER_SLAVE_ID,

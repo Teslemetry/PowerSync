@@ -40,6 +40,7 @@ class _Controller:
 
     async def curtail(self, **_kwargs) -> bool:
         self.curtail_calls += 1
+        self.last_curtail_kwargs = _kwargs
         return self.curtail_result
 
     async def restore(self) -> bool:
@@ -50,7 +51,7 @@ class _Controller:
         self.disconnect_calls += 1
 
 
-def _handlers(controller: _Controller):
+def _handlers(controller: _Controller, brand="enphase", host="192.0.2.10"):
     entry_id = "entry-id"
     entry_data: dict[str, object] = {}
     hass = SimpleNamespace(data={"power_sync": {entry_id: entry_data}})
@@ -59,8 +60,8 @@ def _handlers(controller: _Controller):
         options={},
         data={
             "ac_inverter_curtailment_enabled": True,
-            "inverter_brand": "enphase",
-            "inverter_host": "192.0.2.10",
+            "inverter_brand": brand,
+            "inverter_host": host,
         },
     )
     created = []
@@ -152,3 +153,22 @@ def test_failed_manual_curtail_closes_and_does_not_retain_controller():
     assert controller.disconnect_calls == 1
     assert "inverter_controller" not in entry_data
     assert states == []
+
+
+def test_envoy_entity_manual_control_does_not_require_a_network_host():
+    controller = _Controller()
+    namespace, entry_data, created, states = _handlers(
+        controller, brand="enphase_envoy", host=""
+    )
+    asyncio.run(namespace["handle_curtail_inverter"](SimpleNamespace(data={})))
+    asyncio.run(namespace["handle_restore_inverter"](SimpleNamespace(data={})))
+    assert created == [controller]
+    assert controller.curtail_calls == controller.restore_calls == 1
+    assert states[-1] == ("normal",)
+
+
+def test_envoy_manual_shutdown_requests_an_explicit_production_stop():
+    controller = _Controller()
+    namespace, _, _, _ = _handlers(controller, brand="enphase_envoy", host="")
+    asyncio.run(namespace["handle_curtail_inverter"](SimpleNamespace(data={"mode": "shutdown"})))
+    assert controller.last_curtail_kwargs == {"shutdown": True}
