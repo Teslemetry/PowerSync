@@ -10715,6 +10715,14 @@ class SolarEdgeEnergyCoordinator(
             return False
         return await self._control_result(self._controller.set_backup_reserve(percent, automatic=automatic))
 
+    async def read_external_control(self, operation, *, read_allowed=None):
+        """Read a curtailment limit under the shared SolarEdge control lock."""
+        if not self._native_control_allowed("SolarEdge curtailment readback"):
+            return None
+        return await self._controller.read_external_control(
+            operation, read_allowed=read_allowed
+        )
+
     async def run_external_mutation(
         self, operation, *, automatic: bool = False, write_allowed=None, determinate=None
     ) -> bool:

@@ -28944,10 +28944,53 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         )
                     return
 
+                def curtailment_write_allowed():
+                    return (
+                        _direct_dc_curtailment_write_allowed()
+                        and not _solaredge_force_dispatch_active(entry_data)
+                    )
+
+                if current_state in {"curtailed", "pending"}:
+                    # A successful write in this process does not survive an
+                    # inverter-only reset. Read under the battery mutation lock
+                    # and close the direct connection before releasing it.
+                    async def read_limit():
+                        try:
+                            return await controller.read_active_power_limit()
+                        finally:
+                            await controller.disconnect()
+
+                    try:
+                        limit = await coordinator.read_external_control(
+                            read_limit, read_allowed=curtailment_write_allowed
+                        )
+                    except Exception as err:
+                        _LOGGER.warning("SolarEdge curtailment limit readback failed: %s", err)
+                        limit = None
+                    if limit == 0:
+                        entry_data["solaredge_curtailment_state"] = "curtailed"
+                        await _persist_solaredge_curtailment_marker(entry_data, True)
+                        if current_state != "curtailed":
+                            async_dispatcher_send(
+                                hass, f"power_sync_curtailment_updated_{entry.entry_id}"
+                            )
+                        return
+                    entry_data["solaredge_curtailment_state"] = "pending"
+                    async_dispatcher_send(
+                        hass, f"power_sync_curtailment_updated_{entry.entry_id}"
+                    )
+                    if limit is None:
+                        _LOGGER.warning(
+                            "SolarEdge curtailment pending: current active-power limit unavailable"
+                        )
+                        return
+                    current_state = "pending"
+                    _LOGGER.warning(
+                        "SolarEdge owned curtailment limit changed to %s%%; reapplying 0%%",
+                        limit,
+                    )
+
                 if current_state != "curtailed":
-                    # "pending" is an unverified limit from a previous process.
-                    # The limit is an absolute register, so re-asserting it is
-                    # idempotent and cheaper than trusting a stale marker.
                     _LOGGER.info(
                         "SolarEdge curtailment TRIGGERED: export_earnings=%.2fc (below threshold) -> active power 0%%",
                         export_earnings,
@@ -28956,11 +28999,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         coordinator,
                         controller,
                         controller.curtail,
-                        write_allowed=_direct_dc_curtailment_write_allowed,
+                        write_allowed=curtailment_write_allowed,
                     )
                     if success:
                         entry_data["solaredge_curtailment_state"] = "curtailed"
                         await _persist_solaredge_curtailment_marker(entry_data, True)
+                        if current_state == "pending":
+                            async_dispatcher_send(
+                                hass, f"power_sync_curtailment_updated_{entry.entry_id}"
+                            )
                     else:
                         _LOGGER.error("SolarEdge curtail() failed")
                 else:

@@ -702,14 +702,133 @@ def test_duplicate_solaredge_generic_control_returns_before_controller_creation(
         "ac_inverter_is_same_hybrid": lambda: True,
         "_aemo_dispatch_entry_data": dict,
         "_LOGGER": logging.getLogger(__name__),
-        "entry": SimpleNamespace(data={}, options={"enabled": True}),
+        "entry": SimpleNamespace(entry_id="entry", data={}, options={"enabled": True}),
         "CONF_AC_INVERTER_CURTAILMENT_ENABLED": "enabled",
         "INVERTER_CONTROL_MODE_LOAD_FOLLOWING": "load_following",
         "INVERTER_CONTROL_MODE_SHUTDOWN": "shutdown",
+        "hass": SimpleNamespace(data={}),
+        "DOMAIN": "power_sync",
     }
     call = _load_node(node, namespace)
     argument = SimpleNamespace(data={}) if name.startswith("handle_") else True
     assert asyncio.run(call(argument)) is result
+
+
+def _solaredge_curtailment_recovery_runtime():
+    """Build the real price handler around an observable device boundary."""
+    writes = []
+    device_limit = [0]
+    permission = [True]
+    force = [False]
+
+    async def curtail():
+        writes.append(0)
+        device_limit[0] = 0
+        return True
+
+    direct = SimpleNamespace(curtail=curtail, restore=AsyncMock(return_value=True),
+                             disconnect=AsyncMock())
+    async def read(operation, *, read_allowed=None):
+        if read_allowed is not None and not read_allowed():
+            return None
+        return await operation()
+    direct.read_active_power_limit = AsyncMock(side_effect=lambda: device_limit[0])
+    coord = SimpleNamespace(control_health="ready", mutation_active=False,
+                            read_external_control=read)
+    entry_data = {"solaredge_coordinator": coord, "solaredge_curtailment_state": "normal"}
+    persist = AsyncMock()
+    async def write(coordinator, controller, operation, *, write_allowed=None):
+        if write_allowed is not None and not write_allowed():
+            return False
+        return await operation()
+    namespace = {
+        "hass": SimpleNamespace(data={"power_sync": {"entry": entry_data}}),
+        "entry": SimpleNamespace(entry_id="entry", options={"enabled": True}, data={}),
+        "DOMAIN": "power_sync", "CONF_SOLAREDGE_DC_CURTAILMENT_ENABLED": "enabled",
+        "battery_connection_profile": SimpleNamespace(profile_id="solaredge_composite"),
+        "_LOGGER": logging.getLogger(__name__),
+        "_get_solaredge_curtailment_controller": lambda _: direct,
+        "_direct_dc_curtailment_write_allowed": lambda: permission[0],
+        "_solaredge_force_dispatch_active": lambda _: force[0],
+        "export_earnings_are_uneconomic": lambda earnings, *_: earnings < 0,
+        "_solaredge_curtailment_write": write,
+        "_persist_solaredge_curtailment_marker": persist,
+        "async_dispatcher_send": Mock(),
+    }
+    handler = _load_node(_setup_node("handle_solaredge_curtailment"), namespace)
+    return SimpleNamespace(**locals())
+
+
+@pytest.mark.parametrize("limit", [0, 1, 35, 100, None])
+@pytest.mark.parametrize("initial_state", ["curtailed", "pending"])
+def test_owned_solaredge_curtailment_checks_device_limit(limit, initial_state):
+    """A device-only reset must not be hidden by an old acknowledgement."""
+    runtime = _solaredge_curtailment_recovery_runtime()
+    handler, writes, entry_data, device_limit, direct = (
+        runtime.handler, runtime.writes, runtime.entry_data, runtime.device_limit, runtime.direct
+    )
+    async def scenario():
+        await handler(feedin_price=25, import_price=30)
+        assert writes == [0]
+        entry_data["solaredge_curtailment_state"] = initial_state
+        device_limit[0] = limit
+        await handler(feedin_price=25, import_price=30)
+        assert writes == ([0, 0] if limit not in (0, None) else [0])
+        assert entry_data["solaredge_curtailment_state"] == ("pending" if limit is None else "curtailed")
+        if limit == 0:
+            persist_calls = runtime.persist.await_args_list
+            assert persist_calls[-1].args == (entry_data, True)
+            if initial_state == "pending":
+                runtime.namespace["async_dispatcher_send"].assert_called_with(
+                    runtime.namespace["hass"], "power_sync_curtailment_updated_entry"
+                )
+        # Unknown readback remains pending without turning the next tick into
+        # a blind retry. A confirmed limit does not cause repeated writes.
+        await handler(feedin_price=25, import_price=30)
+        assert writes == ([0, 0] if limit not in (0, None) else [0])
+        direct.read_active_power_limit.assert_awaited()
+        await handler(feedin_price=-10, import_price=30)
+        direct.restore.assert_awaited_once()
+        assert entry_data["solaredge_curtailment_state"] == "normal"
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("gate", ["monitoring", "external", "force", "busy", "not_ready", "disabled", "permission_during_read", "force_during_read", "read_error", "write_rejected"])
+def test_solaredge_limit_recovery_preserves_current_control_gates(gate):
+    runtime = _solaredge_curtailment_recovery_runtime()
+    async def scenario():
+        await runtime.handler(feedin_price=25, import_price=30)
+        assert runtime.writes == [0]
+        runtime.device_limit[0] = 100
+        if gate in {"monitoring", "external"}:
+            runtime.permission[0] = False
+        elif gate == "force":
+            runtime.force[0] = True
+            runtime.namespace["_restore_solaredge_curtailment_for_dispatch"] = AsyncMock(return_value=False)
+        elif gate == "busy":
+            runtime.coord.mutation_active = True
+        elif gate == "not_ready":
+            runtime.coord.control_health = "reconciliation_required"
+        elif gate == "disabled":
+            runtime.namespace["entry"].options["enabled"] = False
+        elif gate in {"permission_during_read", "force_during_read"}:
+            async def read():
+                if gate == "permission_during_read":
+                    runtime.permission[0] = False
+                else:
+                    runtime.force[0] = True
+                return 100
+            runtime.direct.read_active_power_limit.side_effect = read
+        elif gate == "read_error":
+            runtime.direct.read_active_power_limit.side_effect = TimeoutError("read unavailable")
+        elif gate == "write_rejected":
+            runtime.direct.curtail = AsyncMock(return_value=False)
+        await runtime.handler(feedin_price=25, import_price=30)
+        assert runtime.writes == [0]
+        if gate in {"monitoring", "external", "permission_during_read", "force_during_read", "read_error", "write_rejected"}:
+            assert runtime.entry_data["solaredge_curtailment_state"] == "pending"
+        assert runtime.persist.await_count == 1  # Initial owned limit remains recorded.
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize(

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
 import types
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -86,6 +88,64 @@ def test_solaredge_zero_curtail_and_restore_write_percent_limits():
     assert asyncio.run(controller.curtail())
     assert asyncio.run(controller.restore())
     assert writes == [0, 100]
+
+
+@pytest.mark.parametrize("raw, expected", [(0, 0), (100, 100), (1, 1), (65535, None), (-1, None), (None, None)])
+def test_solaredge_active_limit_readback_validates_direct_register(raw, expected):
+    controller = SolarEdgeController(host="inverter")
+    controller._connected = True
+    controller._read_holding_registers = AsyncMock(return_value=None if raw is None else [raw])
+    controller._set_active_power_limit = AsyncMock()
+    assert asyncio.run(controller.read_active_power_limit()) == expected
+    controller._read_holding_registers.assert_awaited_once_with(controller.REG_ACTIVE_POWER_LIMIT, 1)
+    controller._set_active_power_limit.assert_not_awaited()
+
+
+@pytest.mark.parametrize("fresh", [True, False])
+@pytest.mark.parametrize("raw, expected", [("0", 0), ("0.5", 0.5), ("100", 100), ("nan", None), ("inf", None), ("unavailable", None)])
+def test_solaredge_active_limit_entity_requires_fresh_selected_readback(fresh, raw, expected):
+    selected = "number.custom_active_power_limit"
+    state = types.SimpleNamespace(state="0", last_reported=datetime.now(timezone.utc) - timedelta(minutes=10))
+    other = types.SimpleNamespace(state="0", last_reported=datetime.now(timezone.utc))
+    states = {selected: state, "number.solaredge_active_power_limit": other}
+    async def refresh(domain, service, data, *, blocking):
+        assert (domain, service, data, blocking) == ("homeassistant", "update_entity", {"entity_id": selected}, True)
+        state.state = raw
+        if fresh:
+            state.last_reported = datetime.now(timezone.utc)
+    hass = types.SimpleNamespace(states=types.SimpleNamespace(get=states.get),
+                                 services=types.SimpleNamespace(async_call=refresh))
+    controller = SolarEdgeController(host="", entity_prefix="custom", hass=hass)
+    controller._connected = True
+    controller._use_entity_mode = True
+    controller._active_power_limit_entity = selected
+    assert asyncio.run(controller.read_active_power_limit()) == (expected if fresh else None)
+
+
+@pytest.mark.parametrize("blocked", ["none", "busy", "health", "permission"])
+def test_solaredge_read_only_control_uses_shared_lock_without_mutation(blocked):
+    async def scenario():
+        controller = SolarEdgeEnergyController(_SEHass(), entity_prefix="solaredge")
+        session = controller._coordinator()
+        await controller._load_session(session)
+        if blocked == "health":
+            session.health = "reconciliation_required"
+        if blocked == "busy":
+            await session.lock.acquire()
+        saved = session.store.data.copy() if session.store.data else None
+        async def read():
+            assert session.lock.locked()
+            return 100
+        callback = AsyncMock(side_effect=read)
+        try:
+            result = await controller.read_external_control(callback, read_allowed=lambda: blocked != "permission")
+            assert result == (100 if blocked == "none" else None)
+            assert callback.await_count == (1 if blocked == "none" else 0)
+            assert session.store.data == saved
+        finally:
+            if blocked == "busy":
+                session.lock.release()
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("entity_prefix", ["custom", "custom_*"])
@@ -2976,7 +3036,8 @@ def test_solaredge_curtailment_release_survives_a_reload(marker_persisted):
     asyncio.run(scenario())
 
 
-def test_solaredge_curtailment_records_ownership_across_a_restart():
+@pytest.mark.parametrize("limit", [0, 100, None])
+def test_solaredge_curtailment_records_ownership_across_a_restart(limit):
     """A curtail must leave a marker so the next process can still release it."""
     import ast
     import logging
@@ -2990,6 +3051,7 @@ def test_solaredge_curtailment_records_ownership_across_a_restart():
             curtail=AsyncMock(return_value=True),
             restore=AsyncMock(return_value=True),
             disconnect=AsyncMock(),
+            read_active_power_limit=AsyncMock(return_value=limit),
         )
         store = _MemoryStore()
         entry_data = {
@@ -3009,6 +3071,7 @@ def test_solaredge_curtailment_records_ownership_across_a_restart():
                 profile_id="solaredge_composite"
             ),
             "_LOGGER": logging.getLogger(__name__),
+            "async_dispatcher_send": lambda *_: None,
             "_get_solaredge_curtailment_controller": lambda _: direct,
             "_direct_dc_curtailment_write_allowed": lambda: True,
             "_solaredge_force_dispatch_active": lambda _: False,
@@ -3036,12 +3099,15 @@ def test_solaredge_curtailment_records_ownership_across_a_restart():
         assert entry_data["solaredge_curtailment_state"] == "curtailed"
         assert store.data["solaredge_curtailment_owned"] is True
 
-        # A stale "pending" marker must still re-assert the limit: the absolute
-        # register write is idempotent and cheaper than trusting the marker.
+        # The restarted process verifies the old owned limit before deciding
+        # whether to reapply it; unavailable readback must remain pending.
         entry_data["solaredge_curtailment_state"] = "pending"
         await namespace["handle_solaredge_curtailment"](feedin_price=10.0, import_price=5.0)
-        assert direct.curtail.await_count == 2
-        assert entry_data["solaredge_curtailment_state"] == "curtailed"
+        assert direct.curtail.await_count == (2 if limit == 100 else 1)
+        assert entry_data["solaredge_curtailment_state"] == (
+            "pending" if limit is None else "curtailed"
+        )
+        assert store.data["solaredge_curtailment_owned"] is True
 
     asyncio.run(scenario())
 

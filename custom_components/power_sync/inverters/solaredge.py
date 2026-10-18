@@ -456,6 +456,27 @@ class SolarEdgeController(InverterController):
             _LOGGER.info("SolarEdge active power limit restored to 100%%")
         return ok
 
+    async def read_active_power_limit(self) -> float | None:
+        """Read the selected limit, refreshing upstream entities before trusting them."""
+        if not self._connected and not await self.connect():
+            return None
+        if self._use_entity_mode:
+            entity = self._active_power_limit_entity or self._find_active_power_limit_entity()
+            if not entity or not self._hass:
+                return None
+            requested_at = datetime.now(timezone.utc)
+            await self._hass.services.async_call(
+                "homeassistant", "update_entity", {"entity_id": entity}, blocking=True
+            )
+            state = self._hass.states.get(entity)
+            reported_at = getattr(state, "last_reported", None) or getattr(state, "last_updated", None)
+            if reported_at is None or reported_at < requested_at:
+                return None
+        limit = await self._get_active_power_limit()
+        if limit is None or not math.isfinite(limit) or not 0 <= limit <= 100:
+            return None
+        return limit
+
     async def get_status(self) -> InverterState:
         """Read current SolarEdge telemetry and curtailment state."""
         if not self._connected and not await self.connect():
@@ -560,13 +581,13 @@ class SolarEdgeController(InverterController):
             _LOGGER.error("SolarEdge active power limit write error: %s", err)
             return False
 
-    async def _get_active_power_limit(self) -> int | None:
+    async def _get_active_power_limit(self) -> float | None:
         if self._use_entity_mode:
             entity = self._active_power_limit_entity or self._find_active_power_limit_entity()
             state = self._hass.states.get(entity) if self._hass and entity else None
             if state and state.state not in ("unknown", "unavailable", None):
                 try:
-                    return int(float(state.state))
+                    return float(state.state)
                 except (TypeError, ValueError):
                     return None
             return None
@@ -1560,6 +1581,19 @@ class SolarEdgeEnergyController:
         if mode in {"autonomous", "normal"}:
             return await self.restore_normal()
         return False
+
+    async def read_external_control(self, callback, *, read_allowed=None):
+        """Serialize a read-only control check without journalling a hardware write."""
+        session = self._coordinator()
+        if session.lock.locked():
+            return None
+        async with session.lock:
+            await self._load_session(session)
+            if session.health != "ready":
+                return None
+            if read_allowed is not None and not read_allowed():
+                return None
+            return await callback()
 
     async def run_external_mutation(
         self, callback, *, automatic=False, write_allowed=None, determinate=None
