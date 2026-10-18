@@ -28959,7 +28959,35 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     return (
                         _direct_dc_curtailment_write_allowed()
                         and not _solaredge_force_dispatch_active(entry_data)
+                        and hass.data.get(DOMAIN, {}).get(entry.entry_id) is entry_data
+                        and (
+                            home_load_w is None
+                            or controller.load_following_target_w(coordinator.data) == home_load_w
+                        )
                     )
+
+                # A full inverter stop also blocks solar/battery supply to the
+                # house. Keep it only while the site is paid to import; cap
+                # output to current site demand plus solar battery charging.
+                home_load_w = None
+                target_percent = 0
+                if import_price is None or not math.isfinite(float(import_price)):
+                    _LOGGER.warning("SolarEdge curtailment: current import price unavailable")
+                    return
+                if import_price >= 0:
+                    await coordinator.async_request_refresh()
+                    if not coordinator.last_update_success:
+                        return
+                    home_load_w = controller.load_following_target_w(coordinator.data)
+                    if home_load_w is None:
+                        _LOGGER.warning("SolarEdge load-following deferred: current site telemetry unavailable")
+                        return
+                    target_percent = controller.curtailment_limit_percent(home_load_w)
+
+                async def apply_limit():
+                    if home_load_w is None:
+                        return await controller.curtail()
+                    return await controller.curtail(home_load_w=home_load_w)
 
                 if current_state in {"curtailed", "pending"}:
                     # A successful write in this process does not survive an
@@ -28978,7 +29006,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     except Exception as err:
                         _LOGGER.warning("SolarEdge curtailment limit readback failed: %s", err)
                         limit = None
-                    if limit == 0:
+                    if limit == target_percent:
                         entry_data["solaredge_curtailment_state"] = "curtailed"
                         await _persist_solaredge_curtailment_marker(entry_data, True)
                         if current_state != "curtailed":
@@ -28997,19 +29025,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         return
                     current_state = "pending"
                     _LOGGER.warning(
-                        "SolarEdge owned curtailment limit changed to %s%%; reapplying 0%%",
-                        limit,
+                        "SolarEdge owned curtailment limit is %s%%; applying %s%%",
+                        limit, target_percent,
                     )
 
                 if current_state != "curtailed":
                     _LOGGER.info(
-                        "SolarEdge curtailment TRIGGERED: export_earnings=%.2fc (below threshold) -> active power 0%%",
-                        export_earnings,
+                        "SolarEdge curtailment TRIGGERED: export_earnings=%.2fc, import=%.2fc -> active power %s%%",
+                        export_earnings, import_price, target_percent,
                     )
                     success = await _solaredge_curtailment_write(
                         coordinator,
                         controller,
-                        controller.curtail,
+                        apply_limit,
                         write_allowed=curtailment_write_allowed,
                     )
                     if success:
@@ -43275,6 +43303,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 await production.tick()
                 if production.blocks_export_control:
                     return
+
+            if (
+                entry_data.get("is_solaredge")
+                and entry_data.get("solaredge_curtailment_state") in {"curtailed", "pending"}
+                and getattr(now, "second", None) in (0, 30)
+            ):
+                await handle_solaredge_curtailment()
 
             if ac_inverter_is_same_hybrid():
                 return

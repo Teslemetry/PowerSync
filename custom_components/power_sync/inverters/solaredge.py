@@ -433,12 +433,7 @@ class SolarEdgeController(InverterController):
         or non-positive load means full curtailment (0% active power limit).
         """
         rated_w = float(rated_capacity_w or self.rated_power_w or self.DEFAULT_RATED_POWER_W)
-        if home_load_w is not None and home_load_w > 0 and rated_w > 0:
-            target_pct = math.ceil((float(home_load_w) / rated_w) * 100.0)
-        else:
-            target_pct = 0
-        target_pct = max(0, min(100, int(target_pct)))
-
+        target_pct = self.curtailment_limit_percent(home_load_w, rated_capacity_w)
         ok = await self._set_active_power_limit(target_pct)
         if ok:
             _LOGGER.info(
@@ -448,6 +443,45 @@ class SolarEdgeController(InverterController):
                 int(rated_w),
             )
         return ok
+
+    def curtailment_limit_percent(
+        self,
+        home_load_w: float | None = None,
+        rated_capacity_w: float | None = None,
+    ) -> int:
+        """Return the same absolute inverter step used by curtail()."""
+        rated_w = float(rated_capacity_w or self.rated_power_w or self.DEFAULT_RATED_POWER_W)
+        if home_load_w is not None and home_load_w > 0 and rated_w > 0:
+            target = math.ceil(float(home_load_w) / rated_w * 100)
+        else:
+            target = 0
+        return max(0, min(100, target))
+
+    @staticmethod
+    def load_following_target_w(data: dict) -> float | None:
+        """Require a current usable site snapshot before allowing local supply.
+
+        Coordinator power values are kW, with negative battery power charging.
+        This is an output cap, not a native grid export limit.
+        """
+        if not data or data.get("telemetry_ready") is not True:
+            return None
+        try:
+            stamp = data.get("last_update")
+            age = (datetime.now(timezone.utc) - stamp).total_seconds()
+            load = float(data["load_power"])
+            battery = float(data["battery_power"])
+            if (
+                not 0 <= age <= 120
+                or not math.isfinite(load)
+                or not math.isfinite(battery)
+                or load < 0
+            ):
+                return None
+            target = (load + max(0, -battery)) * 1000
+            return target if math.isfinite(target) else None
+        except (KeyError, TypeError, ValueError):
+            return None
 
     async def restore(self) -> bool:
         """Restore SolarEdge active power limit to 100%."""

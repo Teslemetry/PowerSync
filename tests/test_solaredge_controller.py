@@ -1890,6 +1890,7 @@ def test_solaredge_curtailment_permission_rejection_does_not_latch(
             "_direct_dc_curtailment_write_allowed": lambda: allowed,
             "_solaredge_force_dispatch_active": lambda _: False,
             "export_earnings_are_uneconomic": lambda *_: not curtailed,
+            "math": __import__("math"),
         }
         source = ROOT / "__init__.py"
         setup = next(n for n in ast.parse(source.read_text()).body if getattr(n, "name", None) == "async_setup_entry")
@@ -1897,7 +1898,7 @@ def test_solaredge_curtailment_permission_rejection_does_not_latch(
             node = next(n for n in setup.body if getattr(n, "name", None) == name)
             exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), namespace)
 
-        await namespace["handle_solaredge_curtailment"](feedin_price=-10 if curtailed else 26)
+        await namespace["handle_solaredge_curtailment"](feedin_price=-10 if curtailed else 26, import_price=-1)
         direct.curtail.assert_not_awaited()
         direct.restore.assert_not_awaited()
         assert controller.control_health == "ready"
@@ -1917,7 +1918,7 @@ def test_solaredge_curtailment_permission_rejection_does_not_latch(
         # Re-enabling permission can perform one ordinary request without reconciliation.
         allowed = True
         session.store.async_save = save
-        await namespace["handle_solaredge_curtailment"](feedin_price=-10 if curtailed else 26)
+        await namespace["handle_solaredge_curtailment"](feedin_price=-10 if curtailed else 26, import_price=-1)
         (direct.restore if curtailed else direct.curtail).assert_awaited_once()
         assert controller.control_health == "ready"
         assert entry_data["solaredge_curtailment_state"] == ("normal" if curtailed else "curtailed")
@@ -3076,6 +3077,7 @@ def test_solaredge_curtailment_records_ownership_across_a_restart(limit):
             "_direct_dc_curtailment_write_allowed": lambda: True,
             "_solaredge_force_dispatch_active": lambda _: False,
             "export_earnings_are_uneconomic": lambda *_: True,
+            "math": __import__("math"),
         }
         source = ROOT / "__init__.py"
         setup = next(
@@ -3094,7 +3096,7 @@ def test_solaredge_curtailment_records_ownership_across_a_restart(limit):
                 namespace,
             )
 
-        await namespace["handle_solaredge_curtailment"](feedin_price=10.0, import_price=5.0)
+        await namespace["handle_solaredge_curtailment"](feedin_price=10.0, import_price=-1.0)
         direct.curtail.assert_awaited_once()
         assert entry_data["solaredge_curtailment_state"] == "curtailed"
         assert store.data["solaredge_curtailment_owned"] is True
@@ -3102,7 +3104,7 @@ def test_solaredge_curtailment_records_ownership_across_a_restart(limit):
         # The restarted process verifies the old owned limit before deciding
         # whether to reapply it; unavailable readback must remain pending.
         entry_data["solaredge_curtailment_state"] = "pending"
-        await namespace["handle_solaredge_curtailment"](feedin_price=10.0, import_price=5.0)
+        await namespace["handle_solaredge_curtailment"](feedin_price=10.0, import_price=-1.0)
         assert direct.curtail.await_count == (2 if limit == 100 else 1)
         assert entry_data["solaredge_curtailment_state"] == (
             "pending" if limit is None else "curtailed"
@@ -3317,3 +3319,25 @@ def test_solaredge_supervised_release_refuses_an_externally_changed_field():
         assert restarted.control_health == "reconciliation_required"
 
     asyncio.run(scenario())
+
+
+def test_solaredge_load_following_targets_require_usable_current_site_data():
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    valid = {"telemetry_ready": True, "last_update": now,
+             "load_power": .93, "battery_power": -.5}
+    target = SolarEdgeController.load_following_target_w
+    assert target(valid) == pytest.approx(1430)
+    assert target({**valid, "battery_power": .5}) == pytest.approx(930)
+    assert target({**valid, "load_power": 0, "battery_power": 0}) == 0
+    invalid = [
+        {}, {**valid, "telemetry_ready": False},
+        {**valid, "last_update": now - timedelta(seconds=121)},
+        {**valid, "last_update": now + timedelta(seconds=10)},
+        {**valid, "last_update": None},
+        {**valid, "load_power": -1}, {**valid, "load_power": float("inf")},
+        {**valid, "battery_power": None}, {**valid, "battery_power": float("nan")},
+    ]
+    for data in invalid:
+        assert target(data) is None

@@ -28,3 +28,12 @@ It sends inverter writes in one case: restoring the saved baseline of a dispatch
 A successful reconciliation clears the retained transaction and allows the next command to capture its baseline. Review the control-health attributes before resuming automatic dispatch. Reconciliation does not restore an earlier force command or timer.
 
 Storage readback cannot validate an uncertain active-power curtailment write. The reconciliation service leaves that block in place; recovery requires separate validation of the active-power controls.
+
+
+## Export curtailment and household supply
+
+With SolarEdge export curtailment enabled, negative feed-in earnings keep an output limit active. When import pricing is negative, PowerSync requests a full stop. When import pricing is zero or positive, it instead allows output up to the current house demand plus battery charging, so curtailment does not deliberately block local supply while you pay for imports.
+
+The output target is checked every 30 seconds while PowerSync owns the limit, using a current usable coordinator snapshot. It is rounded up to the inverter's whole-percent steps and capped at rated output. This is load-following output limiting, not a native zero-export guarantee: brief import or export can occur as demand changes or because of the inverter's limit steps. Normal output is restored when feed-in earnings recover. A current import price, usable telemetry, control permission and device limit readback are required to change an existing limit; unavailable evidence leaves the limit retained for a later check.
+
+Monitoring Mode, active force dispatch and reconciliation blocks continue to take precedence. A selected output limit or a successful write does not prove that solar or battery power has resumed; check current inverter and grid telemetry after updating.
