@@ -87,6 +87,31 @@ def _foxess_service_handler_node():
     return handler
 
 
+def _fronius_service_handler_node():
+    module = ast.parse(_INIT_PATH.read_text())
+    setup = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "async_setup_entry"
+    )
+    handler = next(
+        node
+        for node in setup.body
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "handle_set_self_consumption"
+    )
+    fronius_branch = next(
+        node
+        for node in ast.walk(handler)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Name)
+        and node.test.id == "is_fronius_reserva_sc"
+    )
+    handler.body = copy.deepcopy(fronius_branch.body)
+    return handler
+
+
 def _foxess_wrapper_method_node():
     module = ast.parse(_BATTERY_CONTROLLER_PATH.read_text())
     wrapper = next(
@@ -100,6 +125,80 @@ def _foxess_wrapper_method_node():
         for node in wrapper.body
         if isinstance(node, ast.AsyncFunctionDef)
         and node.name == "set_self_consumption_mode"
+    )
+
+
+def _fronius_runtime(*, outcome="true", coordinator=True, user_owned_override=False):
+    """Load the real Fronius service branch and wrapper with fake transport."""
+    restore_calls = []
+    state = {"outcome": outcome}
+
+    async def restore_normal():
+        restore_calls.append(True)
+        if state["outcome"] == "exception":
+            raise TimeoutError("simulated Modbus timeout")
+        return state["outcome"] == "true"
+
+    cleanup_calls = []
+
+    def clear_self_consumption_state():
+        cleanup_calls.append("clear")
+
+    async def persist_force_mode_state():
+        cleanup_calls.append("persist")
+
+    entry_data = {}
+    if coordinator:
+        entry_data["fronius_reserva_coordinator"] = SimpleNamespace(
+            restore_normal=restore_normal
+        )
+    service_hass = SimpleNamespace(data={"power_sync": {"entry": entry_data}})
+    handler = _load_ast_node(
+        _fronius_service_handler_node(),
+        {
+            "hass": service_hass,
+            "entry": SimpleNamespace(entry_id="entry"),
+            "DOMAIN": "power_sync",
+            "user_owned_override": user_owned_override,
+            "_clear_self_consumption_state": clear_self_consumption_state,
+            "persist_force_mode_state": persist_force_mode_state,
+            "_guarded_self_consumption_write": lambda writer: writer(),
+            "_LOGGER": logging.getLogger(__name__),
+            "HomeAssistantError": RuntimeError,
+        },
+        _INIT_PATH,
+    )
+
+    service_calls = []
+
+    async def async_call(domain, service, data, blocking):
+        service_calls.append((domain, service, data, blocking))
+        return await handler(None)
+
+    wrapper_self = SimpleNamespace(
+        hass=SimpleNamespace(services=SimpleNamespace(async_call=async_call))
+    )
+    wrapper = _load_ast_node(
+        _foxess_wrapper_method_node(),
+        {
+            "_LOGGER": logging.getLogger(__name__),
+            "optimizer_command": lambda method: method,
+            "optimizer_service_data": lambda _controller, data: data,
+        },
+        _BATTERY_CONTROLLER_PATH,
+    )
+
+    async def set_self_consumption_mode():
+        return await wrapper(wrapper_self)
+
+    return (
+        SimpleNamespace(set_self_consumption_mode=set_self_consumption_mode),
+        entry_data,
+        restore_calls,
+        service_calls,
+        state,
+        restore_normal,
+        cleanup_calls,
     )
 
 
@@ -399,6 +498,90 @@ def test_foxess_missing_coordinator_is_not_acknowledged():
         assert await battery.set_self_consumption_mode() is False
         assert len(service_calls) == 1
         assert restore_calls == []
+
+    asyncio.run(_run())
+
+
+@pytest.mark.parametrize("failure", ["false", "exception"])
+def test_fronius_service_failure_reaches_optimizer_retry(opt_module, failure):
+    """A Fronius restore failure must cross service and wrapper boundaries."""
+    async def _run():
+        battery, _entry_data, restore_calls, service_calls, state, _restore_normal, _cleanup_calls = (
+            _fronius_runtime(outcome=failure)
+        )
+        coordinator = _execute_coordinator(opt_module, battery)
+        coordinator.battery_system = "fronius_reserva"
+
+        await coordinator._execute_optimizer_action(_self_consumption_action())
+        assert len(service_calls) == 1
+        assert len(restore_calls) == 1
+        assert coordinator._last_executed_action == "charge"
+
+        state["outcome"] = "true"
+        await coordinator._execute_optimizer_action(_self_consumption_action())
+        assert len(service_calls) == 2
+        assert len(restore_calls) == 2
+        assert coordinator._last_executed_action == "self_consumption"
+
+    asyncio.run(_run())
+
+
+def test_fronius_missing_coordinator_reaches_optimizer_retry(opt_module):
+    async def _run():
+        battery, entry_data, restore_calls, service_calls, _state, restore_normal, _cleanup_calls = (
+            _fronius_runtime(coordinator=False)
+        )
+        coordinator = _execute_coordinator(opt_module, battery)
+        coordinator.battery_system = "fronius_reserva"
+
+        await coordinator._execute_optimizer_action(_self_consumption_action())
+        assert len(service_calls) == 1
+        assert restore_calls == []
+        assert coordinator._last_executed_action == "charge"
+
+        entry_data["fronius_reserva_coordinator"] = SimpleNamespace(
+            restore_normal=restore_normal
+        )
+        await coordinator._execute_optimizer_action(_self_consumption_action())
+        assert len(service_calls) == 2
+        assert len(restore_calls) == 1
+        assert coordinator._last_executed_action == "self_consumption"
+
+    asyncio.run(_run())
+
+
+@pytest.mark.parametrize("outcome", ["false", "exception"])
+def test_fronius_service_failure_returns_false_from_wrapper(outcome):
+    async def _run():
+        battery, _entry_data, restore_calls, service_calls, _state, _restore_normal, _cleanup_calls = (
+            _fronius_runtime(outcome=outcome)
+        )
+        assert await battery.set_self_consumption_mode() is False
+        assert len(service_calls) == 1
+        assert len(restore_calls) == 1
+
+    asyncio.run(_run())
+
+
+def test_fronius_missing_coordinator_is_not_acknowledged():
+    async def _run():
+        battery, _entry_data, restore_calls, service_calls, _state, _restore_normal, _cleanup_calls = (
+            _fronius_runtime(coordinator=False)
+        )
+        assert await battery.set_self_consumption_mode() is False
+        assert len(service_calls) == 1
+        assert restore_calls == []
+
+    asyncio.run(_run())
+
+
+def test_fronius_manual_failure_clears_self_consumption_state():
+    async def _run():
+        battery, _entry_data, _restore_calls, _service_calls, _state, _restore_normal, cleanup_calls = (
+            _fronius_runtime(outcome="false", user_owned_override=True)
+        )
+        assert await battery.set_self_consumption_mode() is False
+        assert cleanup_calls == ["clear", "persist"]
 
     asyncio.run(_run())
 

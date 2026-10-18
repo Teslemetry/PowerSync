@@ -39559,7 +39559,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 fronius_coord = entry_data.get("fronius_reserva_coordinator")
                 if not fronius_coord:
                     _LOGGER.error("Self-consumption: Fronius GEN24 storage coordinator not available")
-                    return
+                    if user_owned_override:
+                        _clear_self_consumption_state()
+                        await persist_force_mode_state()
+                    raise HomeAssistantError(
+                        "Fronius GEN24 storage coordinator unavailable"
+                    )
                 success = await _guarded_self_consumption_write(
                     fronius_coord.restore_normal
                 )
@@ -39567,10 +39572,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     _LOGGER.info("Fronius GEN24 storage self-consumption mode restored (Auto)")
                 else:
                     _LOGGER.error("Failed to set Fronius GEN24 storage self-consumption mode")
+                    if user_owned_override:
+                        _clear_self_consumption_state()
+                        await persist_force_mode_state()
+                    raise HomeAssistantError(
+                        "Fronius GEN24 storage self-consumption restore failed"
+                    )
                 return
+            except HomeAssistantError:
+                raise
             except Exception as e:
                 _LOGGER.error(f"Error setting Fronius GEN24 storage self-consumption: {e}", exc_info=True)
-                return
+                if user_owned_override:
+                    _clear_self_consumption_state()
+                    await persist_force_mode_state()
+                raise HomeAssistantError(
+                    "Fronius GEN24 storage self-consumption restore failed"
+                ) from e
 
         # Check if this is a Neovolt system
         is_neovolt_sc = bool(_get_neovolt_entry_ids(entry.data, hass))
