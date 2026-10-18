@@ -38,16 +38,18 @@ class NativeProductionTarget:
             data = raw.get("dynamic_pel_settings", raw) if isinstance(raw, dict) else None
             if not isinstance(data, dict) or not isinstance(data.get("enable"), bool) or not isinstance(data.get("export_limit"), bool):
                 return None
-            if finite_number(data.get("limit_value_W")) is None:
+            # Gateway (static watts) and digital-input (relay table) modes
+            # expose different controls. Require the active mode's baseline,
+            # retaining any inactive controls actually returned for restoration.
+            if not isinstance(data.get("enable_dynamic_limiting"), bool) or finite_number(data.get("slew_rate")) is None:
                 return None
-            # Require an exact restorable control surface. In particular do not
-            # assume a relay config or dynamic-limiting state on older firmware.
+            dynamic = data["enable_dynamic_limiting"]
+            if (not dynamic or "limit_value_W" in data) and finite_number(data.get("limit_value_W")) is None:
+                return None
+            if (dynamic or "relay_config" in data) and not isinstance(data.get("relay_config"), (dict, bool)):
+                return None
             keys = ("enable", "export_limit", "limit_value_W", "enable_dynamic_limiting", "relay_config", "slew_rate")
-            if any(key not in data for key in keys):
-                return None
-            if not isinstance(data["enable_dynamic_limiting"], bool) or not isinstance(data["relay_config"], (dict, bool)) or finite_number(data["slew_rate"]) is None:
-                return None
-            return deepcopy({key: data[key] for key in keys})
+            return deepcopy({key: data[key] for key in keys if key in data})
         if self.brand == "fronius":
             state = {}
             for key, address in (("enabled", c.REG_WMAXLIM_ENA), ("limit", c.REG_WMAXLIMPCT), ("revert", c.REG_WMAXLIMPCT_RVRT)):
@@ -93,7 +95,11 @@ class NativeProductionTarget:
             state["pv_limit"] = 0
             return state
         if self.brand == "enphase":
-            state.update(enable=True, export_limit=False, limit_value_W=0.0, enable_dynamic_limiting=True, relay_config=self.controller._dpel_relay_config(0.0))
+            state.update(enable=True, export_limit=False)
+            if "limit_value_W" in state:
+                state["limit_value_W"] = 0.0
+            if state["enable_dynamic_limiting"]:
+                state["relay_config"] = self.controller._dpel_relay_config(0.0)
         elif self.brand == "fronius":
             # Preserve the existing adapter's indefinite-limit semantics.
             # A new reversion lease could restore 100% over a user's prior cap.
@@ -107,6 +113,21 @@ class NativeProductionTarget:
         else:
             return None
         return state
+
+    def matches(self, observed, expected):
+        """Match old full-surface journals against mode-specific DPEL reads."""
+        if self.brand != "enphase" or not isinstance(observed, dict) or not isinstance(expected, dict):
+            return observed == expected
+        mode = observed.get("enable_dynamic_limiting")
+        if not isinstance(mode, bool) or expected.get("enable_dynamic_limiting") is not mode:
+            return False
+        expected = deepcopy(expected)
+        inactive = "limit_value_W" if mode else "relay_config"
+        if inactive not in observed:
+            expected.pop(inactive, None)
+        # Mode, active controls, common fields and any returned inactive field
+        # still match exactly. Never infer an absent active setting or a mode.
+        return observed == expected
 
     def owns_partial(self, observed, original, stopped):
         """Recognize interrupted multi-register updates, field by field."""
@@ -141,8 +162,8 @@ class NativeProductionTarget:
             settings.update(deepcopy(state))
             if not getattr(self, "allowed", lambda: True)():
                 return False
-            # One production payload only. No disabled dynamic limiting,
-            # opposite export flag, zero-export profile or DER export fallback.
+            # Preserve the captured Gateway/relay mode. One production payload
+            # only; no opposite export flag, zero-export or DER export fallback.
             ok, _ = await c._post(c.ENDPOINT_DPEL, {"dynamic_pel_settings": settings})
             return ok
         if self.brand == "fronius":

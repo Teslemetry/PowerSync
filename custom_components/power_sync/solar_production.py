@@ -188,6 +188,10 @@ class ProductionStopManager:
             _LOGGER.exception("PV production readback unavailable; restore intent retained")
             return None
 
+    @staticmethod
+    def _matches(target, observed, expected):
+        return getattr(target, "matches", lambda actual, wanted: actual == wanted)(observed, expected)
+
     async def _write(self, target, state, *, stop=False):
         # Re-evaluate after every await and immediately before every mutation.
         if not self.permitted() or (stop and (self.stopping or not self.stop_permitted())):
@@ -234,12 +238,12 @@ class ProductionStopManager:
             if target is None:
                 continue
             observed = await self._read(target)
-            if observed == record["original"]:
+            if self._matches(target, observed, record["original"]):
                 pass  # Includes a crash before the stop write reached hardware.
-            elif observed == record["stopped"] or getattr(target, "owns_partial", lambda *args: False)(observed, record["original"], record["stopped"]):
+            elif self._matches(target, observed, record["stopped"]) or getattr(target, "owns_partial", lambda *args: False)(observed, record["original"], record["stopped"]):
                 if not await self._write(target, record["original"]):
                     continue
-                if await self._read(target) != record["original"]:
+                if not self._matches(target, await self._read(target), record["original"]):
                     continue
             elif observed is None:
                 continue
@@ -301,7 +305,7 @@ class ProductionStopManager:
                     if stopped is None:
                         confirmed = False
                         continue
-                    if observed == stopped:
+                    if self._matches(target, observed, stopped):
                         # Already stopped by somebody else: never acquire/restore it.
                         self.status = "external_control"
                         confirmed = False
@@ -313,18 +317,18 @@ class ProductionStopManager:
                     except BaseException:
                         self.records.remove(record)
                         raise
-                elif observed not in (record["original"], record["stopped"]) and not getattr(target, "owns_partial", lambda *args: False)(observed, record["original"], record["stopped"]):
+                elif not any(self._matches(target, observed, state) for state in (record["original"], record["stopped"])) and not getattr(target, "owns_partial", lambda *args: False)(observed, record["original"], record["stopped"]):
                     self.suspended = True
                     self.status = "external_control"
                     await self._save()
                     self.device_confirmed = False
                     return
-                if observed != record["stopped"] or target.refresh:
+                if not self._matches(target, observed, record["stopped"]) or target.refresh:
                     if not await self._write(target, record["stopped"], stop=True):
                         confirmed = False
                         continue
                     observed = await self._read(target)
-                if observed != record["stopped"] or not getattr(target, "effective", True):
+                if not self._matches(target, observed, record["stopped"]) or not getattr(target, "effective", True):
                     confirmed = False
             self.device_confirmed = confirmed
             if confirmed:

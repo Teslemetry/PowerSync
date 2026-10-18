@@ -303,6 +303,138 @@ def test_enphase_zero_production_never_uses_zero_export_or_firmware_fallbacks():
     run(scenario())
 
 
+def enphase_mode_rig(dynamic, *, combined=False):
+    settings = {"enable": True, "export_limit": True,
+                "enable_dynamic_limiting": dynamic, "slew_rate": 100,
+                "installed_capacity": 10000}
+    if not dynamic or combined:
+        settings["limit_value_W"] = 3500.0
+    if dynamic or combined:
+        settings["relay_config"] = {"default_pct_limit": 75, "limit_levels": [
+            {"relays": "0000", "pct_limit": 50}]}
+    posts = []
+    failure = {"reject": False}
+    store = Store()
+    async def connect(): return True
+    async def get(): return {"dynamic_pel_settings": deepcopy(settings)}
+    async def post(endpoint, payload):
+        assert store.data["records"], "restore must be durable before writing"
+        posts.append(deepcopy(payload["dynamic_pel_settings"]))
+        if failure["reject"]:
+            return False, 400
+        settings.update(deepcopy(payload["dynamic_pel_settings"]))
+        return True, 200
+    c = SimpleNamespace(connect=connect, _get_dpel_settings=get, _post=post,
+                        ENDPOINT_DPEL="/ivp/ss/dpel", _dpel_relay_config=lambda pct: {
+                            "default_pct_limit": pct, "limit_levels": [
+                                {"relays": f"{bits:04b}", "pct_limit": pct} for bits in range(16)]})
+    identity = {"brand": "enphase", "host": "192.0.2.10"}
+    target = native.NativeProductionTarget(c, identity)
+    manager = pv.ProductionStopManager(store, lambda _: target, lambda: True)
+    return manager, store, target, identity, settings, posts, failure
+
+
+@pytest.mark.parametrize("dynamic,combined", [(False, False), (True, False), (False, True), (True, True)])
+def test_enphase_mode_specific_stop_and_restore_preserve_gateway_mode(dynamic, combined):
+    manager, store, target, identity, settings, posts, _ = enphase_mode_rig(dynamic, combined=combined)
+    original = deepcopy(settings)
+    async def scenario():
+        await manager.update(-5, [identity])
+        assert manager.device_confirmed
+        assert settings["enable_dynamic_limiting"] is dynamic
+        assert settings.keys() == original.keys(), "do not invent inactive-mode fields"
+        assert settings["export_limit"] is False
+        if "limit_value_W" in settings:
+            assert settings["limit_value_W"] == 0
+        if dynamic:
+            assert settings["relay_config"] == target.controller._dpel_relay_config(0)
+        elif "relay_config" in settings:
+            assert settings["relay_config"] == original["relay_config"]
+        assert manager.as_dict()["physical_converged"] is None
+        # Periodic refresh must preserve the mode too.
+        await manager.update(-5, [identity])
+        assert len(posts) == 2
+        settings["installed_capacity"] = 12000
+        # A restart must recover the exact saved controls, retaining new metadata.
+        recovered = pv.ProductionStopManager(store, lambda _: target, lambda: True)
+        await recovered.update(0, [])
+        assert settings == {**original, "installed_capacity": 12000}
+        assert not recovered.owns_control
+    run(scenario())
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_enphase_mode_specific_restore_failure_survives_restart(dynamic):
+    manager, store, target, identity, settings, posts, failure = enphase_mode_rig(dynamic)
+    original = deepcopy(settings)
+    async def scenario():
+        await manager.update(-5, [identity])
+        assert manager.device_confirmed
+        failure["reject"] = True
+        await manager.shutdown()
+        assert manager.owns_control and manager.status == "restore_pending"
+        assert settings != original
+        failure["reject"] = False
+        recovered = pv.ProductionStopManager(store, lambda _: target, lambda: True)
+        await recovered.update(0, [])
+        assert not recovered.owns_control and settings == original
+    run(scenario())
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("omit_inactive", [False, True])
+def test_enphase_previous_release_restore_journal_remains_recoverable(dynamic, omit_inactive):
+    _, store, target, identity, settings, posts, _ = enphase_mode_rig(dynamic, combined=True)
+    original = run(target.read())
+    # v2.12.1418-1425 wrote both fields and always switched to relay mode.
+    stopped = {**deepcopy(original), "enable": True, "export_limit": False,
+               "enable_dynamic_limiting": True, "limit_value_W": 0.0,
+               "relay_config": target.controller._dpel_relay_config(0)}
+    store.data = {"records": [{"identity": identity, "original": original, "stopped": stopped}]}
+    settings.update(deepcopy(stopped))
+    if omit_inactive:
+        # A mode-specific GET need not echo the inactive control in an older
+        # full-surface journal, including after the restore POST.
+        async def get():
+            current = deepcopy(settings)
+            current.pop("limit_value_W" if current["enable_dynamic_limiting"] else "relay_config", None)
+            return {"dynamic_pel_settings": current}
+        target.controller._get_dpel_settings = get
+    recovered = pv.ProductionStopManager(store, lambda _: target, lambda: True)
+    run(recovered.update(0, []))
+    assert not recovered.owns_control and recovered.status == "normal"
+    assert settings["enable"] == original["enable"]
+    assert settings["export_limit"] == original["export_limit"]
+    assert settings["limit_value_W"] == original["limit_value_W"]
+    assert settings["relay_config"] == original["relay_config"]
+    assert len(posts) == 1 and settings["enable_dynamic_limiting"] is dynamic
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_enphase_mode_change_by_another_controller_is_not_overwritten(dynamic):
+    manager, _, _, identity, settings, posts, _ = enphase_mode_rig(dynamic)
+    async def scenario():
+        await manager.update(-5, [identity])
+        assert manager.device_confirmed
+        settings["enable_dynamic_limiting"] = not dynamic
+        settings["limit_value_W"] = 900
+        settings["relay_config"] = {"default_pct_limit": 80, "limit_levels": []}
+        changed = deepcopy(settings)
+        await manager.release()
+        assert len(posts) == 1 and settings == changed
+        assert manager.suspended and manager.status == "external_control"
+    run(scenario())
+
+
+@pytest.mark.parametrize("dynamic,missing", [(False, "limit_value_W"), (True, "relay_config"),
+                                          (False, "enable_dynamic_limiting"), (True, "slew_rate")])
+def test_enphase_incomplete_active_mode_baseline_sends_no_command(dynamic, missing):
+    manager, _, _, identity, settings, posts, _ = enphase_mode_rig(dynamic)
+    del settings[missing]
+    run(manager.update(-5, [identity]))
+    assert not posts and not manager.owns_control
+
+
 def test_enphase_unsupported_or_rejected_production_surface_sends_no_export_substitute():
     posts = []
     async def connect(): return True
