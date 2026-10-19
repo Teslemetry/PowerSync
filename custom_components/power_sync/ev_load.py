@@ -183,6 +183,11 @@ def is_ev_power_contradicted_by_state(
 
     The second shape requires the state entity to be currently reporting, so a
     bridge that has gone silent cannot veto a genuine reading.
+
+    Callers must use HA ``last_changed`` for value ordering (falling back to
+    ``last_updated`` when absent). Attribute-only updates advance
+    ``last_updated`` without changing the vehicle state or measured watts;
+    treating those as new values can keep phantom power alive indefinitely.
     """
     try:
         watts = float(power_kw)

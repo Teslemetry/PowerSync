@@ -1800,9 +1800,15 @@ async def _get_observed_ev_power_reading_kw(
             if is_ev_power_contradicted_by_state(
                 power_kw,
                 getattr(charging, "state", ""),
-                state_changed_at=getattr(charging, "last_updated", None),
+                state_changed_at=(
+                    getattr(charging, "last_changed", None)
+                    or getattr(charging, "last_updated", None)
+                ),
                 state_reported_at=getattr(charging, "last_reported", None),
-                power_value_updated_at=getattr(state, "last_updated", None),
+                power_value_updated_at=(
+                    getattr(state, "last_changed", None)
+                    or getattr(state, "last_updated", None)
+                ),
             ):
                 return 0.0, True
             return power_kw, True

@@ -2350,21 +2350,26 @@ def _get_ev_vehicles_status(hass, entry) -> list:
         # re-report an unchanged, older power value.  `last_reported` is
         # useful for normal freshness checks, but it is not the time at which
         # that watt value was measured.  A newer explicit non-charging state
-        # therefore wins over a positive value whose last value update
-        # predates it.  Keep the power unavailable rather than claiming a
+        # therefore wins over a positive value whose last value change
+        # predates it. Attribute-only updates do not change measured watts.
+        # Keep the power unavailable rather than claiming a
         # measured zero: command acknowledgement is still not hardware proof.
         # A vehicle that has *held* an explicit non-charging state for longer
         # than the attribution window also disproves the watts, even when the
         # power value happened to change last.  Without that, the veto is
-        # decided purely by the order of two ``last_updated`` stamps and can
+        # decided purely by the order of two value-change timestamps and can
         # never re-arm while both entities hold steady (Discord #409).
         power_value_updated_at = _ev_observed_at(
-            getattr(power_state, "last_updated", None)
+            getattr(power_state, "last_changed", None)
+            or getattr(power_state, "last_updated", None)
         )
         stale_power_contradicted_by_state = is_ev_power_contradicted_by_state(
             power_kw,
             getattr(charge_state, "state", ""),
-            state_changed_at=ble_state_observed_at,
+            state_changed_at=(
+                getattr(charge_state, "last_changed", None)
+                or ble_state_observed_at
+            ),
             state_reported_at=_ev_power_observed_at(charge_state),
             power_value_updated_at=power_value_updated_at,
         )

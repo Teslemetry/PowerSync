@@ -13600,6 +13600,31 @@ def test_ble_observed_power_reading_keeps_a_live_charging_reading():
     )) == (7.0, True)
 
 
+@pytest.mark.parametrize("completed_seconds_ago,power_seconds_ago", [(180, 120), (1, 120)])
+def test_ble_completed_charge_attribute_refresh_does_not_feed_surplus(
+    completed_seconds_ago, power_seconds_ago,
+):
+    """#409: changing attributes must not renew phantom charging watts."""
+    now = datetime.now(timezone.utc)
+    hass = _Hass([
+        _State(
+            "sensor.snowflake_charging_state", "Complete",
+            last_changed=now - timedelta(seconds=completed_seconds_ago),
+            last_updated=now - timedelta(seconds=1), last_reported=now,
+        ),
+        _State(
+            "sensor.snowflake_charge_power", "7.0",
+            {"unit_of_measurement": "kW"},
+            last_changed=now - timedelta(seconds=power_seconds_ago),
+            last_updated=now, last_reported=now,
+        ),
+    ])
+
+    assert asyncio.run(actions._get_observed_ev_power_reading_kw(
+        hass, "ble_snowflake", {"charger_type": "tesla"},
+    )) == (0.0, True)
+
+
 # Discord #284: Tesla's cloud live_status caches the site aggregate for ~62s
 # while wall_connector_power in the same payload refreshes every ~16s poll.
 # Two real epochs from the reporter's 2026-09-20 capture, each held byte

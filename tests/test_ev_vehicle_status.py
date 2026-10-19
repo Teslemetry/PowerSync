@@ -1181,6 +1181,71 @@ def test_ble_recent_stopped_state_still_allows_a_newer_power_value():
     assert vehicle["power_available"] is True
 
 
+def test_ble_complete_attribute_refresh_cannot_keep_phantom_power_active(monkeypatch):
+    """#409: attribute updates are not new charging-state or watt values."""
+    power_sync = _power_sync_module()
+    now = datetime.now(timezone.utc)
+    hass, entry = _stopped_ble_vehicle(
+        power_last_updated=now,
+        state_last_updated=now - timedelta(seconds=1),
+        now=now,
+    )
+    charging = hass.states.get("sensor.garage_ble_charging_state")
+    charging.state = "Complete"
+    charging.last_changed = now - timedelta(minutes=3)
+    power = hass.states.get("sensor.garage_ble_charge_power")
+    # Even a delayed positive value after Complete expires after 90 seconds
+    # of a currently reporting, unchanged Complete state.
+    power.last_changed = now - timedelta(minutes=2)
+
+    vehicle = power_sync._get_ev_vehicles_status(hass, entry)[0]
+
+    assert vehicle["is_connected"] is True  # Cable remains plugged in.
+    assert vehicle["is_charging"] is False
+    assert vehicle["ev_power_kw"] == 0.0
+    assert vehicle["power_available"] is False
+
+    async def no_sigenergy_state(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        power_sync, "_read_sigenergy_charger_state_for_entry", no_sigenergy_state,
+    )
+    observations = asyncio.run(
+        power_sync._get_ev_load_observations(hass, entry, [vehicle])
+    )
+    ev_load = importlib.import_module("power_sync.ev_load")
+    snapshot = ev_load.aggregate_ev_load(observations, at=now)
+    normalized = ev_load.normalize_home_load(
+        1.783, ev_load.HomeLoadBasis.INCLUDES_EV, snapshot, at=now,
+    )
+    assert snapshot.power_kw == 0.0
+    assert snapshot.quality.value == "complete"
+    assert normalized.non_ev_home_load_kw == 1.783
+
+
+def test_ble_new_complete_state_beats_attributes_on_unchanged_power():
+    power_sync = _power_sync_module()
+    now = datetime.now(timezone.utc)
+    hass, entry = _stopped_ble_vehicle(
+        power_last_updated=now,
+        state_last_updated=now - timedelta(seconds=1),
+        now=now,
+    )
+    charging = hass.states.get("sensor.garage_ble_charging_state")
+    charging.state = "Complete"
+    charging.last_changed = now - timedelta(seconds=1)
+    hass.states.get("sensor.garage_ble_charge_power").last_changed = (
+        now - timedelta(minutes=2)
+    )
+
+    vehicle = power_sync._get_ev_vehicles_status(hass, entry)[0]
+
+    assert vehicle["is_charging"] is False
+    assert vehicle["ev_power_kw"] == 0.0
+    assert vehicle["power_available"] is False
+
+
 def test_ble_silent_state_entity_cannot_veto_a_live_power_value():
     """A bridge that stopped reporting its state must not veto the meter."""
     power_sync = _power_sync_module()
