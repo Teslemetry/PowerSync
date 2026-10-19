@@ -16,6 +16,11 @@ from .base import InverterController, InverterState, InverterStatus
 
 _LOGGER = logging.getLogger(__name__)
 
+# HA batches coordinator refresh requests during a 10-second cooldown. A
+# completed entity service can therefore precede its published readback.
+_READBACK_TIMEOUT_SECONDS = 15
+_READBACK_POLL_SECONDS = 0.1
+
 
 class EnphaseEnvoyController(InverterController):
     def __init__(self, hass, entity_prefix, entry_id="", model="export"):
@@ -98,6 +103,22 @@ class EnphaseEnvoyController(InverterController):
         await self._store.async_save(record)
         self._shared["record"] = deepcopy(record)
 
+    async def _wait_for_readback(self, current, pending):
+        try:
+            async with asyncio.timeout(_READBACK_TIMEOUT_SECONDS):
+                while True:
+                    observed = self._read()
+                    if observed == pending:
+                        return True
+                    if observed != current:
+                        # Do not wait through an external write or unavailable
+                        # controls, or overwrite them with the next field.
+                        return False
+                    await asyncio.sleep(_READBACK_POLL_SECONDS)
+        except TimeoutError:
+            _LOGGER.warning("Envoy DPEL readback not confirmed before deadline")
+            return False
+
     async def _apply(self, target, record):
         current = self._read()
         if current is None:
@@ -134,11 +155,9 @@ class EnphaseEnvoyController(InverterController):
                 service = "set_value"
                 data["value"] = value
             await self.hass.services.async_call(domain, service, data, blocking=True)
-            # Allow CoordinatorEntity's scheduled state publication to complete.
-            await asyncio.sleep(0)
-            current = self._read()
-            if current != pending:
+            if not await self._wait_for_readback(current, pending):
                 return False
+            current = pending
             record = {**record, "owned": current, "pending": None}
             await self._save(record)
         return self._read() == target

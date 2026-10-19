@@ -34,6 +34,9 @@ def module(monkeypatch):
     storage.Store = Store
     monkeypatch.setitem(sys.modules, "homeassistant.helpers.storage", storage)
     result = importlib.import_module(name)
+    # Keep bounded readback failures quick without changing the service timing.
+    monkeypatch.setattr(result, "_READBACK_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(result, "_READBACK_POLL_SECONDS", 0.001)
     yield result
     sys.modules.pop(name, None)
 
@@ -317,4 +320,116 @@ def test_registry_resolves_actual_dpel_switch_slug_and_renamed_select(module, mo
         assert c.entities["enabled"] == "switch.envoy_123_dpel"
         assert c.entities["mode"] == "select.solar_export_mode"
         assert await c.restore()
+    asyncio.run(run())
+
+
+class DeferredReadbackHass(Hass):
+    """Envoy setters can return while HA's debounced refresh is queued.
+
+    The upstream number/select/switch setters await async_request_refresh(),
+    which returns immediately during DataUpdateCoordinator's 10s cooldown.
+    Keep device acceptance and eventual entity publication separate here.
+    """
+
+    def __init__(self, *, first_refresh_immediate=False):
+        super().__init__()
+        self.first_refresh_immediate = first_refresh_immediate
+        self.published = 0
+
+    async def call(self, domain, service, data, *, blocking):
+        assert blocking
+        self.calls.append((domain, service, data))
+        state = self.values[data["entity_id"]]
+        value = (str(data["value"]) if domain == "number"
+                 else data.get("option", "on" if service == "turn_on" else "off"))
+
+        def publish():
+            state.state = value
+            self.published += 1
+
+        if self.first_refresh_immediate and len(self.calls) == 1:
+            publish()
+        else:
+            asyncio.get_running_loop().call_later(0.01, publish)
+
+
+@pytest.mark.parametrize("first_refresh_immediate", [False, True])
+def test_deferred_refresh_confirms_each_write_and_restore(module, first_refresh_immediate):
+    h = DeferredReadbackHass(first_refresh_immediate=first_refresh_immediate)
+    c = controller(module, h)
+
+    async def run():
+        assert await c.curtail()
+        assert h.published == len(h.calls) == 3
+        assert c._read() == {"enabled": True, "mode": "Export", "limit": 0}
+        assert c._shared["record"]["pending"] is None
+        h.data = {}  # Reload recovers the durable baseline before delayed restore.
+        restored = controller(module, h)
+        assert await restored.restore()
+        assert h.published == len(h.calls)
+        assert c._read() == {"enabled": False, "mode": "Production", "limit": 4200}
+        assert restored._shared["record"] is None
+
+    asyncio.run(run())
+
+
+def test_deferred_restore_timeout_preserves_journal_for_reload(module):
+    h = Hass()
+    c = controller(module, h)
+
+    async def run():
+        assert await c.curtail()
+        h.ignore_call = len(h.calls) + 1
+        assert not await c.restore()
+        assert c._shared["record"]["pending"] is not None
+        h.ignore_call = None
+        h.data = {}
+        restored = controller(module, h)
+        assert await restored.restore()
+        assert restored._read() == {"enabled": False, "mode": "Production", "limit": 4200}
+        assert restored._shared["record"] is None
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("conflict", ["external_write", "unavailable"])
+def test_readback_wait_stops_before_next_write_on_conflict(module, conflict):
+    h = Hass()
+    h.ignore_call = 1
+    c = controller(module, h)
+
+    async def run():
+        def conflict_during_wait():
+            key = "mode" if conflict == "external_write" else "limit"
+            h.values[c.entities[key]].state = "Export" if key == "mode" else "unavailable"
+
+        asyncio.get_running_loop().call_later(0.01, conflict_during_wait)
+        assert not await c.curtail()
+        assert len(h.calls) == 1
+        assert c._shared["record"]["pending"] is not None
+
+    asyncio.run(run())
+
+
+def test_cancelled_readback_wait_keeps_pending_for_reload_restore(module):
+    h = Hass()
+    h.ignore_call = 1
+    c = controller(module, h)
+
+    async def run():
+        task = asyncio.create_task(c.curtail())
+        while not h.calls:
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert c._shared["record"]["pending"] is not None
+        assert not c._shared["lock"].locked()
+        h.ignore_call = None
+        h.data = {}
+        restored = controller(module, h)
+        assert await restored.restore()
+        assert restored._read() == {"enabled": False, "mode": "Production", "limit": 4200}
+        assert restored._shared["record"] is None
+
     asyncio.run(run())
