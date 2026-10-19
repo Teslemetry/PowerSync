@@ -1246,6 +1246,28 @@ def test_ble_new_complete_state_beats_attributes_on_unchanged_power():
     assert vehicle["power_available"] is False
 
 
+def test_ble_state_attributes_do_not_veto_a_genuinely_newer_power_value():
+    power_sync = _power_sync_module()
+    now = datetime.now(timezone.utc)
+    hass, entry = _stopped_ble_vehicle(
+        power_last_updated=now - timedelta(seconds=1),
+        state_last_updated=now,
+        now=now,
+    )
+    hass.states.get("sensor.garage_ble_charging_state").last_changed = (
+        now - timedelta(seconds=30)
+    )
+    hass.states.get("sensor.garage_ble_charge_power").last_changed = (
+        now - timedelta(seconds=1)
+    )
+
+    vehicle = power_sync._get_ev_vehicles_status(hass, entry)[0]
+
+    assert vehicle["ev_power_kw"] == 7.0
+    assert vehicle["is_charging"] is True
+    assert vehicle["power_available"] is True
+
+
 def test_ble_silent_state_entity_cannot_veto_a_live_power_value():
     """A bridge that stopped reporting its state must not veto the meter."""
     power_sync = _power_sync_module()

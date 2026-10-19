@@ -13600,9 +13600,12 @@ def test_ble_observed_power_reading_keeps_a_live_charging_reading():
     )) == (7.0, True)
 
 
-@pytest.mark.parametrize("completed_seconds_ago,power_seconds_ago", [(180, 120), (1, 120)])
+@pytest.mark.parametrize(
+    "completed_seconds_ago,power_seconds_ago,state_attribute_seconds_ago,expected_kw",
+    [(180, 120, 1, 0.0), (1, 120, 1, 0.0), (30, 1, 0, 7.0)],
+)
 def test_ble_completed_charge_attribute_refresh_does_not_feed_surplus(
-    completed_seconds_ago, power_seconds_ago,
+    completed_seconds_ago, power_seconds_ago, state_attribute_seconds_ago, expected_kw,
 ):
     """#409: changing attributes must not renew phantom charging watts."""
     now = datetime.now(timezone.utc)
@@ -13610,7 +13613,8 @@ def test_ble_completed_charge_attribute_refresh_does_not_feed_surplus(
         _State(
             "sensor.snowflake_charging_state", "Complete",
             last_changed=now - timedelta(seconds=completed_seconds_ago),
-            last_updated=now - timedelta(seconds=1), last_reported=now,
+            last_updated=now - timedelta(seconds=state_attribute_seconds_ago),
+            last_reported=now,
         ),
         _State(
             "sensor.snowflake_charge_power", "7.0",
@@ -13622,7 +13626,7 @@ def test_ble_completed_charge_attribute_refresh_does_not_feed_surplus(
 
     assert asyncio.run(actions._get_observed_ev_power_reading_kw(
         hass, "ble_snowflake", {"charger_type": "tesla"},
-    )) == (0.0, True)
+    )) == (expected_kw, True)
 
 
 # Discord #284: Tesla's cloud live_status caches the site aggregate for ~62s
