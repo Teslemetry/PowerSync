@@ -2534,14 +2534,11 @@ def _get_ev_vehicles_status(hass, entry) -> list:
                 set(),
             ))
 
-        if not wc_observations:
-            wc_power_kw = _kw_from_wall_connector_power(
-                tesla_coordinator.data.get("ev_power", 0)
-            )
-            if wc_power_kw > 0.05:
-                wc_observations.append(
-                    (wc_power_kw, True, True, None, "site", wc_observed_at, set())
-                )
+        # ``ev_power`` is the site's calculated EV total, which can originate
+        # from these same BLE/Fleet vehicles. Reusing it as a connector meter
+        # feeds old watts back into attribution with every fresh site poll,
+        # overriding completion or creating a phantom row after unplugging.
+        # Only native connector records or the HA meters below are sources.
 
     if not wc_observations:
         wc_power = 0.0

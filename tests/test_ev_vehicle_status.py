@@ -515,6 +515,89 @@ def test_named_zone_does_not_suppress_unpaired_ble_outside_both_mode():
     assert power_sync._get_external_tesla_ev_power_kw(hass, entry) == 3.0
 
 
+def test_site_ev_aggregate_does_not_become_a_phantom_wall_connector(monkeypatch):
+    """#409: a prior BLE total must not feed back as a fresh charger meter."""
+    power_sync = _power_sync_module()
+    ev_load = importlib.import_module("power_sync.ev_load")
+    now = datetime.now(timezone.utc)
+    monkeypatch.setattr(power_sync.dt_util, "utcnow", lambda: now)
+    async def no_sigenergy_charger(*_args):
+        return None
+    monkeypatch.setattr(power_sync, "_read_sigenergy_charger_state_for_entry", no_sigenergy_charger)
+    coordinator = SimpleNamespace(data={
+        "wall_connectors_raw": [],
+        "ev_power": 7.0,
+        "last_update": now,
+    })
+    hass = _Hass([], entry_data={"tesla_coordinator": coordinator})
+    entry = SimpleNamespace(entry_id="entry-1", data={}, options={
+        "ev_provider": power_sync.EV_PROVIDER_TESLA_BLE,
+        "tesla_ble_entity_prefix": "donkey,electric_bullet",
+    })
+
+    for charging_state, expected_power, expected_connected in (
+        ("Charging", 7.0, True),
+        ("Complete", 0.0, True),
+        ("Disconnected", 0.0, False),
+    ):
+        states = []
+        for prefix, state in (("donkey", "Disconnected"),
+                              ("electric_bullet", charging_state)):
+            states.extend([
+                _State(f"binary_sensor.{prefix}_status", "on", last_updated=now),
+                _State(f"sensor.{prefix}_charging_state", state, last_updated=now),
+                _State(f"binary_sensor.{prefix}_charge_flap",
+                       "off" if state == "Disconnected" else "on", last_updated=now),
+                # The bridge keeps reporting the old watts after completion.
+                _State(f"sensor.{prefix}_charge_power", "7.0",
+                       {"unit_of_measurement": "kW"},
+                       last_updated=now - timedelta(seconds=30), last_reported=now),
+                _State(f"sensor.{prefix}_charge_level", "81", last_updated=now),
+            ])
+        hass.states = _States(states)
+        # A refreshed site poll must never renew the prior derived total as
+        # independent evidence, even across repeated status/aggregation reads.
+        for _ in range(3):
+            vehicles = power_sync._get_ev_vehicles_status(hass, entry)
+            assert {v["vehicle_id"] for v in vehicles} == {
+                "ble_donkey", "ble_electric_bullet",
+            }
+            target = next(v for v in vehicles if v["vehicle_id"] == "ble_electric_bullet")
+            assert target["is_connected"] is expected_connected
+            assert target["is_charging"] is (charging_state == "Charging")
+            observations = asyncio.run(power_sync._get_ev_load_observations(hass, entry, vehicles))
+            snapshot = ev_load.aggregate_ev_load(observations, at=now)
+            assert snapshot.power_kw == expected_power
+            assert snapshot.quality == ev_load.EvLoadQuality.COMPLETE
+            normalized = ev_load.normalize_energy_data(
+                {"raw_home_load_power": 1.475 + expected_power,
+                 "load_power": 0.0, "ev_power": 7.0},
+                battery_system="tesla", ev_load=snapshot, at=now,
+            )
+            assert abs(normalized["load_power"] - 1.475) < 1e-9
+
+
+def test_real_wall_connector_meter_survives_unrelated_site_aggregate():
+    """Only actual connector payloads or HA meters establish charger rows."""
+    power_sync = _power_sync_module()
+    now = datetime.now(timezone.utc)
+    for data, states, expected_id in (
+        ({"wall_connectors_raw": [{"wall_connector_id": "garage",
+                                    "wall_connector_power": 7000,
+                                    "wall_connector_state": 2}]}, [], "wall_connector_garage"),
+        ({"wall_connectors_raw": []},
+         [_State("sensor.wall_connector_power", "7.0",
+                 {"unit_of_measurement": "kW"}, last_updated=now)], "wall_connector_ha"),
+    ):
+        data.update({"ev_power": 99.0, "last_update": now})
+        hass = _Hass(states, entry_data={"tesla_coordinator": SimpleNamespace(data=data)})
+        vehicles = power_sync._get_ev_vehicles_status(hass, _Entry())
+        assert len(vehicles) == 1
+        assert vehicles[0]["vehicle_id"] == expected_id
+        assert vehicles[0]["ev_power_kw"] == 7.0
+        assert vehicles[0]["is_charging"] is True
+
+
 def test_ble_steady_power_uses_its_own_last_reported_timestamp():
     """A steady source report stays fresh without borrowing metadata time."""
     power_sync = _power_sync_module()
