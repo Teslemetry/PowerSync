@@ -1,8 +1,17 @@
 # Powerwall energy-device schemas
 
-These are the unchanged energy-device schemas from Teslemetry/tesla-protocol
+The original energy-device schemas are unchanged from Teslemetry/tesla-protocol
 1.4.0, commit `faac4a0ef9cf036b4d81b262528118ec3aa0ce4d`:
 https://github.com/Teslemetry/tesla-protocol/tree/faac4a0ef9cf036b4d81b262528118ec3aa0ce4d/proto/energy_device
+
+`system_info_compat.proto` adds a PowerSync read-only projection of the newer
+identity response, following `common_api.proto` at upstream commit
+`2870ee505fb3db632641500b079e54f7a5de38bf`. Newer gateways use a scalar DIN and
+device-type tag 6; the original schemas use a wrapped DIN and tag 5. The
+transport recognizes the newer device-type tag before decoding that projection
+and falls back to the original response for older gateways. Update, compliance,
+and signature fields are deliberately left unmodelled in the projection.
+The existing request and control schemas remain unchanged.
 
 Only the transitive dependencies of PowerSync's five transport imports are
 included. The Tesla schemas and the upstream google/rpc/status.proto excerpt

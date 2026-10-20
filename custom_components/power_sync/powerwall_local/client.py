@@ -424,6 +424,8 @@ class PowerwallLocalClient:
                 errors[key] = str(result)
             else:
                 diagnostics[key] = result
+                if result is None:
+                    errors[key] = "Gateway returned no usable response"
         diagnostics["errors"] = errors
         return diagnostics
 

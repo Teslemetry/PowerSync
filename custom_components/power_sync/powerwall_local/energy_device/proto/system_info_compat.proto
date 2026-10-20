@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package tesla.proto.energy_device.v1;
+
+import "device.proto";
+import "update.proto";
+
+// Read-only projection of the newer Common API identity response. Field numbers
+// follow Teslemetry/tesla-protocol common_api.proto at commit
+// 2870ee505fb3db632641500b079e54f7a5de38bf. Other response fields (updates,
+// compliance and signatures) are intentionally left unmodelled. Keep the legacy
+// CommonMessages/MessageEnvelope definitions unchanged for older gateways.
+message PowerSyncSystemInfoResponse {
+  EcuId device_id = 1;
+  string din = 2;
+  FirmwareVersion firmware_version = 3;
+  optional DeviceType device_type = 6;
+}
+
+message PowerSyncSystemInfoCommon {
+  PowerSyncSystemInfoResponse get_system_info_response = 3;
+}
+
+message PowerSyncSystemInfoEnvelope {
+  PowerSyncSystemInfoCommon common = 4;
+}

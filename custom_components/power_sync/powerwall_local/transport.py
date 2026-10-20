@@ -35,6 +35,7 @@ from .energy_device import (
     device_pb2,
     filestore_api_pb2,
     signed_message_pb2,
+    system_info_compat_pb2,
     transport_pb2,
 )
 
@@ -719,17 +720,37 @@ class TEDAPIv1rTransport:
         resp = await self.post_v1r(env.SerializeToString(), din)
         if not resp.ok or not resp.inner_bytes:
             return None
-        try:
-            reply = transport_pb2.MessageEnvelope()
-            reply.ParseFromString(resp.inner_bytes)
-            if not reply.HasField("common") or not reply.common.HasField(
-                response_field
-            ):
-                return None
-            return getattr(reply.common, response_field)
-        except Exception as err:
-            _LOGGER.debug("%s parse error: %s", response_field, err)
-            return None
+        envelope_types = [transport_pb2.MessageEnvelope]
+        if response_field == "get_system_info_response":
+            envelope_types.insert(0, system_info_compat_pb2.PowerSyncSystemInfoEnvelope)
+        for envelope_type in envelope_types:
+            try:
+                reply = envelope_type()
+                reply.ParseFromString(resp.inner_bytes)
+                if not reply.HasField("common") or not reply.common.HasField(
+                    response_field
+                ):
+                    continue
+                response = getattr(reply.common, response_field)
+                if (
+                    envelope_type is system_info_compat_pb2.PowerSyncSystemInfoEnvelope
+                    and not response.HasField("device_type")
+                ):
+                    # The newer response moved device_type from tag 5 to 6.
+                    # Require that marker before interpreting a legacy wrapped
+                    # DIN as text; both formats use length-delimited tag 2.
+                    continue
+                if response_field == "get_system_info_response" and (
+                    _protobuf_text(response.din) != din
+                    or response.device_type == device_pb2.DEVICE_TYPE_INVALID
+                ):
+                    # Validate both projections: a future legacy tag 6 must
+                    # not turn wrapped DIN bytes into a modern scalar identity.
+                    continue
+                return response
+            except Exception as err:
+                _LOGGER.debug("%s parse error: %s", response_field, err)
+        return None
 
     async def get_system_info(self, din: str) -> dict[str, Any] | None:
         """Read gateway identity, model class, and firmware from Common API."""

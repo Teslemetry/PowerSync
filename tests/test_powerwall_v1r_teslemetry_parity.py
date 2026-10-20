@@ -319,6 +319,93 @@ async def test_common_api_diagnostics_are_read_only_and_credential_free():
     assert "password" not in repr(networking).lower()
 
 
+def _modern_system_info_wire(*, din="DIN--1", extra_fields=True, device_type=4):
+    """Independent wire fixture for the format observed on firmware 26.26.4."""
+    from importlib import import_module
+    wire = import_module(f"{_LOCAL_PKG}.fleet_api_bms")
+    response = (
+        wire._field_bytes(1, wire._field_string(1, "1234567-00-A") + wire._field_string(2, "TG123456789"))
+        + wire._field_string(2, din)
+        + wire._field_bytes(3, wire._field_string(1, "26.26.4") + wire._field_bytes(2, b"\xaa\xbb"))
+        + wire._field_varint(6, device_type)
+    )
+    if extra_fields:
+        # Update/compliance/signature fields need not be decoded for identity.
+        response += wire._field_bytes(5, b"\x0a\x00")
+        response += wire._field_bytes(7, b"\x0a\x00")
+        response += wire._field_bytes(8, b"opaque-signature")
+    return wire._field_bytes(4, wire._field_bytes(3, response))
+
+
+@pytest.mark.parametrize("extra_fields", [False, True])
+@async_test
+async def test_get_system_info_decodes_modern_gateway_wire(extra_fields):
+    transport = _transport_without_key()
+    transport.post_v1r = AsyncMock(return_value=transport_mod.TEDAPIResponse(
+        True, _modern_system_info_wire(extra_fields=extra_fields),
+    ))
+
+    result = await transport.get_system_info("DIN--1")
+
+    assert result == {
+        "part_number": "1234567-00-A", "serial_number": "TG123456789",
+        "din": "DIN--1", "firmware_version": "26.26.4",
+        "firmware_githash": "aabb", "device_type": "SITECONTROLLER",
+    }
+    transport.post_v1r.assert_awaited_once()
+    request = transport_pb2.MessageEnvelope()
+    request.ParseFromString(transport.post_v1r.await_args.args[0])
+    assert request.common.WhichOneof("message") == "get_system_info_request"
+
+
+@pytest.mark.parametrize("din,device_type", [("", 4), ("other-gateway", 4), ("DIN--1\n", 4), ("DIN--1", 0)])
+@async_test
+async def test_modern_system_info_requires_target_identity(din, device_type):
+    transport = _transport_without_key()
+    transport.post_v1r = AsyncMock(return_value=transport_mod.TEDAPIResponse(
+        True, _modern_system_info_wire(din=din, device_type=device_type),
+    ))
+    assert await transport.get_system_info("DIN--1") is None
+
+
+@async_test
+async def test_legacy_system_info_with_unknown_tag_six_keeps_wrapped_din():
+    from importlib import import_module
+    wire = import_module(f"{_LOCAL_PKG}.fleet_api_bms")
+    reply = transport_pb2.MessageEnvelope()
+    response = reply.common.get_system_info_response
+    response.din.value = "DIN--1"
+    response.firmare_version.version = "24.44.0"
+    response.device_type = device_pb2.DEVICE_TYPE_SITECONTROLLER
+    # An unknown future field must not make legacy wrapped DIN look modern.
+    inner = response.SerializeToString() + wire._field_varint(6, 4)
+    raw = wire._field_bytes(4, wire._field_bytes(3, inner))
+    transport = _transport_without_key()
+    transport.post_v1r = AsyncMock(return_value=transport_mod.TEDAPIResponse(True, raw))
+    result = await transport.get_system_info("DIN--1")
+    assert result["din"] == "DIN--1"
+    assert result["firmware_version"] == "24.44.0"
+    assert result["device_type"] == "SITECONTROLLER"
+
+
+@async_test
+async def test_missing_common_api_response_is_reported_in_diagnostics():
+    client = client_mod.PowerwallLocalClient.__new__(client_mod.PowerwallLocalClient)
+    client._din = "DIN--1"
+    client._transport = SimpleNamespace(
+        get_system_info=AsyncMock(return_value=None),
+        get_networking_status=AsyncMock(return_value={}),
+        check_internet=AsyncMock(return_value={}),
+    )
+
+    result = await client.get_v1r_diagnostics()
+
+    assert result["system_info"] is None
+    assert "system_info" in result["errors"]
+    assert "networking" not in result["errors"]
+    assert "internet" not in result["errors"]
+
+
 @async_test
 async def test_get_system_info_supports_legacy_tesla_protocol_shape():
     transport = _transport_without_key()
