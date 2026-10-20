@@ -821,7 +821,7 @@ def test_restore_normal_treats_octopus_as_dynamic_sync_provider():
 def test_tesla_tou_upload_waits_for_site_info_readback():
     source = INIT_PATH.read_text()
     tree = ast.parse(source)
-    function = _find_function(tree, "send_tariff_to_tesla")
+    function = _find_function(tree, "_send_tariff_to_tesla")
     confirm = _find_function(tree, "_confirm_tesla_tariff_uploaded")
     status = _find_function(tree, "_tesla_tariff_readback_status")
     function_source = ast.get_source_segment(source, function)
@@ -1119,7 +1119,7 @@ def test_tesla_energy_coordinator_grid_charging_uses_confirmed_uncached_helper()
 def test_tesla_tou_upload_reports_accepted_before_readback_failure():
     source = INIT_PATH.read_text()
     tree = ast.parse(source)
-    function = _find_function(tree, "send_tariff_to_tesla")
+    function = _find_function(tree, "_send_tariff_to_tesla")
     function_source = ast.get_source_segment(source, function)
 
     assert function_source is not None

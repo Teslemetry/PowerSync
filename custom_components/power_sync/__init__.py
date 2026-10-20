@@ -5761,6 +5761,51 @@ async def send_tariff_to_tesla(
     accepted_status: dict[str, bool] | None = None,
     readback_status: dict[str, str] | None = None,
 ) -> bool:
+    """Upload one site's tariff, sharing backpressure across all TOU callers.
+
+    Do not queue competing force/restore payloads: their callers must recheck
+    lifecycle state before retrying. Keep the cooldown in hass.data so a final
+    429 or a cancelled retry cannot let the next caller bypass Retry-After.
+    """
+    uploads = hass.data.setdefault(DOMAIN, {}).setdefault("_tesla_tou_uploads", {})
+    key = (api_provider, get_tesla_api_base_url(api_provider, fleet_base_url), str(site_id))
+    state = uploads.setdefault(key, {"busy": False, "retry_at": 0.0})
+    if state["busy"] or state["retry_at"] > time.monotonic():
+        _LOGGER.debug("Deferring TOU upload for site %s: upload busy or rate limited", site_id)
+        return False
+
+    # No await between checking and claiming the slot on HA's event loop.
+    state["busy"] = True
+    try:
+        return await _send_tariff_to_tesla(
+            hass, site_id, tariff_data, api_token, api_provider,
+            max_retries=max_retries,
+            timeout_seconds=timeout_seconds,
+            fleet_base_url=fleet_base_url,
+            confirm_readback=confirm_readback,
+            accepted_status=accepted_status,
+            readback_status=readback_status,
+            rate_limit_state=state,
+        )
+    finally:
+        state["busy"] = False
+
+
+async def _send_tariff_to_tesla(
+    hass: HomeAssistant,
+    site_id: str,
+    tariff_data: dict[str, Any],
+    api_token: str,
+    api_provider: str = TESLA_PROVIDER_TESLEMETRY,
+    max_retries: int = 3,
+    timeout_seconds: int = 60,
+    fleet_base_url: str | None = None,
+    confirm_readback: bool = True,
+    accepted_status: dict[str, bool] | None = None,
+    readback_status: dict[str, str] | None = None,
+    *,
+    rate_limit_state: dict[str, Any],
+) -> bool:
     """Send tariff data to Tesla via the configured provider with retry logic.
 
     Args:
@@ -5905,6 +5950,9 @@ async def send_tariff_to_tesla(
                     # Rate limited — retry with Retry-After if provided
                     from .coordinator import _parse_retry_after
                     retry_after_delay = _parse_retry_after(response)
+                    rate_limit_state["retry_at"] = time.monotonic() + (
+                        retry_after_delay or (2 ** (attempt + 1))
+                    )
                     _LOGGER.warning(
                         "TOU sync rate limited 429 (attempt %d/%d): %s (retry-after: %s)",
                         attempt + 1,

@@ -634,10 +634,10 @@ def extract_current_price_interval(
 ) -> dict[str, Any] | None:
     """Return a currently covering Amber ``CurrentInterval`` by channel.
 
-    The current-price endpoint and the cached five-minute forecast have the
-    same interval shape, but only the former is authoritative for a refreshed
-    TOU sync.  An interval ending at or before ``now`` must not be promoted to
-    the current half-hour period by the rolling tariff builder.
+    Amber's current-price endpoint defaults to 30-minute intervals; the
+    interval schema also supports 5 and 15 minutes. Only a currently covering
+    CurrentInterval is authoritative for a refreshed TOU sync. An interval
+    ending at or before ``now`` must not be promoted to the current period.
     """
     if not price_data:
         return None
@@ -656,7 +656,7 @@ def extract_current_price_interval(
 
         try:
             duration_minutes = float(interval.get("duration", 0))
-            if duration_minutes != 5:
+            if duration_minutes not in (5, 15, 30):
                 continue
             interval_end = datetime.fromisoformat(
                 str(interval.get("nemTime", "")).replace("Z", "+00:00")

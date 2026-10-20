@@ -10,6 +10,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parent.parent / "custom_components" / "power_sync"
 
@@ -190,21 +192,21 @@ def _forecast_30min():
     ]
 
 
-def _current_interval(nem_time: str, buy: float, sell: float):
+def _current_interval(nem_time: str, buy: float, sell: float, duration: int = 5):
     return [
         {
             "channelType": "general",
             "type": "CurrentInterval",
             "nemTime": nem_time,
             "perKwh": buy,
-            "duration": 5,
+            "duration": duration,
         },
         {
             "channelType": "feedIn",
             "type": "CurrentInterval",
             "nemTime": nem_time,
             "perKwh": sell,
-            "duration": 5,
+            "duration": duration,
         },
     ]
 
@@ -226,11 +228,25 @@ def _full_30min_forecast():
     return forecast
 
 
-def test_amber_tou_uses_refreshed_current_after_cached_boundary(monkeypatch):
+def test_amber_current_interval_uses_nem_offset_during_victorian_daylight_saving():
+    current = _current_interval("2026-10-20T14:30:00+10:00", 1.77, -4.08, 30)
+    now = datetime.fromisoformat("2026-10-20T15:17:00+11:00")
+    selected = tariff_converter.extract_current_price_interval(current, now=now)
+    assert selected["general"]["perKwh"] == 1.77
+    assert selected["feedIn"]["perKwh"] == -4.08
+    # The same payload stops being current at its actual end, regardless of DST.
+    assert tariff_converter.extract_current_price_interval(
+        current, now=datetime.fromisoformat("2026-10-20T15:30:00+11:00")
+    ) is None
+
+
+@pytest.mark.parametrize("duration", [5, 15, 30])
+def test_amber_tou_uses_refreshed_current_after_cached_boundary(monkeypatch, duration):
     """A cached five-minute interval must not become the new TOU period."""
     clock = {"now": datetime(2026, 5, 1, 11, 29, 50, tzinfo=timezone.utc)}
-    old_current = _current_interval("2026-05-01T11:30:00+00:00", 62.0, -47.0)
-    fresh_current = _current_interval("2026-05-01T11:35:00+00:00", 25.6, -13.2)
+    old_current = _current_interval("2026-05-01T11:30:00+00:00", 62.0, -47.0, duration)
+    fresh_end = datetime(2026, 5, 1, 11, 30, tzinfo=timezone.utc) + timedelta(minutes=duration)
+    fresh_current = _current_interval(fresh_end.isoformat(), 25.6, -13.2, duration)
     refresh_count = {"current": 0}
 
     async def fake_fetch(session, url, headers, **kwargs):
