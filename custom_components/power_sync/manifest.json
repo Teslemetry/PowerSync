@@ -24,7 +24,8 @@
     "aemo-to-tariff>=0.7.15",
     "goodwe>=0.4.9",
     "protobuf>=4.25.0",
-    "highspy>=1.7.0"
+    "highspy>=1.7.0",
+    "pycognito==2024.5.1"
   ],
   "version": "2.12.1430"
 }

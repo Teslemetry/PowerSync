@@ -150,6 +150,7 @@ EV_LIVE_STATUS_COORDINATOR_KEYS = (
     "neovolt_coordinator",
     "solaredge_coordinator",
     "anker_solix_coordinator",
+    "amber_smartshift_coordinator",
     "custom_energy_coordinator",
 )
 
@@ -3911,6 +3912,8 @@ async def _action_force_discharge(
 
     try:
         service_data: Dict[str, Any] = {"duration": duration, "source": "automation"}
+        if config_entry.options.get("battery_system", config_entry.data.get("battery_system")) == "amber_smartshift":
+            service_data["entry_id"] = config_entry.entry_id
         power_w = params.get("power_w")
         if power_w is not None:
             service_data["power_w"] = int(power_w)
@@ -3955,6 +3958,8 @@ async def _action_force_charge(
 
     try:
         service_data: Dict[str, Any] = {"duration": duration, "source": "automation"}
+        if config_entry.options.get("battery_system", config_entry.data.get("battery_system")) == "amber_smartshift":
+            service_data["entry_id"] = config_entry.entry_id
         power_w = params.get("power_w")
         if power_w is not None:
             service_data["power_w"] = int(power_w)
@@ -4405,7 +4410,7 @@ async def _action_restore_normal(
         await hass.services.async_call(
             DOMAIN,
             SERVICE_RESTORE_NORMAL,
-            {"source": "automation"},
+            {"source": "automation", **({"entry_id": config_entry.entry_id} if config_entry.options.get("battery_system", config_entry.data.get("battery_system")) == "amber_smartshift" else {})},
             blocking=True,
         )
         return True

@@ -79,6 +79,7 @@ def _p(
 
 
 _PROFILES: tuple[BatteryConnectionProfile, ...] = (
+    _p("amber_smartshift_native", "amber_smartshift", "PowerSync native Amber Smart Shift", "cloud", controls_summary="Timed battery modes; no target watts, reserve writes or solar curtailment"),
     _p("tesla_provider", BATTERY_SYSTEM_TESLA, "Configured Tesla provider", "provider"),
     _p(
         "tesla_powerwall_monitoring",
@@ -265,6 +266,7 @@ def legacy_profile_id(
             ANKER_SOLIX_CONNECTION_CLOUD_HA: "anker_ha_cloud",
         }.get(route, "anker_direct")
     return {
+        "amber_smartshift": "amber_smartshift_native",
         BATTERY_SYSTEM_TESLA: "tesla_provider",
         BATTERY_SYSTEM_SIGENERGY: "sigenergy_direct",
         BATTERY_SYSTEM_ESY_SUNHOME: "esy_ha",

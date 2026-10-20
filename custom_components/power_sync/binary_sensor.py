@@ -53,6 +53,10 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up PowerSync binary sensors."""
+    if native_amber := hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("amber_smartshift_coordinator"):
+        from .amber_smartshift.entities import AmberConnectionSensor
+        async_add_entities([AmberConnectionSensor(native_amber, entry)])
+        return
     tesla_site_id = entry.options.get(
         CONF_TESLA_ENERGY_SITE_ID,
         entry.data.get(CONF_TESLA_ENERGY_SITE_ID, ""),

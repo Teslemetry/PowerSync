@@ -194,7 +194,7 @@ async def async_setup_entry(
         CONF_TESLA_ENERGY_SITE_ID,
         entry.data.get(CONF_TESLA_ENERGY_SITE_ID, "")
     )
-    is_tesla = bool(tesla_site_id)
+    is_tesla = bool(tesla_site_id) and entry.options.get(CONF_BATTERY_SYSTEM, entry.data.get(CONF_BATTERY_SYSTEM, BATTERY_SYSTEM_TESLA)) == BATTERY_SYSTEM_TESLA
 
     # Detect electricity provider for TOU sync relevance
     electricity_provider = entry.options.get(
@@ -221,6 +221,9 @@ async def async_setup_entry(
     )
 
     entities = []
+    if native_amber := hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("amber_smartshift_coordinator"):
+        from .amber_smartshift.entities import AmberSmartShiftSwitch
+        entities.append(AmberSmartShiftSwitch(native_amber, entry))
 
     entities.append(
         AutoUpdateSwitch(
@@ -273,26 +276,33 @@ async def async_setup_entry(
 
     # Manual force controls are service wrappers and are available for every
     # battery system supported by power_sync.force_charge/force_discharge.
-    entities.extend([
-        ForceDischargeSwitch(
-            hass=hass,
-            entry=entry,
-            description=SwitchEntityDescription(
-                key=SWITCH_TYPE_FORCE_DISCHARGE,
-                name="Force Discharge",
-                icon="mdi:battery-arrow-up",
+    if native_amber:
+        from .amber_smartshift.entities import AmberModeSwitch
+        entities.extend([
+            AmberModeSwitch(native_amber, entry, "charge", "force_charge", "Force Charge"),
+            AmberModeSwitch(native_amber, entry, "discharge", "force_discharge", "Force Discharge"),
+        ])
+    else:
+        entities.extend([
+            ForceDischargeSwitch(
+                hass=hass,
+                entry=entry,
+                description=SwitchEntityDescription(
+                    key=SWITCH_TYPE_FORCE_DISCHARGE,
+                    name="Force Discharge",
+                    icon="mdi:battery-arrow-up",
+                ),
             ),
-        ),
-        ForceChargeSwitch(
-            hass=hass,
-            entry=entry,
-            description=SwitchEntityDescription(
-                key=SWITCH_TYPE_FORCE_CHARGE,
-                name="Force Charge",
-                icon="mdi:battery-arrow-down",
+            ForceChargeSwitch(
+                hass=hass,
+                entry=entry,
+                description=SwitchEntityDescription(
+                    key=SWITCH_TYPE_FORCE_CHARGE,
+                    name="Force Charge",
+                    icon="mdi:battery-arrow-down",
+                ),
             ),
-        ),
-    ])
+        ])
 
     # Only add auto-sync switch for providers that actually sync TOU schedules
     if has_tou_sync:

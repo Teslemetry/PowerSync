@@ -1129,6 +1129,32 @@
           "custom_solar_power_entity": "Optional. A sensor reporting TOTAL solar production for the whole property: the GoodWe inverter's own PV plus any AC-coupled array such as Enphase microinverters. Leave empty if the GoodWe PV strings are all your solar. If this sensor becomes unavailable, PowerSync ignores solar samples instead of using a partial reading."
         },
         "submit": "Next"
+      },
+      "amber_smartshift": {
+        "title": "Amber Smart Shift",
+        "description": "Connect your Amber Smart Shift battery natively. Leave PowerSync management off for Amber-managed operation with manual PowerSync controls. Automatic operation requires grid, solar and home-load meters. Amber controls battery power; target watts and hardware reserve changes are unavailable. If allowed, PowerSync may enable Smart Shift for overrides and leaves it enabled. Override expiry returns control to Amber, including when Home Assistant is offline.",
+        "data": {
+          "amber_smartshift_email": "Amber email",
+          "amber_smartshift_password": "Amber password",
+          "amber_smartshift_managed": "Let PowerSync manage battery operation",
+          "amber_smartshift_allow_enable": "Allow PowerSync to enable Smart Shift for overrides",
+          "custom_grid_power_entity": "Grid power (positive import)",
+          "custom_solar_power_entity": "Solar power",
+          "custom_load_power_entity": "Home load power"
+        }
+      },
+      "amber_smartshift_reauth": {
+        "title": "Reconnect Amber Smart Shift",
+        "description": "Connect your Amber Smart Shift battery natively. Leave PowerSync management off for Amber-managed operation with manual PowerSync controls. Automatic operation requires grid, solar and home-load meters. Amber controls battery power; target watts and hardware reserve changes are unavailable. If allowed, PowerSync may enable Smart Shift for overrides and leaves it enabled. Override expiry returns control to Amber, including when Home Assistant is offline.",
+        "data": {
+          "amber_smartshift_email": "Amber email",
+          "amber_smartshift_password": "Amber password",
+          "amber_smartshift_managed": "Let PowerSync manage battery operation",
+          "amber_smartshift_allow_enable": "Allow PowerSync to enable Smart Shift for overrides",
+          "custom_grid_power_entity": "Grid power (positive import)",
+          "custom_solar_power_entity": "Solar power",
+          "custom_load_power_entity": "Home load power"
+        }
       }
     },
     "error": {
@@ -1212,7 +1238,9 @@
       "anker_solix_connect_failed": "Could not validate the Anker Solix connection. For direct Modbus, check IP, port 502, slave ID, and third-party control. For HA bridge mode, check that the Anker integration exposes SOC and solar power entities.",
       "solaredge_host_required": "Enter the SolarEdge inverter IP address, or enter an HA entity prefix for entity fallback.",
       "solaredge_connect_failed": "Could not connect to SolarEdge via Modbus or find a matching SolarEdge active power limit entity. Check Modbus TCP, power-control settings, firmware/grid profile support, and the entity prefix.",
-      "solaredge_rated_power_required": "Enter the SolarEdge inverter rated AC power in watts."
+      "solaredge_rated_power_required": "Enter the SolarEdge inverter rated AC power in watts.",
+      "amber_smartshift_auth": "Amber sign-in failed. Check your email and password. Unsupported sign-in challenges require completing sign-in with Amber.",
+      "amber_smartshift_connection": "Unable to connect the Amber battery. Confirm Smart Shift enrollment, matching Amber pricing site, required meters for automatic operation, and that previous PowerSync overrides have finished cleanup."
     },
     "abort": {
       "already_configured": "PowerSync is already configured. To change settings, use the Configure button on the integration card.",
@@ -1277,7 +1305,9 @@
       "storage_unavailable": "PowerSync storage is not available. Reload the integration and try again.",
       "solar_production_control_required": "Select PV production controls or enable and configure a supported separate AC inverter.",
       "invalid_solar_production_entity": "Select available PV production switches or production-limit numbers that support zero.",
-      "solar_production_grid_status_required": "Select a sensor that confirms the utility grid is connected before stopping solar."
+      "solar_production_grid_status_required": "Select a sensor that confirms the utility grid is connected before stopping solar.",
+      "amber_smartshift_auth": "Amber sign-in failed. Check your email and password. Unsupported sign-in challenges require completing sign-in with Amber.",
+      "amber_smartshift_connection": "Unable to connect the Amber battery. Confirm Smart Shift enrollment, matching Amber pricing site, required meters for automatic operation, and that previous PowerSync overrides have finished cleanup."
     },
     "step": {
       "optimizer_access": {
@@ -1317,7 +1347,8 @@
           "ev_charging": "EV charging",
           "ev_load_management": "EV load management",
           "solax_battery_options": "Solax connection",
-          "advanced": "Advanced settings"
+          "advanced": "Advanced settings",
+          "amber_smartshift": "Amber Smart Shift connection and control owner"
         }
       },
       "display_currency": {
@@ -2834,6 +2865,19 @@
           "solax_entity_prefix": "Optional. Use when Solax Modbus creates more than one naming group. For entities like select.solax_modbus_charger_use_mode, enter solax_modbus."
         },
         "submit": "Save"
+      },
+      "amber_smartshift": {
+        "title": "Amber Smart Shift",
+        "description": "Connect your Amber Smart Shift battery natively. Leave PowerSync management off for Amber-managed operation with manual PowerSync controls. Automatic operation requires grid, solar and home-load meters. Amber controls battery power; target watts and hardware reserve changes are unavailable. If allowed, PowerSync may enable Smart Shift for overrides and leaves it enabled. Override expiry returns control to Amber, including when Home Assistant is offline.",
+        "data": {
+          "amber_smartshift_email": "Amber email",
+          "amber_smartshift_password": "Amber password",
+          "amber_smartshift_managed": "Let PowerSync manage battery operation",
+          "amber_smartshift_allow_enable": "Allow PowerSync to enable Smart Shift for overrides",
+          "custom_grid_power_entity": "Grid power (positive import)",
+          "custom_solar_power_entity": "Solar power",
+          "custom_load_power_entity": "Home load power"
+        }
       }
     },
     "abort": {

@@ -12132,6 +12132,9 @@ class ProviderConfigView(HomeAssistantView):
                     entry.data.get(CONF_MONITORING_MODE, False),
                 )
 
+            if native_amber := self._hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("amber_smartshift_coordinator"):
+                config["amber_smartshift"] = native_amber.api_data()["amber_smartshift"]
+
             result = {
                 "success": True,
                 "electricity_provider": electricity_provider,
@@ -19385,6 +19388,7 @@ def _get_ev_display_coordinator(hass, entry):
             "neovolt_coordinator": "neovolt",
             "solaredge_coordinator": "solaredge",
             "anker_solix_coordinator": "anker_solix",
+            "amber_smartshift_coordinator": "amber_smartshift",
             "custom_energy_coordinator": "custom",
         }
         for coordinator_key, battery_system in coordinator_systems.items():
@@ -19538,6 +19542,7 @@ class EVLoadpointStatusView(HomeAssistantView):
             return parsed if math.isfinite(parsed) else None
 
         for key in (
+            "amber_smartshift_coordinator",
             "tesla_coordinator",
             "sigenergy_coordinator",
             "sungrow_coordinator",
@@ -22377,6 +22382,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     is_neovolt = active_battery_system == BATTERY_SYSTEM_NEOVOLT
     is_solaredge = active_battery_system == BATTERY_SYSTEM_SOLAREDGE
     is_anker_solix = active_battery_system == BATTERY_SYSTEM_ANKER_SOLIX
+    is_amber_smartshift = active_battery_system == "amber_smartshift"
     is_custom_battery = active_battery_system == BATTERY_SYSTEM_CUSTOM
 
     def ac_inverter_is_same_hybrid() -> bool:
@@ -22443,6 +22449,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     solaredge_coordinator = None
     anker_solix_coordinator = None
     custom_energy_coordinator = None
+    amber_smartshift_coordinator = None
     token_getter = None  # Will be set for Tesla users
 
     source_config_entry_id = str(
@@ -23133,6 +23140,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 )
             ),
         )
+    elif is_amber_smartshift:
+        from .amber_smartshift.runtime import AmberBatteryCoordinator
+        amber_smartshift_coordinator = AmberBatteryCoordinator(hass, entry)
     elif is_custom_battery:
         _LOGGER.info(
             "Running in custom external-controller mode - using selected Home Assistant entities for planner telemetry"
@@ -23232,6 +23242,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             )
 
     # Fetch initial data
+    if amber_smartshift_coordinator:
+        await amber_smartshift_coordinator.async_config_entry_first_refresh()
     if amber_coordinator:
         await amber_coordinator.async_config_entry_first_refresh()
     if tesla_coordinator:
@@ -23439,7 +23451,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         or sigenergy_coordinator or sungrow_coordinator or alphaess_coordinator
         or esy_sunhome_coordinator or solax_coordinator or saj_h2_coordinator
         or fronius_reserva_coordinator or neovolt_coordinator
-        or solaredge_coordinator or anker_solix_coordinator
+        or solaredge_coordinator or anker_solix_coordinator or amber_smartshift_coordinator
     )
     if demand_charge_enabled and energy_coord_for_demand:
         demand_charge_rate = entry.options.get(
@@ -23501,7 +23513,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     # Tesla AEMO Spike Manager (tariff-based) — only for Tesla
-    if has_tesla_site and not is_sigenergy and not is_sungrow and not is_foxess and not is_goodwe and not is_alphaess and not is_esy_sunhome and not is_solax and not is_saj_h2 and not is_fronius_reserva and not is_neovolt and not is_solaredge and not is_anker_solix and (
+    if has_tesla_site and not is_amber_smartshift and not is_sigenergy and not is_sungrow and not is_foxess and not is_goodwe and not is_alphaess and not is_esy_sunhome and not is_solax and not is_saj_h2 and not is_fronius_reserva and not is_neovolt and not is_solaredge and not is_anker_solix and (
         (aemo_spike_enabled and not ml_optimization_enabled)
         or await _aemo_spike_restore_required(hass, entry)
     ):
@@ -24144,6 +24156,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if tesla_site_country is None and tesla_coordinator:
         tesla_site_country = getattr(tesla_coordinator, "_site_country", None)
     hass.data[DOMAIN][entry.entry_id] = {
+        "amber_smartshift_coordinator": amber_smartshift_coordinator,
+        "is_amber_smartshift": is_amber_smartshift,
         "amber_coordinator": amber_coordinator,
         "tesla_coordinator": tesla_coordinator,
         "tesla_capabilities": tesla_capabilities or {},
@@ -41375,7 +41389,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         return result
 
     from .licensing.entry_routing import register_handlers, routed_handler
+    if amber_smartshift_coordinator:
+        from .amber_smartshift.controls import handlers as amber_handlers
+        native_handlers = amber_handlers(amber_smartshift_coordinator)
+        handle_force_charge = native_handlers["force_charge"]
+        handle_force_discharge = native_handlers["force_discharge"]
+        handle_restore_normal = native_handlers["restore_normal"]
+        handle_set_self_consumption = native_handlers["set_self_consumption"]
+        handle_hold_battery_soc = native_handlers["hold_battery_soc"]
+        handle_set_autonomous = native_handlers["set_autonomous"]
+        handle_set_backup_reserve = native_handlers["set_backup_reserve"]
+        register_handlers(hass, entry.entry_id, native_handlers)
+        hass.services.async_register(
+            DOMAIN, "preserve_battery",
+            routed_handler(hass, entry.entry_id, "preserve_battery", native_handlers["preserve_battery"]),
+            supports_response=SupportsResponse.OPTIONAL,
+        )
     register_handlers(hass, entry.entry_id, {
+        **(native_handlers if amber_smartshift_coordinator else {}),
         'force_charge': handle_force_charge,
         'force_discharge': handle_force_discharge,
         'restore_normal': handle_restore_normal,
@@ -41415,7 +41446,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.services.async_register(DOMAIN, "set_autonomous", routed_handler(hass, entry.entry_id, 'set_autonomous', handle_set_autonomous))
 
     # Now that handle_restore_normal is defined, schedule expired force mode restore
-    if persisted_force_state:
+    if persisted_force_state and not is_amber_smartshift:
         hass.async_create_task(restore_force_mode_from_persistence())
 
     # Register Powerwall settings services
@@ -41463,7 +41494,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             float(end_ts), saved_reserve, local_event=local_event
         )
 
-    hass.async_create_task(_resume_max_backup_if_persisted())
+    if not is_amber_smartshift:
+        hass.async_create_task(_resume_max_backup_if_persisted())
 
     _LOGGER.info("🔋 Force charge/discharge, restore, and Powerwall settings services registered")
 
@@ -44416,6 +44448,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             elif is_anker_solix:
                 battery_system = "anker_solix"
                 energy_coordinator = anker_solix_coordinator
+            elif is_amber_smartshift:
+                battery_system = "amber_smartshift"
+                energy_coordinator = amber_smartshift_coordinator
             elif is_custom_battery:
                 battery_system = BATTERY_SYSTEM_CUSTOM
                 energy_coordinator = None
@@ -44430,6 +44465,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 battery_system=battery_system,
             )
 
+            if is_amber_smartshift:
+                from .amber_smartshift.controls import AmberOptimizerController
+                battery_controller = AmberOptimizerController(amber_smartshift_coordinator)
+
             # Get tariff schedule for TOU-based pricing (Globird, etc.)
             tariff_schedule = hass.data[DOMAIN][entry.entry_id].get("tariff_schedule")
 
@@ -44441,6 +44480,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
                 if entry_data.get("optimizer_force_restart_restore_pending"):
                     return {"active": False}
+                if native_amber := entry_data.get("amber_smartshift_coordinator"):
+                    return native_amber.force_state()
                 if force_charge_state.get("active"):
                     return {
                         "active": True,
@@ -47132,6 +47173,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Tear down TOU sync hooks (AEMO dispatch subscriber + dispatch-trigger
     # coordinator + cron fallback + optional Octopus cron)
     entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+
+    if amber_runtime := entry_data.get("amber_smartshift_coordinator"):
+        await amber_runtime.shutdown()
 
     # Retire spike checks before the first await. A timer cancellation alone
     # cannot fence a callback already waiting for AEMO or Tesla.

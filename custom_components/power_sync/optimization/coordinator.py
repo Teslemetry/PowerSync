@@ -971,6 +971,10 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return True
         if not self._entry:
             return False
+        if self.battery_system == "amber_smartshift" and not self._entry.options.get(
+            "amber_smartshift_managed", self._entry.data.get("amber_smartshift_managed", False)
+        ):
+            return True
 
         return bool(
             self._entry.options.get(
@@ -1153,6 +1157,9 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         solar/grid charge. Backends without such a primitive fall back to their
         existing IDLE hold behavior.
         """
+        if self.battery_system == "amber_smartshift":
+            return await battery.preserve()
+
         soc, _ = await self._get_battery_state()
         soc_pct = int(soc * 100)
         configured_idle_floor = int(self._config.backup_reserve * 100)
@@ -8362,6 +8369,20 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             return
         if (
+            getattr(self, "battery_system", "") == "amber_smartshift"
+            and self.energy_coordinator.renewal_due()
+        ):
+            solved_at = getattr(self, "_last_update_time", None)
+            if solved_at and (dt_util.utcnow() - solved_at).total_seconds() <= 360:
+                async with self._execute_lock:
+                    current_action = self._get_current_action()
+                    if current_action:
+                        await self._execute_optimizer_action(
+                            current_action, execution_trigger="amber_lease"
+                        )
+                self.async_set_updated_data(self.get_api_data())
+            return
+        if (
             action_name == getattr(self, "_last_executed_action", None)
             and (
                 action_name not in FORCED_ACTIONS
@@ -9917,6 +9938,8 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def _get_active_force_state(self) -> dict[str, Any]:
         """Return user-visible force state or private optimizer force state."""
+        if getattr(self, "battery_system", "") == "amber_smartshift":
+            return self.energy_coordinator.force_state()
         shared_force_state: dict[str, Any] = {}
         force_state_getter = getattr(self, "_force_state_getter", None)
         if force_state_getter:
@@ -12435,6 +12458,8 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "_last_optimizer_self_consumption_reserve_target",
                         None,
                     )
+                    if self.battery_system == "amber_smartshift":
+                        apply_self_consumption = apply_self_consumption or self.energy_coordinator.renewal_due()
                     if not apply_self_consumption:
                         # Verify the hardware mode has not drifted. On HA restart
                         # Tesla can remain in autonomous while the optimizer's
@@ -20809,6 +20834,8 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _cal_entry_data.get("calibration_sources") or []
         )
 
+        if self.battery_system == "amber_smartshift":
+            return self.energy_coordinator.project_optimizer_status(data)
         return data
 
     async def set_settings(self, settings: dict[str, Any]) -> dict[str, Any]:

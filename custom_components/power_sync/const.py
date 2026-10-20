@@ -23,7 +23,7 @@ except (FileNotFoundError, json.JSONDecodeError):
     POWER_SYNC_VERSION = "0.0.0"
 
 # Dashboard JS version — bump this to cache-bust the strategy JS independently of the app version
-DASHBOARD_JS_VERSION = "53"
+DASHBOARD_JS_VERSION = "54"
 
 # User-Agent for API identification
 POWER_SYNC_USER_AGENT = f"PowerSync/{POWER_SYNC_VERSION} HomeAssistant"
@@ -227,6 +227,7 @@ BATTERY_SENSOR_DISPLAY_MODES = {
     BATTERY_SENSOR_DISPLAY_ALL: "All supported sensors",
     BATTERY_SENSOR_DISPLAY_OFF: "Off",
 }
+BATTERY_SYSTEM_AMBER_SMARTSHIFT = "amber_smartshift"
 BATTERY_SYSTEM_TESLA = "tesla"
 BATTERY_SYSTEM_SIGENERGY = "sigenergy"
 BATTERY_SYSTEM_SUNGROW = "sungrow"
@@ -244,6 +245,7 @@ BATTERY_SYSTEM_ANKER_SOLIX = "anker_solix"
 BATTERY_SYSTEM_CUSTOM = "custom"
 
 BATTERY_SYSTEMS = {
+    BATTERY_SYSTEM_AMBER_SMARTSHIFT: "Amber Smart Shift — native cloud battery control",
     BATTERY_SYSTEM_TESLA: "Tesla Powerwall — Fleet API or Teslemetry",
     BATTERY_SYSTEM_SIGENERGY: "Sigenergy — Cloud API + optional Modbus",
     BATTERY_SYSTEM_SUNGROW: "Sungrow SH-series — Modbus TCP",

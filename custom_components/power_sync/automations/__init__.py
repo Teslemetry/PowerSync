@@ -655,6 +655,7 @@ class AutomationEngine:
                 data.get("neovolt_coordinator"),
                 data.get("solaredge_coordinator"),
                 data.get("anker_solix_coordinator"),
+                data.get("amber_smartshift_coordinator"),
                 data.get("custom_energy_coordinator"),
             )
             coordinator = next(

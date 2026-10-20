@@ -2057,9 +2057,15 @@ async def async_setup_entry(
         )
         _LOGGER.info("CovaU plan and quota sensors added")
 
+    if native_amber := domain_data.get("amber_smartshift_coordinator"):
+        from .amber_smartshift.entities import sensors as amber_sensors
+        entities.extend(amber_sensors(native_amber, entry))
+
     # Add energy sensors - select the correct coordinator for battery system type
     # All coordinators return data with same field names (solar_power, grid_power, etc.)
-    if is_foxess:
+    if native_amber:
+        energy_coordinator = native_amber
+    elif is_foxess:
         energy_coordinator = foxess_coordinator
     elif is_goodwe:
         energy_coordinator = goodwe_coordinator
@@ -2592,7 +2598,8 @@ async def async_setup_entry(
     _LOGGER.info("Battery health sensor added")
 
     # Always add battery mode sensor (for automation triggers)
-    entities.append(BatteryModeSensor(hass=hass, entry=entry))
+    if not native_amber:
+        entities.append(BatteryModeSensor(hass=hass, entry=entry))
     _LOGGER.info("Battery mode sensor added")
 
     # Powerwall local TEDAPI sensors — gated on completed pairing.

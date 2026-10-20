@@ -72,6 +72,7 @@ from .flow_power import (
 )
 from .optimization.ai_summary import AISummaryError, apply_ai_summary_settings, configured_openai_model
 from .optimization.chatgpt_auth import get_chatgpt_auth
+from .amber_smartshift.flow import AmberSetupMixin, AmberOptionsMixin
 from .const import (
     DOMAIN,
     CONF_DISPLAY_CURRENCY,
@@ -760,6 +761,7 @@ SUNGROW_LEGACY_DUAL_KEYS = (
 # _active_battery_system in __init__.py). Only connection-identifying keys are
 # listed — brand-agnostic settings (backup reserve, tariff, EV) are left alone.
 BATTERY_SYSTEM_CONNECTION_KEYS: dict[str, tuple[str, ...]] = {
+    "amber_smartshift": ("amber_smartshift_email", "amber_smartshift_password", "amber_smartshift_site_id", "amber_smartshift_config_id", "amber_smartshift_managed", "amber_smartshift_allow_enable"),
     BATTERY_SYSTEM_TESLA: (CONF_TESLA_ENERGY_SITE_ID,),
     BATTERY_SYSTEM_SIGENERGY: (
         CONF_SIGENERGY_STATION_ID,
@@ -2028,8 +2030,16 @@ def resolve_goodwe_port(protocol: str, port: int | None) -> int:
     return port if port is not None else DEFAULT_GOODWE_PORT_UDP
 
 
-class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+
+
+class PowerSyncConfigFlow(AmberSetupMixin, config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for PowerSync."""
+
+    async def async_step_amber_smartshift(self, user_input=None):
+        return await AmberSetupMixin.async_step_amber_smartshift(self, user_input)
+
+    async def async_step_amber_smartshift_reauth(self, user_input=None):
+        return await AmberSetupMixin.async_step_amber_smartshift_reauth(self, user_input)
 
     VERSION = 10
 
@@ -2115,6 +2125,9 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Show the reauth flow for the configured Tesla provider."""
         if self._reauth_entry is None:
             return self.async_abort(reason="reauth_failed")
+
+        if self._reauth_entry.options.get(CONF_BATTERY_SYSTEM, self._reauth_entry.data.get(CONF_BATTERY_SYSTEM)) == "amber_smartshift":
+            return await self.async_step_amber_smartshift_reauth()
 
         provider = self._reauth_entry.data.get(
             CONF_TESLA_API_PROVIDER, TESLA_PROVIDER_TESLEMETRY
@@ -2814,6 +2827,8 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def _route_to_battery_setup(self) -> FlowResult:
         """Route to battery system setup based on selection."""
+        if self._selected_battery_system == "amber_smartshift":
+            return await self.async_step_amber_smartshift()
         if self._selected_battery_system == BATTERY_SYSTEM_SIGENERGY:
             return await self.async_step_sigenergy_credentials()
         elif self._selected_battery_system == BATTERY_SYSTEM_SUNGROW:
@@ -3076,6 +3091,7 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             **getattr(self, "_solaredge_data", {}),
             **getattr(self, "_anker_solix_data", {}),
             **getattr(self, "_custom_battery_data", {}),
+            **getattr(self, "_amber_smartshift_data", {}),
             **getattr(self, "_battery_profile_data", {}),
             CONF_ELECTRICITY_PROVIDER: self._selected_electricity_provider,
         }
@@ -3116,6 +3132,7 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         # Set appropriate title based on battery system and provider
         battery_label = {
+            "amber_smartshift": "Amber Smart Shift",
             BATTERY_SYSTEM_SIGENERGY: "Sigenergy",
             BATTERY_SYSTEM_SUNGROW: "Sungrow",
             BATTERY_SYSTEM_FOXESS: "FoxESS",
@@ -8031,8 +8048,11 @@ class PowerSyncConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return PowerSyncOptionsFlow()
 
 
-class PowerSyncOptionsFlow(config_entries.OptionsFlow):
+class PowerSyncOptionsFlow(AmberOptionsMixin, config_entries.OptionsFlow):
     """Handle options flow for PowerSync."""
+
+    async def async_step_amber_smartshift(self, user_input=None):
+        return await AmberOptionsMixin.async_step_amber_smartshift(self, user_input)
 
     async def _restore_owned_curtailment_limits(self) -> None:
         """Restore curtailment limits PowerSync has marked active."""
@@ -8566,6 +8586,9 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
         if current_provider == "globird":
             menu_options.append("provider_portal")
 
+        if battery_system == "amber_smartshift":
+            menu_options.append("amber_smartshift")
+
         # Battery connection settings
         if battery_system == BATTERY_SYSTEM_TESLA:
             menu_options.append("tesla_connection")
@@ -8973,6 +8996,8 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
 
     async def _route_to_battery_options(self, battery_system: str) -> FlowResult:
         """Route to the selected battery/control method options page."""
+        if battery_system == "amber_smartshift":
+            return await self.async_step_amber_smartshift()
         if battery_system == BATTERY_SYSTEM_TESLA:
             return await self.async_step_tesla_connection()
         if battery_system == BATTERY_SYSTEM_SIGENERGY:
@@ -9013,6 +9038,12 @@ class PowerSyncOptionsFlow(config_entries.OptionsFlow):
             )
             if battery_system == self._effective_battery_system():
                 return await self.async_step_init()
+            native_amber = self.hass.data.get(DOMAIN, {}).get(self.config_entry.entry_id, {}).get("amber_smartshift_coordinator")
+            if native_amber:
+                await native_amber.restore_normal()
+            if battery_system == "amber_smartshift":
+                # Validate credentials and site before replacing the live backend.
+                return await self.async_step_amber_smartshift()
             self._save_battery_system_selection(battery_system)
             return await self._route_to_battery_options(battery_system)
 

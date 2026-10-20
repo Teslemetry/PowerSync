@@ -14,6 +14,34 @@ STRATEGY_PATH = (
     / "frontend"
     / "power-sync-strategy.js"
 )
+
+
+def test_native_amber_dashboard_uses_entry_scoped_mode_controls_without_watt_targets():
+    source = STRATEGY_PATH.read_text()
+    function = source[source.index("function _amberBatteryControls("):]
+    script = function + r'''
+      const status = {attributes: {entry_id: 'amber-entry'}};
+      const card = _amberBatteryControls(
+        name => `sensor.power_sync_${name}`,
+        (domain, name) => `${domain}.power_sync_${name}`,
+        {states: {'sensor.power_sync_amber_override': status}}
+      );
+      const actions = card.cards[2].cards;
+      if (actions.length !== 5) throw new Error('Missing native Amber controls');
+      const services = new Set(actions.map(button => button.tap_action.service));
+      for (const service of ['force_charge', 'force_discharge', 'preserve_battery', 'set_self_consumption', 'restore_normal']) {
+        if (!services.has(`power_sync.${service}`)) throw new Error(`Missing ${service}`);
+      }
+      for (const button of actions) {
+        const data = button.tap_action.service_data;
+        if (data.entry_id !== 'amber-entry' || data.source !== 'manual') throw new Error('Wrong control owner/entry');
+        if ('power_w' in data) throw new Error('Unsupported watt target');
+        if (data.duration !== 30) throw new Error('Unexpected manual duration');
+      }
+      const unbound = _amberBatteryControls(name => name, () => null, {states: {}});
+      if (unbound.cards[2].cards.some(button => button.tap_action.action !== 'none')) throw new Error('Unbound control was enabled');
+    '''
+    subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True)
 INIT_PATH = (
     Path(__file__).resolve().parent.parent
     / "custom_components"
@@ -811,7 +839,7 @@ def test_dashboard_strategy_resource_uses_incremented_cache_buster():
 
     version = re.search(r'DASHBOARD_JS_VERSION = "(\d+)"', const_source)
     assert version is not None
-    assert version.group(1) == "53"
+    assert version.group(1) == "54"
     assert "url = f\"{base_path}?v={POWER_SYNC_VERSION}.{DASHBOARD_JS_VERSION}\"" in source
 
 

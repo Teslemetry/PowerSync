@@ -489,3 +489,21 @@ reconcile_solaredge_control:
       default: false
       selector:
         boolean:
+
+preserve_battery:
+  name: Preserve Battery
+  description: Hold the current battery charge with a timed native Amber Smart Shift override. Does not change the hardware reserve.
+  fields:
+    entry_id:
+      name: PowerSync entry ID
+      required: true
+      selector:
+        text:
+    duration:
+      name: Duration
+      default: 30
+      selector:
+        number:
+          min: 1
+          max: 240
+          unit_of_measurement: min

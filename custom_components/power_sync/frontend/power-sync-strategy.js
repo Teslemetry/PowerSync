@@ -7630,7 +7630,9 @@ class PowerSyncStrategy {
     }
 
     // --- Left Column: Battery Controls (requires button-card) ---
-    if (hasButton && (hasE('battery_level') || hasE('battery_power'))) {
+    if (hass.states[e('amber_override')]) {
+      left.push(_amberBatteryControls(e, findEntity, hass));
+    } else if (hasButton && (hasE('battery_level') || hasE('battery_power'))) {
       left.push(_batteryControls(hass));
     }
 
@@ -9959,4 +9961,32 @@ function _networkExportEnvelope(entity) {
 
 if (!customElements.get('ll-strategy-dashboard-power-sync-strategy')) {
   customElements.define('ll-strategy-dashboard-power-sync-strategy', PowerSyncStrategy);
+}
+
+// Native Amber controls use built-in HA cards and never send a watt target.
+function _amberBatteryControls(e, findEntity, hass) {
+  const status = hass.states[e('amber_override')];
+  const entryId = status?.attributes?.entry_id;
+  const buttons = [
+    ['Charge (30 min)', 'force_charge', 'mdi:battery-arrow-down'],
+    ['Export (30 min)', 'force_discharge', 'mdi:battery-arrow-up'],
+    ['Preserve (30 min)', 'preserve_battery', 'mdi:battery-lock'],
+    ['Self-consumption (30 min)', 'set_self_consumption', 'mdi:home-battery'],
+    ['Cancel PowerSync override', 'restore_normal', 'mdi:stop-circle'],
+  ].map(([name, service, icon]) => ({
+    type: 'button', name, icon, show_state: false,
+    tap_action: entryId ? {
+      action: 'call-service', service: `power_sync.${service}`,
+      service_data: { entry_id: entryId, source: 'manual', duration: 30 },
+      confirmation: { text: `${name}?` },
+    } : { action: 'none' },
+  }));
+  const entities = [e('amber_override'), e('amber_control_owner'), e('amber_command_status'), e('amber_power_state')];
+  const smartShift = findEntity('switch', 'amber_smartshift');
+  if (smartShift) entities.push(smartShift);
+  return { type: 'vertical-stack', cards: [
+    { type: 'markdown', content: '## Amber battery\nTimed mode control through Amber. Plan power is estimated; Amber selects the battery power. Smart Shift resumes when an override expires.' },
+    { type: 'entities', title: 'Amber-reported status', show_header_toggle: false, entities },
+    { type: 'grid', columns: 2, square: false, cards: buttons },
+  ] };
 }

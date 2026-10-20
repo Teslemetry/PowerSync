@@ -9,22 +9,28 @@
   },
   "source_state": {
     "components": {
-      "config_flow.py": "5b8ec7a29d126f35bf312e5703202ed4c03d465edcf270090064f36f283cc05b",
-      "const.py": "a13ff32f96132ad463d5da3f4077e4318a4e1cc2abde6cdab408e7635f9bb679",
-      "battery_backend/profiles.py": "d8d0631ab789653483f01a04ac1fab2f7245d2e8f164118be2297b36efab4ae5",
+      "config_flow.py": "61d2a4002eba9de130bec4c5f44b42fb80d8eb8111d9d4be4e3bfbeeb15a7b05",
+      "const.py": "8417f2b53d74f2b06a22624d66994ad6f3718c30d63baf8d1d2252bfebb9845f",
+      "battery_backend/profiles.py": "b192164b20cc0b39ce23580a4a90ade9279d281f1f9e692158aa9a3a31a396b3",
       "battery_backend/discovery.py": "3a8c88c00d6c57f6101d55056968524d7971d1ac3b8e16365923bca978f9489b",
       "settings_metadata.py": "7d942632666c27c60793ce26cc5bb0a783721a5347863aca4c5e4e8a5a18b0e7",
-      "strings.json": "7d49cd1378c7be84ea7fca5b11ac629b86337d1b183b3416d878ea220dca2655",
-      "translations/en.json": "cfa73381ded521ef901d922c508c13bedbdb9e27a4bffe3e33ddb6c4b8afc4f3",
-      "services.yaml": "44c376885c0d4877b8112cfee9b08ccc8a07064d5ecea8c12a67978221360121",
-      "switch.py": "f52d03e794bdeaad0f0cf52053bcf6715edb644e371a2e6cd42e6c8abe9ece11",
+      "strings.json": "f9ca3e2419b9e704e6e3b7259d4342188086aaaaa92f3f16c83f4e7f442ca77b",
+      "translations/en.json": "6114c7fc89e2ffba9d81965f0d0832fe3234492990b4163c808d6aa9806fd16c",
+      "services.yaml": "f72c679d38ac3765a99d2794b875df2109e06abfd769d83bd75832b6e0c766f7",
+      "switch.py": "11aa8bac614b33f6d45d8402cd7a532e18aab2300549d5cfe3b0ece678d4fd41",
       "select.py": "78e64714e13add7ee5fc36c475597e42be4fb241b7268fac5aff93203e9eb0eb",
       "number.py": "bfd496974b5e2a458ef00fc9e336b8c00fd73bd4a326b526d33d9ca50d8f2548",
-      "sensor.py": "476c132ab585261a1076bfa94a5812d85cdf8a8c8493cc53684b2bc7efb22233",
-      "binary_sensor.py": "9c1c1517140c01e298e3aabb3bf095574ee1eb2b5525dcb2eaab4535f7021650",
+      "sensor.py": "da4c4763d48276d6e2baf62037627944405c7f9ecd2293ee071d8c066fab9bab",
+      "binary_sensor.py": "cad335bcce4d56edb1121bc08a6bbe34d55cad991ce31a34547d150ec4898704",
       "button.py": "8648b1b520e66e583875e0e226e3bf7ac46f1d2a8be4c162c03e2abaaa3b435d",
-      "automations/actions.py": "50b1fe7ef6ba1ad4dd7cd6c1a42cff38de1cdd4e9c16c17904136c5457c2ecf4",
-      "licensing/presentation.py": "434294026457b72fcd1764fd78b5fd69dff58d9246f5cdcb346427a95404367e"
+      "automations/actions.py": "c5062fa4d9d943873251ffd3aec8884b78dd4e48a6b10acd99329eadf498af47",
+      "licensing/presentation.py": "434294026457b72fcd1764fd78b5fd69dff58d9246f5cdcb346427a95404367e",
+      "amber_smartshift/__init__.py": "979f85cb66d8ca1e88394cb74ecc275645f2c7598aac3e65f43e4180293ee032",
+      "amber_smartshift/client.py": "c713ecb9e1f3ea26ddea2d0b058dc69e779192cdd3a747ee8cf30277358620ec",
+      "amber_smartshift/runtime.py": "c4f6b44d704591e23f525f31b9f84a16f102150f1cffd259e21be06e1492d5bf",
+      "amber_smartshift/controls.py": "ab2e59058773c51e9565313ddb0313e53a4a32d08995e248e29840c167bd9752",
+      "amber_smartshift/flow.py": "e88b4b6c79f6f5483adda57840bdad52f339de109048ee3087a6a357809aa71e",
+      "amber_smartshift/entities.py": "a2502634cf192a529d1d2e82fd38ec8983527e9841851bf8f4d77d77b9ad9406"
     },
     "step_methods": [
       "PowerSyncConfigFlow.async_step_aemo_config",
@@ -33,6 +39,8 @@
       "PowerSyncConfigFlow.async_step_alphaess_modbus",
       "PowerSyncConfigFlow.async_step_amber",
       "PowerSyncConfigFlow.async_step_amber_site_selection",
+      "PowerSyncConfigFlow.async_step_amber_smartshift",
+      "PowerSyncConfigFlow.async_step_amber_smartshift_reauth",
       "PowerSyncConfigFlow.async_step_anker_solix",
       "PowerSyncConfigFlow.async_step_battery_connection_profile_setup",
       "PowerSyncConfigFlow.async_step_battery_system",
@@ -88,6 +96,7 @@
       "PowerSyncOptionsFlow.async_step_agl_options",
       "PowerSyncOptionsFlow.async_step_alphaess_connection",
       "PowerSyncOptionsFlow.async_step_amber_options",
+      "PowerSyncOptionsFlow.async_step_amber_smartshift",
       "PowerSyncOptionsFlow.async_step_anker_solix",
       "PowerSyncOptionsFlow.async_step_auto_update",
       "PowerSyncOptionsFlow.async_step_back",
@@ -157,6 +166,7 @@
       "alphaess_cloud_monitoring",
       "alphaess_ha_monitoring",
       "alphaess_modbus_cloud",
+      "amber_smartshift_native",
       "anker_direct",
       "anker_ha_cloud",
       "anker_ha_official",
@@ -234,6 +244,20 @@
       "config.amber_settings.forecast_discrepancy_threshold": "Forecast confidence threshold",
       "config.amber_settings.spike_protection_enabled": "Enable spike protection",
       "config.amber_site_selection.amber_site_id": "Amber site",
+      "config.amber_smartshift.amber_smartshift_allow_enable": "Allow PowerSync to enable Smart Shift for overrides",
+      "config.amber_smartshift.amber_smartshift_email": "Amber email",
+      "config.amber_smartshift.amber_smartshift_managed": "Let PowerSync manage battery operation",
+      "config.amber_smartshift.amber_smartshift_password": "Amber password",
+      "config.amber_smartshift.custom_grid_power_entity": "Grid power (positive import)",
+      "config.amber_smartshift.custom_load_power_entity": "Home load power",
+      "config.amber_smartshift.custom_solar_power_entity": "Solar power",
+      "config.amber_smartshift_reauth.amber_smartshift_allow_enable": "Allow PowerSync to enable Smart Shift for overrides",
+      "config.amber_smartshift_reauth.amber_smartshift_email": "Amber email",
+      "config.amber_smartshift_reauth.amber_smartshift_managed": "Let PowerSync manage battery operation",
+      "config.amber_smartshift_reauth.amber_smartshift_password": "Amber password",
+      "config.amber_smartshift_reauth.custom_grid_power_entity": "Grid power (positive import)",
+      "config.amber_smartshift_reauth.custom_load_power_entity": "Home load power",
+      "config.amber_smartshift_reauth.custom_solar_power_entity": "Solar power",
       "config.anker_solix.anker_solix_battery_capacity_kwh": "Battery capacity",
       "config.anker_solix.anker_solix_config_entry_id": "Anker integration",
       "config.anker_solix.anker_solix_connection_type": "Connection type",
@@ -551,6 +575,13 @@
       "options.amber_options.inverter_slave_id": "Modbus slave ID",
       "options.amber_options.spike_protection_enabled": "Enable spike protection",
       "options.amber_options.update_amber_token": "Update Amber API token",
+      "options.amber_smartshift.amber_smartshift_allow_enable": "Allow PowerSync to enable Smart Shift for overrides",
+      "options.amber_smartshift.amber_smartshift_email": "Amber email",
+      "options.amber_smartshift.amber_smartshift_managed": "Let PowerSync manage battery operation",
+      "options.amber_smartshift.amber_smartshift_password": "Amber password",
+      "options.amber_smartshift.custom_grid_power_entity": "Grid power (positive import)",
+      "options.amber_smartshift.custom_load_power_entity": "Home load power",
+      "options.amber_smartshift.custom_solar_power_entity": "Solar power",
       "options.anker_solix.anker_solix_battery_capacity_kwh": "Battery capacity",
       "options.anker_solix.anker_solix_config_entry_id": "Anker integration",
       "options.anker_solix.anker_solix_connection_type": "Connection type",
@@ -1851,6 +1882,27 @@
       "owner": "PowerSyncOptionsFlow.async_step_tariff_period_options",
       "pages": [
         "Tariffs-and-Time-Periods"
+      ],
+      "disposition": "document_current_route"
+    },
+    {
+      "owner": "PowerSyncConfigFlow.async_step_amber_smartshift",
+      "pages": [
+        "Amber-Smart-Shift"
+      ],
+      "disposition": "document_current_route"
+    },
+    {
+      "owner": "PowerSyncConfigFlow.async_step_amber_smartshift_reauth",
+      "pages": [
+        "Amber-Smart-Shift"
+      ],
+      "disposition": "document_current_route"
+    },
+    {
+      "owner": "PowerSyncOptionsFlow.async_step_amber_smartshift",
+      "pages": [
+        "Amber-Smart-Shift"
       ],
       "disposition": "document_current_route"
     }
@@ -8325,6 +8377,216 @@
       "source_line": 15290,
       "group": null,
       "rendering": "curtailment options; optional policy and PV-only control selection"
+    },
+    {
+      "scope": "config",
+      "form": "amber_smartshift",
+      "field": "amber_smartshift_allow_enable",
+      "label": "Allow PowerSync to enable Smart Shift for overrides",
+      "page": "Amber-Smart-Shift.md",
+      "source_line": null,
+      "group": null,
+      "rendering": "Native connection form; see control ownership and automatic-meter requirements."
+    },
+    {
+      "scope": "config",
+      "form": "amber_smartshift",
+      "field": "amber_smartshift_email",
+      "label": "Amber email",
+      "page": "Amber-Smart-Shift.md",
+      "source_line": null,
+      "group": null,
+      "rendering": "Native connection form; see control ownership and automatic-meter requirements."
+    },
+    {
+      "scope": "config",
+      "form": "amber_smartshift",
+      "field": "amber_smartshift_managed",
+      "label": "Let PowerSync manage battery operation",
+      "page": "Amber-Smart-Shift.md",
+      "source_line": null,
+      "group": null,
+      "rendering": "Native connection form; see control ownership and automatic-meter requirements."
+    },
+    {
+      "scope": "config",
+      "form": "amber_smartshift",
+      "field": "amber_smartshift_password",
+      "label": "Amber password",
+      "page": "Amber-Smart-Shift.md",
+      "source_line": null,
+      "group": null,
+      "rendering": "Native connection form; see control ownership and automatic-meter requirements."
+    },
+    {
+      "scope": "config",
+      "form": "amber_smartshift",
+      "field": "custom_grid_power_entity",
+      "label": "Grid power (positive import)",
+      "page": "Amber-Smart-Shift.md",
+      "source_line": null,
+      "group": null,
+      "rendering": "Native connection form; see control ownership and automatic-meter requirements."
+    },
+    {
+      "scope": "config",
+      "form": "amber_smartshift",
+      "field": "custom_load_power_entity",
+      "label": "Home load power",
+      "page": "Amber-Smart-Shift.md",
+      "source_line": null,
+      "group": null,
+      "rendering": "Native connection form; see control ownership and automatic-meter requirements."
+    },
+    {
+      "scope": "config",
+      "form": "amber_smartshift",
+      "field": "custom_solar_power_entity",
+      "label": "Solar power",
+      "page": "Amber-Smart-Shift.md",
+      "source_line": null,
+      "group": null,
+      "rendering": "Native connection form; see control ownership and automatic-meter requirements."
+    },
+    {
+      "scope": "config",
+      "form": "amber_smartshift_reauth",
+      "field": "amber_smartshift_allow_enable",
+      "label": "Allow PowerSync to enable Smart Shift for overrides",
+      "page": "Amber-Smart-Shift.md",
+      "source_line": null,
+      "group": null,
+      "rendering": "Native connection form; see control ownership and automatic-meter requirements."
+    },
+    {
+      "scope": "config",
+      "form": "amber_smartshift_reauth",
+      "field": "amber_smartshift_email",
+      "label": "Amber email",
+      "page": "Amber-Smart-Shift.md",
+      "source_line": null,
+      "group": null,
+      "rendering": "Native connection form; see control ownership and automatic-meter requirements."
+    },
+    {
+      "scope": "config",
+      "form": "amber_smartshift_reauth",
+      "field": "amber_smartshift_managed",
+      "label": "Let PowerSync manage battery operation",
+      "page": "Amber-Smart-Shift.md",
+      "source_line": null,
+      "group": null,
+      "rendering": "Native connection form; see control ownership and automatic-meter requirements."
+    },
+    {
+      "scope": "config",
+      "form": "amber_smartshift_reauth",
+      "field": "amber_smartshift_password",
+      "label": "Amber password",
+      "page": "Amber-Smart-Shift.md",
+      "source_line": null,
+      "group": null,
+      "rendering": "Native connection form; see control ownership and automatic-meter requirements."
+    },
+    {
+      "scope": "config",
+      "form": "amber_smartshift_reauth",
+      "field": "custom_grid_power_entity",
+      "label": "Grid power (positive import)",
+      "page": "Amber-Smart-Shift.md",
+      "source_line": null,
+      "group": null,
+      "rendering": "Native connection form; see control ownership and automatic-meter requirements."
+    },
+    {
+      "scope": "config",
+      "form": "amber_smartshift_reauth",
+      "field": "custom_load_power_entity",
+      "label": "Home load power",
+      "page": "Amber-Smart-Shift.md",
+      "source_line": null,
+      "group": null,
+      "rendering": "Native connection form; see control ownership and automatic-meter requirements."
+    },
+    {
+      "scope": "config",
+      "form": "amber_smartshift_reauth",
+      "field": "custom_solar_power_entity",
+      "label": "Solar power",
+      "page": "Amber-Smart-Shift.md",
+      "source_line": null,
+      "group": null,
+      "rendering": "Native connection form; see control ownership and automatic-meter requirements."
+    },
+    {
+      "scope": "options",
+      "form": "amber_smartshift",
+      "field": "amber_smartshift_allow_enable",
+      "label": "Allow PowerSync to enable Smart Shift for overrides",
+      "page": "Amber-Smart-Shift.md",
+      "source_line": null,
+      "group": null,
+      "rendering": "Native connection form; see control ownership and automatic-meter requirements."
+    },
+    {
+      "scope": "options",
+      "form": "amber_smartshift",
+      "field": "amber_smartshift_email",
+      "label": "Amber email",
+      "page": "Amber-Smart-Shift.md",
+      "source_line": null,
+      "group": null,
+      "rendering": "Native connection form; see control ownership and automatic-meter requirements."
+    },
+    {
+      "scope": "options",
+      "form": "amber_smartshift",
+      "field": "amber_smartshift_managed",
+      "label": "Let PowerSync manage battery operation",
+      "page": "Amber-Smart-Shift.md",
+      "source_line": null,
+      "group": null,
+      "rendering": "Native connection form; see control ownership and automatic-meter requirements."
+    },
+    {
+      "scope": "options",
+      "form": "amber_smartshift",
+      "field": "amber_smartshift_password",
+      "label": "Amber password",
+      "page": "Amber-Smart-Shift.md",
+      "source_line": null,
+      "group": null,
+      "rendering": "Native connection form; see control ownership and automatic-meter requirements."
+    },
+    {
+      "scope": "options",
+      "form": "amber_smartshift",
+      "field": "custom_grid_power_entity",
+      "label": "Grid power (positive import)",
+      "page": "Amber-Smart-Shift.md",
+      "source_line": null,
+      "group": null,
+      "rendering": "Native connection form; see control ownership and automatic-meter requirements."
+    },
+    {
+      "scope": "options",
+      "form": "amber_smartshift",
+      "field": "custom_load_power_entity",
+      "label": "Home load power",
+      "page": "Amber-Smart-Shift.md",
+      "source_line": null,
+      "group": null,
+      "rendering": "Native connection form; see control ownership and automatic-meter requirements."
+    },
+    {
+      "scope": "options",
+      "form": "amber_smartshift",
+      "field": "custom_solar_power_entity",
+      "label": "Solar power",
+      "page": "Amber-Smart-Shift.md",
+      "source_line": null,
+      "group": null,
+      "rendering": "Native connection form; see control ownership and automatic-meter requirements."
     }
   ],
   "profiles": [
@@ -8495,6 +8757,12 @@
       "label": "Selected Home Assistant entities — monitoring only",
       "page": "Battery-Custom-Controller",
       "monitoring_only": true
+    },
+    {
+      "id": "amber_smartshift_native",
+      "label": "PowerSync native Amber Smart Shift",
+      "page": "Amber-Smart-Shift",
+      "monitoring_only": false
     }
   ],
   "providers": [
@@ -8709,6 +8977,11 @@
       "menu": "advanced",
       "entry": "history_relink",
       "label": "Sungrow history relink"
+    },
+    {
+      "menu": "init",
+      "entry": "amber_smartshift",
+      "label": "Amber Smart Shift connection and control owner"
     }
   ],
   "compatibility_anchors": {
@@ -12276,6 +12549,90 @@
     },
     "options.curtailment_options.solar_production_grid_connected_entity": {
       "page": "Negative-Import-Solar",
+      "status": "documented"
+    },
+    "config.amber_smartshift.amber_smartshift_allow_enable": {
+      "page": "Amber-Smart-Shift",
+      "status": "documented"
+    },
+    "config.amber_smartshift.amber_smartshift_email": {
+      "page": "Amber-Smart-Shift",
+      "status": "documented"
+    },
+    "config.amber_smartshift.amber_smartshift_managed": {
+      "page": "Amber-Smart-Shift",
+      "status": "documented"
+    },
+    "config.amber_smartshift.amber_smartshift_password": {
+      "page": "Amber-Smart-Shift",
+      "status": "documented"
+    },
+    "config.amber_smartshift.custom_grid_power_entity": {
+      "page": "Amber-Smart-Shift",
+      "status": "documented"
+    },
+    "config.amber_smartshift.custom_load_power_entity": {
+      "page": "Amber-Smart-Shift",
+      "status": "documented"
+    },
+    "config.amber_smartshift.custom_solar_power_entity": {
+      "page": "Amber-Smart-Shift",
+      "status": "documented"
+    },
+    "config.amber_smartshift_reauth.amber_smartshift_allow_enable": {
+      "page": "Amber-Smart-Shift",
+      "status": "documented"
+    },
+    "config.amber_smartshift_reauth.amber_smartshift_email": {
+      "page": "Amber-Smart-Shift",
+      "status": "documented"
+    },
+    "config.amber_smartshift_reauth.amber_smartshift_managed": {
+      "page": "Amber-Smart-Shift",
+      "status": "documented"
+    },
+    "config.amber_smartshift_reauth.amber_smartshift_password": {
+      "page": "Amber-Smart-Shift",
+      "status": "documented"
+    },
+    "config.amber_smartshift_reauth.custom_grid_power_entity": {
+      "page": "Amber-Smart-Shift",
+      "status": "documented"
+    },
+    "config.amber_smartshift_reauth.custom_load_power_entity": {
+      "page": "Amber-Smart-Shift",
+      "status": "documented"
+    },
+    "config.amber_smartshift_reauth.custom_solar_power_entity": {
+      "page": "Amber-Smart-Shift",
+      "status": "documented"
+    },
+    "options.amber_smartshift.amber_smartshift_allow_enable": {
+      "page": "Amber-Smart-Shift",
+      "status": "documented"
+    },
+    "options.amber_smartshift.amber_smartshift_email": {
+      "page": "Amber-Smart-Shift",
+      "status": "documented"
+    },
+    "options.amber_smartshift.amber_smartshift_managed": {
+      "page": "Amber-Smart-Shift",
+      "status": "documented"
+    },
+    "options.amber_smartshift.amber_smartshift_password": {
+      "page": "Amber-Smart-Shift",
+      "status": "documented"
+    },
+    "options.amber_smartshift.custom_grid_power_entity": {
+      "page": "Amber-Smart-Shift",
+      "status": "documented"
+    },
+    "options.amber_smartshift.custom_load_power_entity": {
+      "page": "Amber-Smart-Shift",
+      "status": "documented"
+    },
+    "options.amber_smartshift.custom_solar_power_entity": {
+      "page": "Amber-Smart-Shift",
       "status": "documented"
     }
   }

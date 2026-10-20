@@ -24,6 +24,9 @@ COMPONENTS = (
     'translations/en.json', 'services.yaml', 'switch.py', 'select.py',
     'number.py', 'sensor.py', 'binary_sensor.py', 'button.py', 'automations/actions.py',
     'licensing/presentation.py',
+    'amber_smartshift/__init__.py', 'amber_smartshift/client.py',
+    'amber_smartshift/runtime.py', 'amber_smartshift/controls.py',
+    'amber_smartshift/flow.py', 'amber_smartshift/entities.py',
 )
 
 def digest(data: str) -> str:
