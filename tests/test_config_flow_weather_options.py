@@ -2121,6 +2121,7 @@ def test_battery_system_selection_only_opens_connection_when_method_changes():
         "FlowResult": object,
         "CONF_BATTERY_SYSTEM": "battery_system",
         "BATTERY_SYSTEM_TESLA": "tesla",
+        "DOMAIN": "power_sync",
     }
     exec(compile(module, str(CONFIG_FLOW_PATH), "exec"), namespace)
 
@@ -2129,6 +2130,8 @@ def test_battery_system_selection_only_opens_connection_when_method_changes():
 
         def __init__(self):
             self.calls = []
+            self.hass = SimpleNamespace(data={})
+            self.config_entry = SimpleNamespace(entry_id="entry-a")
 
         def _effective_battery_system(self):
             return "tesla"

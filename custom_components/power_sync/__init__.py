@@ -23224,6 +23224,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     else:
         # Get initial Tesla API token and provider
         # Use get_tesla_api_token() which fetches fresh from tesla_fleet if available
+        if not entry.data.get(CONF_TESLA_ENERGY_SITE_ID):
+            raise ConfigEntryNotReady(
+                "No Tesla energy site configured. Open PowerSync settings, select "
+                "Tesla API connection and choose your energy site."
+            )
         tesla_api_token, tesla_api_provider = get_tesla_api_token(hass, entry)
 
         if not tesla_api_token:

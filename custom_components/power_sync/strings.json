@@ -1289,6 +1289,9 @@
   },
   "options": {
     "error": {
+      "invalid_tesla_site": "Select a Tesla energy site from the list.",
+      "no_energy_sites": "No Tesla energy sites found for this account.",
+      "invalid_auth": "The Tesla API connection could not be authenticated. Check your selected provider and sign in again.",
       "optimizer_access_unavailable": "Unable to complete activation. Check your account, pairing code, subscription and any pending restoration, then retry.",
       "tesla_force_discharge_prices_invalid": "Enter finite Tesla force-discharge prices from $0 to $99/kWh, with the sell price higher than the buy price.",
       "invalid_flow_power_plan": "Choose a Flow Power plan and a region supported by that plan.",
@@ -1603,6 +1606,13 @@
           "covau_refresh_public_plan": "Refresh this public plan snapshot"
         },
         "submit": "Save"
+      },
+      "tesla_site": {
+        "title": "Tesla energy site",
+        "description": "Choose the Tesla energy site to use after changing your battery control method. PowerSync will reload after saving.",
+        "data": {
+          "tesla_energy_site_id": "Tesla energy site"
+        }
       },
       "tesla_connection": {
         "title": "Tesla API connection",

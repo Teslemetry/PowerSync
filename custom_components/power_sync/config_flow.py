@@ -10444,6 +10444,8 @@ class PowerSyncOptionsFlow(AmberOptionsMixin, config_entries.OptionsFlow):
                     return await self.async_step_teslemetry_token()
 
                 # Fleet API -- save directly
+                if not self.config_entry.data.get(CONF_TESLA_ENERGY_SITE_ID):
+                    return await self.async_step_tesla_site()
                 self._schedule_entry_reload()
                 return self.async_create_entry(
                     title="", data=dict(self.config_entry.options)
@@ -14547,6 +14549,11 @@ class PowerSyncOptionsFlow(AmberOptionsMixin, config_entries.OptionsFlow):
         Tesla sign-in dialog. Fall back to the persisted provider on the
         config entry so every path into this function is valid.
         """
+        if (
+            self._effective_battery_system() == BATTERY_SYSTEM_TESLA
+            and not self.config_entry.data.get(CONF_TESLA_ENERGY_SITE_ID)
+        ):
+            return await self.async_step_tesla_site()
         provider = getattr(self, "_provider", None) or self._get_option(
             CONF_ELECTRICITY_PROVIDER, "amber"
         )
@@ -14566,6 +14573,61 @@ class PowerSyncOptionsFlow(AmberOptionsMixin, config_entries.OptionsFlow):
         if provider == "nz":
             return await self.async_step_nz_options()
         return await self.async_step_amber_options()
+
+    async def async_step_tesla_site(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Recover the Tesla site removed when another battery backend was selected."""
+        from . import get_tesla_api_token
+
+        errors: dict[str, str] = {}
+        token, provider = get_tesla_api_token(self.hass, self.config_entry)
+        sites = getattr(self, "_connection_tesla_sites", None)
+        if getattr(self, "_connection_tesla_identity", None) != (provider, token):
+            sites = None
+        if sites is None:
+            validators = {
+                TESLA_PROVIDER_POWERSYNC: validate_powersync_token,
+                TESLA_PROVIDER_TESLEMETRY: validate_teslemetry_token,
+                TESLA_PROVIDER_FLEET_API: validate_fleet_api_token,
+            }
+            result = (
+                await validators[provider](self.hass, token)
+                if token and provider in validators
+                else {"success": False, "error": "invalid_auth"}
+            )
+            sites = {
+                str(site["energy_site_id"]): site.get("site_name") or str(site["energy_site_id"])
+                for site in result.get("sites", [])
+                if site.get("energy_site_id")
+            } if result["success"] else {}
+            if sites:
+                self._connection_tesla_sites = sites
+                self._connection_tesla_identity = (provider, token)
+                self._connection_tesla_base_url = result.get("base_url")
+            else:
+                errors["base"] = result.get("error", "no_energy_sites")
+
+        if user_input is not None and sites:
+            site_id = str(user_input.get(CONF_TESLA_ENERGY_SITE_ID, ""))
+            if site_id in sites:
+                updates = {CONF_TESLA_ENERGY_SITE_ID: site_id}
+                if base_url := getattr(self, "_connection_tesla_base_url", None):
+                    updates[CONF_FLEET_API_BASE_URL] = base_url
+                return self._save_connection_and_reload(updates)
+            errors[CONF_TESLA_ENERGY_SITE_ID] = "invalid_tesla_site"
+
+        return self.async_show_form(
+            step_id="tesla_site",
+            data_schema=vol.Schema({
+                vol.Required(CONF_TESLA_ENERGY_SITE_ID): SelectSelector(SelectSelectorConfig(
+                    options=[SelectOptionDict(value=site_id, label=f"{name} ({site_id})")
+                             for site_id, name in sites.items()],
+                    mode=SelectSelectorMode.DROPDOWN,
+                )),
+            } if sites else {}),
+            errors=errors,
+        )
 
     async def async_step_powersync_token(
         self, user_input: dict[str, Any] | None = None

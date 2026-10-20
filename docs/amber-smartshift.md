@@ -48,6 +48,7 @@ SOC reserve and charge limits are checked in software, including during active o
 
 ## Troubleshooting
 
+- **Switching back to Tesla:** choose **Configure → Change battery / control method → Tesla**, complete the Tesla API connection, then select your **Tesla energy site** when prompted. Switching away removes the previous Tesla site selection. If Tesla is already selected but setup reports a missing energy site, open **Configure → Tesla API connection** to select it again. Smart Shift mode control does not provide Powerwall solar curtailment or Tesla's Grid Export setting.
 - **Sign-in failed:** check the Amber credentials and complete any sign-in challenge in Amber. Unsupported challenges are rejected; PowerSync does not bypass them. Reconnect through HA's reauthentication prompt.
 - **Site/configuration mismatch:** select the matching pricing site and reconnect. PowerSync does not guess which battery to control.
 - **Command blocked:** check control-owner permission, Monitoring Mode, meter freshness, prices, SOC limits and Smart Shift status. A plan can remain visible while execution is blocked.
