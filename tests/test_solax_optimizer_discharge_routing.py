@@ -186,6 +186,58 @@ def test_sigenergy_pv_only_export_requests_hardware_refresh_for_battery_target()
     assert method(coordinator, 2478.8) is True
 
 
+def test_sigenergy_small_export_refresh_respects_the_requested_battery_power():
+    """Ticket #410: a working 100 W export must not need 500 W to stay active."""
+    method = _load_coordinator_method("_force_discharge_hardware_needs_refresh")
+    for battery_w, expected_refresh in (
+        (-1540.0, True),
+        (0.0, True),
+        (10.0, True),
+        (99.0, True),
+        (100.1, False),
+        (190.0, False),
+        (499.0, False),
+        (500.0, False),
+    ):
+        coordinator = SimpleNamespace(
+            battery_system="sigenergy",
+            _get_energy_data=lambda: {
+                "battery_power": battery_w / 1000,
+                "grid_power": -3.33,
+                "ems_work_mode": 5,
+            },
+        )
+        assert method(coordinator, 100.1) is expected_refresh, battery_w
+
+
+def test_sigenergy_larger_export_still_refreshes_on_low_battery_output():
+    """Solar export alone must not hide a missing battery contribution."""
+    method = _load_coordinator_method("_force_discharge_hardware_needs_refresh")
+    for target_w, battery_w, expected_refresh in (
+        (2500.0, 499.0, True),
+        (2500.0, 500.0, False),
+        (15000.0, 2999.0, True),
+        (15000.0, 3000.0, False),
+    ):
+        coordinator = SimpleNamespace(
+            battery_system="sigenergy",
+            _get_energy_data=lambda: {
+                "battery_power": battery_w / 1000,
+                "grid_power": -5.0,
+            },
+        )
+        assert method(coordinator, target_w) is expected_refresh, (target_w, battery_w)
+
+
+def test_small_export_refresh_keeps_other_inverter_thresholds():
+    method = _load_coordinator_method("_force_discharge_hardware_needs_refresh")
+    coordinator = SimpleNamespace(
+        battery_system="sungrow",
+        _get_energy_data=lambda: {"battery_power": 0.19, "grid_power": 0.0},
+    )
+    assert method(coordinator, 100.1) is True
+
+
 def test_solax_total_tracks_a_network_clamped_export_target():
     method = _load_guard_method()
     battery = _Battery()

@@ -44,6 +44,14 @@ If you use Sigenergy's own AI/native optimisation instead of Smart Optimization,
 
 ### Battery behaves differently from the LP plan
 
+The optimizer's export power is the planned battery contribution. Sigenergy uses
+a separate whole-site export ceiling, so total grid export can be higher when
+solar is available, and actual battery power can change with solar and house
+loads. With solar present, PowerSync preserves PV-first operation rather than
+forcing the battery to match every planned watt. From v2.12.1447, a small battery
+export that meets its requested power no longer triggers a command refresh just
+because it is below 500 W. Low battery output can still trigger a refresh.
+
 - Confirm Sigenergy AI/native optimisation is disabled.
 - Confirm Remote EMS is enabled.
 - Check logs for PowerSync force charge/discharge or optimizer actions.

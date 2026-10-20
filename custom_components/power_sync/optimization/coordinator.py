@@ -10366,16 +10366,23 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             else max(discharge_power_w, export_power_w)
         )
         minimum_expected_w = max(500.0, target_w * 0.2)
+        if self.battery_system == "sigenergy":
+            # Small Cost Neutral exports can request only 100.1 W.  Do not
+            # call a command inactive when the battery already meets that
+            # target just because it is below the normal 500 W noise floor.
+            minimum_expected_w = min(target_w, minimum_expected_w)
 
         if observed_power_w >= minimum_expected_w:
             return False
 
         _LOGGER.info(
             "Optimizer: force discharge hardware appears inactive "
-            "(mode=%s, discharging %.0fW/exporting %.0fW below %.0fW target) — refreshing command",
+            "(mode=%s, discharging %.0fW/exporting %.0fW; "
+            "refresh threshold %.0fW, target %.0fW) — refreshing command",
             mode_value,
             discharge_power_w,
             export_power_w,
+            minimum_expected_w,
             target_w,
         )
         return True
