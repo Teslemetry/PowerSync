@@ -201,3 +201,140 @@ def test_restore_retry_waits_out_its_site_cooldown(limited_site, expected_delay)
     exec(compile(ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])), "<restore-retry>", "exec"), namespace)
     assert namespace["_schedule_tesla_restore_retry"]("tariff deferred") is True
     assert scheduled == [now + timedelta(seconds=expected_delay)]
+
+
+@pytest.mark.parametrize("payload_name", ["normal", "force-charge", "force-discharge", "restore"])
+def test_superseded_tariff_is_not_retried_after_cooldown(upload_harness, payload_name):
+    """A newer command during Retry-After revokes the old payload's authority."""
+    upload, hass, session, clock = upload_harness
+
+    async def run():
+        generation = [7]
+        clock.sleeping, clock.resume = asyncio.Event(), asyncio.Event()
+        accepted = {}
+        old = asyncio.create_task(upload(
+            hass, "site-a", {"name": payload_name}, "token",
+            accepted_status=accepted, is_current=lambda: generation[0] == 7,
+        ))
+        await clock.sleeping.wait()
+        generation[0] = 8
+        clock.resume.set()
+        assert await old is False
+        assert len(session.posts) == 1
+        assert accepted == {}
+        # The latest caller can submit a freshly evaluated payload once the
+        # provider cooldown expires. The obsolete payload is never replayed.
+        assert await upload(hass, "site-a", {"name": "latest"}, "token") is True
+        assert [post[2]["tou_settings"]["tariff_content_v2"]["name"]
+                for post in session.posts] == [payload_name, "latest"]
+
+    asyncio.run(run())
+
+
+def test_superseded_tariff_is_blocked_before_first_post(upload_harness):
+    upload, hass, session, _clock = upload_harness
+    assert asyncio.run(upload(
+        hass, "site-a", {}, "token", is_current=lambda: False,
+    )) is False
+    assert session.posts == []
+
+
+def test_current_tariff_still_retries_and_confirms(upload_harness):
+    upload, hass, session, _clock = upload_harness
+    assert asyncio.run(upload(
+        hass, "site-a", {}, "token", is_current=lambda: True,
+    )) is True
+    assert [post[0] for post in session.posts] == [0.0, 282.0]
+
+
+@pytest.mark.parametrize("mode", ["charge", "discharge"])
+@pytest.mark.parametrize("transition", ["current", "superseded", "expired"])
+def test_force_upload_completion_preserves_newer_command_and_expiry(mode, transition):
+    """Run each real force upload loop across a delayed provider response."""
+    import copy
+
+    tree = ast.parse((ROOT / "custom_components/power_sync/__init__.py").read_text())
+    handler = next(node for node in ast.walk(tree)
+                   if isinstance(node, ast.AsyncFunctionDef)
+                   and node.name == f"handle_force_{mode}")
+    upload_loop = next(node for node in ast.walk(handler)
+                      if isinstance(node, ast.For)
+                      and any(isinstance(child, ast.Name)
+                              and child.id == "upload_status"
+                              for child in ast.walk(node)))
+    now = datetime(2026, 10, 20, 7, 25, tzinfo=timezone.utc)
+    clock = SimpleNamespace(now=now)
+    generation = [7]
+    cleanup = []
+    predicates = []
+
+    async def upload(*args, accepted_status, is_current, **kwargs):
+        assert is_current()
+        predicates.append(is_current)
+        if transition == "superseded":
+            generation[0] += 1
+        elif transition == "expired":
+            clock.now += timedelta(minutes=5)
+        accepted_status["accepted"] = True
+        return True
+
+    async def cleanup_failed(reason):
+        cleanup.append(reason)
+
+    ns = {
+        "hass": None,
+        "site_configs": [("site-a", "token", "teslemetry")],
+        "entry": SimpleNamespace(data={}),
+        "CONF_FLEET_API_BASE_URL": "fleet_base_url",
+        "send_tariff_to_tesla": upload,
+        "_command_generation": generation,
+        "_restore_gen": 7,
+        "actual_expiry": now + timedelta(minutes=1),
+        "dt_util": SimpleNamespace(utcnow=lambda: clock.now),
+        "accepted_sites": [], "unconfirmed_sites": [], "all_success": True,
+        f"{mode}_tariff": {"name": mode},
+        f"_cleanup_failed_tesla_force_{mode}": cleanup_failed,
+        "_LOGGER": logging.getLogger(__name__),
+    }
+    wrapper = ast.AsyncFunctionDef(
+        name="run", args=ast.arguments(posonlyargs=[], args=[], kwonlyargs=[],
+                                      kw_defaults=[], defaults=[]),
+        body=[copy.deepcopy(upload_loop), ast.Return(value=ast.Constant("activate"))],
+        decorator_list=[],
+    )
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[wrapper], type_ignores=[])),
+                 "<force-upload-loop>", "exec"), ns)
+    result = asyncio.run(ns["run"]())
+    if transition == "current":
+        assert result == "activate"
+        assert ns["accepted_sites"] == ["site-a"]
+        # The real caller's predicate must expire as well as detect ownership.
+        clock.now = ns["actual_expiry"]
+        assert predicates[0]() is False
+        clock.now = now
+        generation[0] += 1
+        assert predicates[0]() is False
+    else:
+        assert result["success"] is False
+        assert ns["accepted_sites"] == []
+    assert bool(cleanup) == (transition == "expired")
+
+
+@pytest.mark.parametrize("handler_name,generation_name", [
+    ("_handle_sync_tou_internal", "sync_command_generation"),
+    ("handle_restore_normal", "_restore_generation"),
+])
+def test_sync_and_restore_uploads_pass_their_own_generation(handler_name, generation_name):
+    tree = ast.parse((ROOT / "custom_components/power_sync/__init__.py").read_text())
+    handler = next(node for node in ast.walk(tree)
+                   if isinstance(node, ast.AsyncFunctionDef) and node.name == handler_name)
+    upload = next(node for node in ast.walk(handler)
+                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                  and node.func.id == "send_tariff_to_tesla")
+    predicate = next(keyword.value for keyword in upload.keywords if keyword.arg == "is_current")
+    generation = [7]
+    namespace = {"_command_generation": generation, generation_name: 7}
+    is_current = eval(compile(ast.Expression(body=predicate), "<upload-authority>", "eval"), namespace)
+    assert is_current() is True
+    generation[0] += 1
+    assert is_current() is False

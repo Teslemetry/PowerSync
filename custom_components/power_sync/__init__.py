@@ -5760,12 +5760,14 @@ async def send_tariff_to_tesla(
     confirm_readback: bool = True,
     accepted_status: dict[str, bool] | None = None,
     readback_status: dict[str, str] | None = None,
+    is_current: Callable[[], bool] | None = None,
 ) -> bool:
     """Upload one site's tariff, sharing backpressure across all TOU callers.
 
     Do not queue competing force/restore payloads: their callers must recheck
     lifecycle state before retrying. Keep the cooldown in hass.data so a final
     429 or a cancelled retry cannot let the next caller bypass Retry-After.
+    Callers with a force lifecycle revoke stale payloads through is_current.
     """
     uploads = hass.data.setdefault(DOMAIN, {}).setdefault("_tesla_tou_uploads", {})
     key = (api_provider, get_tesla_api_base_url(api_provider, fleet_base_url), str(site_id))
@@ -5786,6 +5788,7 @@ async def send_tariff_to_tesla(
             accepted_status=accepted_status,
             readback_status=readback_status,
             rate_limit_state=state,
+            is_current=is_current,
         )
     finally:
         state["busy"] = False
@@ -5803,6 +5806,7 @@ async def _send_tariff_to_tesla(
     confirm_readback: bool = True,
     accepted_status: dict[str, bool] | None = None,
     readback_status: dict[str, str] | None = None,
+    is_current: Callable[[], bool] | None = None,
     *,
     rate_limit_state: dict[str, Any],
 ) -> bool:
@@ -5898,6 +5902,13 @@ async def _send_tariff_to_tesla(
                     wait_time
                 )
                 await asyncio.sleep(wait_time)
+
+            # A force/restore transition may have taken ownership while this
+            # upload waited on Retry-After or network backoff. Check directly
+            # before every POST; checking only after upload can overwrite it.
+            if is_current is not None and not is_current():
+                _LOGGER.info("Skipping superseded TOU upload for site %s", site_id)
+                return False
 
             _LOGGER.debug(
                 "Sending TOU schedule to Tesla via %s for site %s (attempt %d/%d)",
@@ -26792,6 +26803,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 parameter so future provider-specific sync paths can pass a
                 different label without changing the signature.
         """
+        # Snapshot before price acquisition, which can also yield to a newer
+        # force/restore command. That command owns the tariff from then on.
+        sync_command_generation = _command_generation[0]
+
         # Determine battery system type for routing
         battery_system = entry.data.get(CONF_BATTERY_SYSTEM, "tesla")
 
@@ -27866,7 +27881,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 s_provider,
                 fleet_base_url=entry.data.get(CONF_FLEET_API_BASE_URL),
                 readback_status=site_readback_status,
+                is_current=lambda: _command_generation[0] == sync_command_generation,
             )
+            if _command_generation[0] != sync_command_generation:
+                _LOGGER.info("TOU sync superseded by a newer force/restore command")
+                return
             if not site_success:
                 _LOGGER.error("Failed to sync TOU to Tesla site %s", site_id)
                 success = False
@@ -34844,7 +34863,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     provider,
                     fleet_base_url=entry.data.get(CONF_FLEET_API_BASE_URL),
                     accepted_status=upload_status,
+                    is_current=lambda: (
+                        _command_generation[0] == _restore_gen
+                        and dt_util.utcnow() < actual_expiry
+                    ),
                 )
+                if _command_generation[0] != _restore_gen:
+                    _LOGGER.info("Force discharge tariff upload superseded; skipping stale cleanup")
+                    return {"success": False, "error": "superseded by a newer command"}
+                if dt_util.utcnow() >= actual_expiry:
+                    await _cleanup_failed_tesla_force_discharge(
+                        "force tariff expired during upload"
+                    )
+                    return {"success": False, "error": "force tariff expired during upload"}
                 if upload_status.get("accepted"):
                     accepted_sites.append(site_id)
                 if not success:
@@ -36734,7 +36765,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     provider,
                     fleet_base_url=entry.data.get(CONF_FLEET_API_BASE_URL),
                     accepted_status=upload_status,
+                    is_current=lambda: (
+                        _command_generation[0] == _restore_gen
+                        and dt_util.utcnow() < actual_expiry
+                    ),
                 )
+                if _command_generation[0] != _restore_gen:
+                    _LOGGER.info("Force charge tariff upload superseded; skipping stale cleanup")
+                    return {"success": False, "error": "superseded by a newer command"}
+                if dt_util.utcnow() >= actual_expiry:
+                    await _cleanup_failed_tesla_force_charge(
+                        "force tariff expired during upload"
+                    )
+                    return {"success": False, "error": "force tariff expired during upload"}
                 if upload_status.get("accepted"):
                     accepted_sites.append(site_id)
                 if not success:
@@ -38466,7 +38509,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         success = await send_tariff_to_tesla(
                             hass, site_id, site_tariff, current_token, provider,
                             fleet_base_url=entry.data.get(CONF_FLEET_API_BASE_URL),
+                            is_current=lambda: _command_generation[0] == _restore_generation,
                         )
+                        if _restore_superseded("tariff restore"):
+                            return
                         if success:
                             _LOGGER.info("Restored saved tariff for site %s", site_id)
                         else:

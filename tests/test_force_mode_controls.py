@@ -1130,7 +1130,12 @@ def test_tesla_tou_upload_reports_accepted_before_readback_failure():
     )
     assert "Tesla accepted TOU schedule; awaiting site_info readback" in function_source
     assert "readback_status: dict[str, str] | None = None" in function_source
-    assert function_source.index("site_info did not confirm") < function_source.index("return False")
+    # A superseded upload may return False before any transport call. The
+    # unconfirmed-readback path must still stop before generic error handling.
+    failed_readback = function_source.index("site_info did not confirm")
+    assert "return False" in function_source[
+        failed_readback:function_source.index("error_text =", failed_readback)
+    ]
 
 
 def test_tesla_tou_sync_labels_zero_normalized_readback_without_rewriting_local_rates():
