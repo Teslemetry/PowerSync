@@ -75,8 +75,17 @@ def test_cost_neutral_plan_normalizes_alignment_and_invalid_values():
         fixed_cost_allowances_by_day={"2026-08-01": 1.0},
         current_day="2026-08-01",
         timezone="Australia/Sydney",
+        forecast_natural_export_earnings_by_day={
+            "2026-08-01": -0.25,
+            "2026-08-02": 0.5,
+            "missing": 1.0,
+            "invalid": float("nan"),
+        },
     ).normalized(4)
 
+    assert plan.forecast_natural_export_earnings_by_day == {
+        "2026-08-01": -0.25, "2026-08-02": 0.5,
+    }
     assert plan.day_ids == ["2026-08-01", None, "2026-08-02", None]
     assert plan.earnings_caps_by_day == {
         "2026-08-01": 1.25,

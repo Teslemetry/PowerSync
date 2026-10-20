@@ -49,6 +49,10 @@ class CostNeutralPlan:
     settlement_import_prices: list[float] = field(default_factory=list)
     settlement_export_prices: list[float] = field(default_factory=list)
 
+    # Present for coordinator-built budgets; legacy callers retain a fixed
+    # battery-only allowance when the baseline solar ledger is unavailable.
+    forecast_natural_export_earnings_by_day: dict[str, float] = field(default_factory=dict)
+
     def normalized(self, length: int) -> "CostNeutralPlan":
         """Return finite, aligned values suitable for optimizer constraints."""
 
@@ -132,6 +136,12 @@ class CostNeutralPlan:
             settlement_export_prices=_price_list(
                 self.settlement_export_prices
             ),
+            forecast_natural_export_earnings_by_day={
+                key: value for key, value in _finite_map(
+                    self.forecast_natural_export_earnings_by_day,
+                    nonnegative=False,
+                ).items() if key in valid_day_set
+            },
         )
 
     @classmethod

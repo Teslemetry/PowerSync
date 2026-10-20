@@ -69,6 +69,14 @@ xAI Grok API calls are separately metered. They are not included with an X or
 Grok consumer subscription, so use an xAI API account with applicable billing
 and usage limits.
 
+## Cost Neutral solar credits
+
+Cost Neutral credits solar export from the final plan before deciding how much
+battery export is needed to cover the day's costs. This includes solar surplus
+released when an export action prevents battery charging, reducing unnecessary
+small battery-export windows. Small exports can still be planned while costs
+remain uncovered, and unavoidable surplus solar export remains uncapped.
+
 ## Core controls
 
 ### Enable Smart Optimization

@@ -1724,3 +1724,166 @@ def test_amber_confidence_changes_decision_value_but_cost_neutral_uses_raw_earni
     assert result.battery_to_grid_w[0] == pytest.approx(2000, abs=5)
     assert max(result.battery_to_grid_w[1:]) < 5
     assert plan.settlement_export_prices == raw
+
+
+@pytest.mark.parametrize("interval_minutes,n,allowance", [(60, 4, 0.10), (5, 12, 0.025)])
+@pytest.mark.parametrize("disable_idle", [False, True])
+@pytest.mark.parametrize("initial_soc", [0.5, 0.99])
+def test_cost_neutral_counts_final_solar_credit_before_battery_export(
+    optimizer_module, interval_minutes, n, allowance, disable_idle, initial_soc,
+):
+    """Export mode must not earn a full battery allowance on top of new solar credit."""
+    module = optimizer_module
+    if not module.HIGHS_AVAILABLE:
+        pytest.skip("requires HiGHS LP solver")
+    optimizer = _optimizer(module)
+    optimizer.interval_minutes = interval_minutes
+    optimizer.dt_hours = interval_minutes / 60
+    optimizer.horizon_hours = n * optimizer.dt_hours
+    start = _timestamps(1)[0]
+    timestamps = [start + timedelta(minutes=interval_minutes * idx) for idx in range(n)]
+    day = start.date().isoformat()
+    plan = module.CostNeutralPlan(
+        day_ids=[day] * n,
+        earnings_caps_by_day={day: allowance},
+        forecast_import_costs_by_day={day: 0.0},
+        fixed_cost_allowances_by_day={day: allowance},
+        forecast_natural_export_earnings_by_day={day: 0.0},
+        settlement_import_prices=[0.10] * n,
+        settlement_export_prices=[0.08] * n,
+    )
+    result = optimizer.optimize(
+        import_prices=[0.10] * n,
+        export_prices=[0.08] * n,
+        solar_forecast=[2.0] * n,
+        load_forecast=[1.0] * n,
+        current_soc=initial_soc,
+        allow_battery_export=[True] * n,
+        schedule_timestamps=timestamps,
+        disable_idle=disable_idle,
+        cost_neutral_plan=plan,
+    )
+
+    assert result.solver_used == "highs"
+    assert result.feasible
+    assert result.lp_stats["mode_converged"] is True
+    credit = sum(result.grid_export_w) / 1000 * optimizer.dt_hours * 0.08
+    imports = sum(result.grid_import_w) / 1000 * optimizer.dt_hours * 0.10
+    battery_credit = sum(result.battery_to_grid_w) / 1000 * optimizer.dt_hours * 0.08
+    assert imports == pytest.approx(0.0, abs=1e-5)
+    if initial_soc == 0.99:
+        # Capacity-limited solar export can exceed the target, freely. There
+        # must be no discretionary battery discharge alongside that surplus.
+        assert credit > allowance
+        assert battery_credit == pytest.approx(0.0)
+    else:
+        assert 0.0 < battery_credit < allowance
+        assert credit == pytest.approx(allowance, abs=1e-5)
+        assert any(action.battery_charge_w > 100 for action in result.schedule.actions)
+        if interval_minutes == 60:
+            assert sum(action.action == "export" for action in result.schedule.actions) == 1
+            assert result.schedule.actions[-1].soc == pytest.approx(0.775, abs=1e-4)
+    assert result.lp_stats["cost_neutral_planned_earnings_by_day"][day] == pytest.approx(
+        battery_credit, abs=1e-5,
+    )
+    assert result.lp_stats["cost_neutral_earnings_caps_by_day"][day] == pytest.approx(
+        max(0.0, allowance + imports - (credit - battery_credit)), abs=1e-5,
+    )
+
+
+@pytest.mark.parametrize("force_greedy", [False, True])
+def test_final_solar_credit_guard_handles_dated_capped_bonuses(
+    optimizer_module, monkeypatch, force_greedy,
+):
+    """Future-day solar credit and chronological bonus quota cannot be spent twice."""
+    module = optimizer_module
+    if not module.HIGHS_AVAILABLE:
+        pytest.skip("requires HiGHS LP solver")
+    if force_greedy:
+        monkeypatch.setattr(module, "HIGHS_AVAILABLE", False)
+    optimizer = _optimizer(module)
+    optimizer.horizon_hours = 6
+    start = datetime(2026, 8, 1, 21, tzinfo=timezone.utc)
+    timestamps = [start + timedelta(hours=i) for i in range(6)]
+    day_ids = [x.date().isoformat() for x in timestamps]
+    days = sorted(set(day_ids))
+    plan = module.CostNeutralPlan(
+        day_ids=day_ids,
+        earnings_caps_by_day={day: 0.10 for day in days},
+        forecast_import_costs_by_day={day: 0.0 for day in days},
+        fixed_cost_allowances_by_day={day: 0.10 for day in days},
+        forecast_natural_export_earnings_by_day={day: 0.0 for day in days},
+        settlement_import_prices=[0.20] * 6,
+        settlement_export_prices=[0.08] * 6,
+    )
+    result = optimizer.optimize(
+        import_prices=[0.20] * 6, export_prices=[0.08] * 6,
+        solar_forecast=[2.0] * 6, load_forecast=[1.0] * 6,
+        current_soc=0.5, allow_battery_export=[True] * 6,
+        schedule_timestamps=timestamps, disable_idle=True,
+        cost_neutral_plan=plan,
+        export_bonus_prices=[0.10] * 6, export_bonus_cap_kwh=0.5,
+    )
+    assert result.feasible
+    bonus_remaining = 0.5
+    for day in days:
+        total_credit = 0.0
+        battery_credit = 0.0
+        for i, action in enumerate(result.schedule.actions):
+            if day_ids[i] != day:
+                continue
+            export_kwh = result.grid_export_w[i] / 1000
+            natural_kwh = max(0.0, export_kwh - result.battery_to_grid_w[i] / 1000)
+            total_bonus_kwh = min(export_kwh, bonus_remaining)
+            natural_bonus_kwh = min(natural_kwh, total_bonus_kwh)
+            total_credit += export_kwh * 0.08 + total_bonus_kwh * 0.10
+            battery_credit += (
+                result.battery_to_grid_w[i] / 1000 * 0.08
+                + (total_bonus_kwh - natural_bonus_kwh) * 0.10
+            )
+            bonus_remaining -= total_bonus_kwh
+        imports = sum(
+            result.grid_import_w[i] / 1000 * 0.20
+            for i in range(6) if day_ids[i] == day
+        )
+        assert battery_credit <= max(0.0, 0.10 + imports - (total_credit - battery_credit)) + 1e-5
+        assert result.lp_stats["cost_neutral_planned_earnings_by_day"][day] == pytest.approx(
+            battery_credit, abs=1e-5,
+        )
+
+
+@pytest.mark.parametrize("solar_kw", [0.0, 2.0])
+def test_final_solar_budget_preserves_manual_export_and_blocks_extra_export(
+    optimizer_module, solar_kw,
+):
+    module = optimizer_module
+    if not module.HIGHS_AVAILABLE:
+        pytest.skip("requires HiGHS LP solver")
+    optimizer = _optimizer(module)
+    timestamps = _timestamps(4)
+    day = timestamps[0].date().isoformat()
+    plan = module.CostNeutralPlan(
+        day_ids=[day] * 4, earnings_caps_by_day={day: 0.10},
+        forecast_import_costs_by_day={day: 0.0},
+        fixed_cost_allowances_by_day={day: 0.10},
+        forecast_natural_export_earnings_by_day={day: 0.0},
+        settlement_import_prices=[0.20] * 4,
+        settlement_export_prices=[0.10] * 4,
+    )
+    result = optimizer.optimize(
+        import_prices=[0.20] * 4, export_prices=[0.10] * 4,
+        solar_forecast=[solar_kw] * 4, load_forecast=[0.0] * 4,
+        current_soc=0.8, allow_battery_export=[True] * 4,
+        schedule_timestamps=timestamps, cost_neutral_plan=plan,
+        manual_control={
+            "control_type": "force_discharge",
+            "mode_slots": ["export", None, None, None],
+            "required_charge_kw": [0.0] * 4,
+            "required_discharge_kw": [2.0, 0.0, 0.0, 0.0],
+        },
+    )
+    assert result.feasible
+    assert result.schedule.actions[0].control_source == "manual"
+    assert result.schedule.actions[0].battery_discharge_w == pytest.approx(2000)
+    assert result.battery_to_grid_w[0] == pytest.approx(2000)
+    assert result.battery_to_grid_w[1:] == pytest.approx([0.0] * 3)

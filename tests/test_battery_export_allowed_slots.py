@@ -2487,6 +2487,9 @@ def test_cost_neutral_builds_tomorrow_budget_for_every_electricity_provider(
         "2026-08-01": 1.2,
         "2026-08-02": 1.4,
     })
+    assert plan.forecast_natural_export_earnings_by_day == {
+        "2026-08-01": 0.0, "2026-08-02": 0.0,
+    }
     assert set(status["days"]) == {"2026-08-01", "2026-08-02"}
     assert status["current_day"] == "2026-08-01"
 

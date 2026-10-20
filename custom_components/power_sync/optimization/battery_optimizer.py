@@ -1293,10 +1293,13 @@ class BatteryOptimizer:
                         # Each settlement day stands alone. A clipped/negative
                         # day must use the bounded reconciliation path, while a
                         # later day with a valid positive allowance can still
-                        # account for its own planned imports.
+                        # account for its own planned imports. Final-solar
+                        # settlement uses the bounded path for every day: an
+                        # optional grid top-up cannot fund a new export budget.
                         account_by_day = {
                             day: (
-                                seeded_plan.earnings_caps_by_day.get(
+                                day not in seeded_plan.forecast_natural_export_earnings_by_day
+                                and seeded_plan.earnings_caps_by_day.get(
                                     day,
                                     0.0,
                                 )
@@ -1357,8 +1360,38 @@ class BatteryOptimizer:
                                     **raw_effective_caps,
                                 }.items()
                             }
-                            changed = any(
-                                effective_caps.get(day, 0.0)
+                            # Final-solar budgets reopen only for imports in
+                            # the emitted plan. Do not let the LP buy power to
+                            # manufacture a larger discretionary-export budget.
+                            settled_imports = dict(
+                                seeded_plan.forecast_import_costs_by_day
+                            )
+                            bonus_import_kw = self._allocate_capped_bonus(
+                                [value / 1000.0 for value in result.grid_import_w],
+                                import_bonus_prices or [0.0] * n_steps,
+                                import_bonus_cap_kwh,
+                                self._quota_import_group_ids,
+                                self._quota_import_caps_by_group,
+                            )
+                            for day in seeded_plan.forecast_natural_export_earnings_by_day:
+                                settled_imports[day] = sum(
+                                    (
+                                        (seeded_plan.settlement_import_prices or import_prices)[idx]
+                                        * value / 1000.0
+                                        - (import_bonus_prices[idx] if import_bonus_prices else 0.0)
+                                        * bonus_import_kw[idx]
+                                    ) * self.dt_hours
+                                    for idx, value in enumerate(result.grid_import_w)
+                                    if seeded_plan.day_ids[idx] == day
+                                )
+                            imports_changed = any(
+                                settled_imports[day]
+                                > seeded_plan.forecast_import_costs_by_day.get(day, 0.0) + 0.005
+                                for day in seeded_plan.forecast_natural_export_earnings_by_day
+                            )
+                            changed = imports_changed or any(
+                                day not in seeded_plan.forecast_natural_export_earnings_by_day
+                                and effective_caps.get(day, 0.0)
                                 > seeded_plan.earnings_caps_by_day.get(day, 0.0)
                                 + 0.005
                                 for day in seeded_plan.earnings_caps_by_day
@@ -1368,6 +1401,7 @@ class BatteryOptimizer:
                             seeded_plan = replace(
                                 seeded_plan,
                                 earnings_caps_by_day=effective_caps,
+                                forecast_import_costs_by_day=settled_imports,
                             )
                             result = _run_lp_once(
                                 seeded_plan,
@@ -3535,7 +3569,9 @@ class BatteryOptimizer:
         if bonus_import_active:
             next_offset += p_n
         direction_binary_active = bool(
-            getattr(self, "_prevent_simultaneous_grid_flow", False)
+            (cost_neutral_active
+             and cost_neutral_plan.forecast_natural_export_earnings_by_day)
+            or getattr(self, "_prevent_simultaneous_grid_flow", False)
         )
         max_grid_kw = (
             max(0.0, self.max_grid_import_w / 1000.0)
@@ -3761,6 +3797,16 @@ class BatteryOptimizer:
         if cost_neutral_active and not ev_charge_active:
             next_offset += p_n
 
+        # One switch per settlement day makes the total-credit constraint
+        # conditional on discretionary battery export. With no such export,
+        # unavoidable solar earnings remain completely unrestricted.
+        cost_neutral_final_solar_days = [
+            day for day in cost_neutral_days
+            if day in cost_neutral_plan.forecast_natural_export_earnings_by_day
+        ] if cost_neutral_active else []
+        cost_neutral_day_export_offset = next_offset
+        next_offset += len(cost_neutral_final_solar_days)
+
         energy_offset = next_offset
         num_vars = energy_offset + p_n + 1
 
@@ -3853,6 +3899,9 @@ class BatteryOptimizer:
 
         def cost_neutral_saturation_var(t: int) -> int:
             return cost_neutral_saturation_offset + t
+
+        def cost_neutral_day_export_var(day: str) -> int:
+            return cost_neutral_day_export_offset + cost_neutral_final_solar_days.index(day)
 
         def ev_stage_credit(stage_slot: int, t: int, efficiency: float) -> float:
             """Return period ``t``'s energy coefficient toward a stage.
@@ -4383,6 +4432,12 @@ class BatteryOptimizer:
                     for t in cost_neutral_natural_periods
                 )
 
+        A_ub_rows += sum(
+            p_cost_neutral_days[t] in cost_neutral_final_solar_days
+            and not p_manual_control[t]
+            for t in cost_neutral_mode_periods
+        )
+
         A_ub = _LpMatrix((A_ub_rows, num_vars), dtype=float)
         b_ub: list[float] = []
 
@@ -4867,6 +4922,57 @@ class BatteryOptimizer:
                         0.0,
                         cost_neutral_caps_by_day.get(day, 0.0),
                     )
+                if day in cost_neutral_final_solar_days:
+                    # Undo the baseline solar credit, then settle the *final*
+                    # physical export. Previously, export mode could suppress
+                    # native charging and create solar revenue that never
+                    # reduced the battery allowance, leaving 100.1 W exports
+                    # selected throughout otherwise unnecessary windows.
+                    gross_allowance = (
+                        cost_neutral_plan.fixed_cost_allowances_by_day[day]
+                        + cost_neutral_plan.forecast_natural_export_earnings_by_day[day]
+                        + (0.0 if account_for_day_imports else
+                           cost_neutral_plan.forecast_import_costs_by_day.get(day, 0.0))
+                    )
+                    day_switch = cost_neutral_day_export_var(day)
+                    for t in cost_neutral_mode_periods:
+                        if p_cost_neutral_days[t] == day and not p_manual_control[t]:
+                            A_ub[len(b_ub), cost_neutral_export_mode_var(t)] = 1.0
+                            A_ub[len(b_ub), day_switch] = -1.0
+                            b_ub.append(0.0)
+                    # Bound the largest possible credit-minus-import balance
+                    # from existing finite grid and quota capabilities. This
+                    # relaxation applies only when no battery export is chosen.
+                    maximum_balance = 0.0
+                    for t in range(p_n):
+                        if p_cost_neutral_days[t] != day:
+                            continue
+                        price = p_cost_neutral_export[t]
+                        export_limit = self._grid_export_limit_kw_for_range(
+                            periods[t].start, periods[t].end, default_kw=100.0,
+                        )
+                        maximum_balance += (
+                            max(0.0, price + p_export_bonus[t]) * export_limit
+                            + (max(0.0, -p_cost_neutral_import[t]) * max_grid_kw
+                               if account_for_day_imports else 0.0)
+                        ) * p_dt[t]
+                        A_ub[len(b_ub), grid_export_var(t)] = price * p_dt[t]
+                        if bonus_export_active:
+                            A_ub[len(b_ub), bonus_export_var(t)] = (
+                                p_export_bonus[t] * p_dt[t]
+                            )
+                        if account_for_day_imports:
+                            A_ub[len(b_ub), grid_import_var(t)] = (
+                                -p_cost_neutral_import[t] * p_dt[t]
+                            )
+                            if bonus_import_active:
+                                A_ub[len(b_ub), bonus_import_var(t)] = (
+                                    p_import_bonus[t] * p_dt[t]
+                                )
+                    relaxation = max(0.0, maximum_balance - gross_allowance) + 1e-6
+                    A_ub[len(b_ub), day_switch] = relaxation
+                    b_ub.append(gross_allowance + relaxation)
+                    continue
                 for t in range(p_n):
                     if p_cost_neutral_days[t] != day:
                         continue
@@ -5536,6 +5642,8 @@ class BatteryOptimizer:
                         else (0.0, 0.0)
                     )
 
+        bounds.extend((0.0, 1.0) for _ in cost_neutral_final_solar_days)
+
         bounds.append((soc_0 * cap, soc_0 * cap))
         for t in range(1, p_n + 1):
             upper_soc = solar_prefill_ceilings[t]
@@ -5650,6 +5758,10 @@ class BatteryOptimizer:
                     + n_ev_vehicles * p_n,
                 )
             )
+        integer_indices.extend(range(
+            cost_neutral_day_export_offset,
+            cost_neutral_day_export_offset + len(cost_neutral_final_solar_days),
+        ))
         if integer_indices:
             result = _solve_lp_highs(
                 *solve_args,
@@ -5928,6 +6040,12 @@ class BatteryOptimizer:
                 import_bonus_prices=import_bonus_prices,
                 import_bonus_cap_kwh=import_bonus_cap_kwh,
                 plan=cost_neutral_plan,
+                schedule=schedule,
+                solar=solar,
+                load=load,
+                export_prices=export_prices,
+                export_bonus_prices=export_bonus_prices,
+                export_bonus_cap_kwh=export_bonus_cap_kwh,
             )
         )
         planned_cost_neutral_by_day: dict[str, float] = {}
@@ -8017,6 +8135,12 @@ class BatteryOptimizer:
                 import_bonus_prices=import_bonus_prices,
                 import_bonus_cap_kwh=import_bonus_cap_kwh,
                 plan=cost_neutral_plan,
+                schedule=import_basis_schedule,
+                solar=solar,
+                load=house_load,
+                export_prices=export_prices,
+                export_bonus_prices=export_bonus_prices,
+                export_bonus_cap_kwh=export_bonus_cap_kwh,
             )
         )
         planned_cost_neutral_by_day: dict[str, float] = {}
@@ -8989,6 +9113,10 @@ class BatteryOptimizer:
                 soc=round(soc, 4),
                 battery_charge_w=round(reported_charge_w, 1),
                 battery_discharge_w=round(reported_discharge_w, 1),
+                # The settlement guard runs before coordinator overlays. Carry
+                # manual ownership now so it cannot trim a fixed user request.
+                control_source="manual" if manual_mode is not None else None,
+                control_action=manual_mode,
                 reason=(
                     "profit_max_solar_export"
                     if action == "solar_export"
@@ -9110,8 +9238,14 @@ class BatteryOptimizer:
         import_bonus_prices: list[float] | None,
         import_bonus_cap_kwh: float | None,
         plan: CostNeutralPlan | None,
+        schedule: OptimizationSchedule | None = None,
+        solar: list[float] | None = None,
+        load: list[float] | None = None,
+        export_prices: list[float] | None = None,
+        export_bonus_prices: list[float] | None = None,
+        export_bonus_cap_kwh: float | None = None,
     ) -> dict[str, float]:
-        """Replace every day's baseline imports with final-plan imports."""
+        """Replace baseline import and solar credits with final physical flows."""
 
         if plan is None:
             return {}
@@ -9142,6 +9276,40 @@ class BatteryOptimizer:
                 - float(bonuses[idx] if idx < len(bonuses) else 0.0)
                 * float(bonus_import[idx] if idx < len(bonus_import) else 0.0)
             ) * self.dt_hours
+        solar_adjustment = {day: 0.0 for day in normalized.earnings_caps_by_day}
+        if schedule is not None and normalized.forecast_natural_export_earnings_by_day:
+            _, grid_export_kw = self._grid_flows_from_schedule(
+                schedule, len(grid_import_kw), solar or [], load or [],
+            )
+            export_bonuses = self._pad_array(
+                export_bonus_prices, len(grid_export_kw), 0.0,
+            )
+            bonus_export_kw = self._allocate_capped_bonus(
+                grid_export_kw, export_bonuses, export_bonus_cap_kwh,
+                self._quota_export_group_ids, self._quota_export_caps_by_group,
+            )
+            solar_adjustment.update(normalized.forecast_natural_export_earnings_by_day)
+            for idx, action in enumerate((schedule.actions or [])[:len(grid_export_kw)]):
+                day = normalized.day_ids[idx]
+                if day not in normalized.forecast_natural_export_earnings_by_day:
+                    continue
+                solar_kw = solar[idx] if solar and idx < len(solar) else 0.0
+                load_kw = load[idx] if load and idx < len(load) else 0.0
+                load_kw += max(
+                    0.0, float(getattr(action, "ev_charge_w", 0.0) or 0.0),
+                ) / 1000.0
+                battery_export_kw = max(
+                    0.0, action.battery_discharge_w / 1000.0 - max(0.0, load_kw - solar_kw),
+                )
+                natural_export_kw = max(0.0, grid_export_kw[idx] - battery_export_kw)
+                price_series = normalized.settlement_export_prices or export_prices or []
+                price = price_series[idx] if idx < len(price_series) else 0.0
+                # Settlement gives chronological natural solar first use of
+                # the shared premium quota, just as the export clamp does.
+                solar_adjustment[day] -= (
+                    price * natural_export_kw
+                    + export_bonuses[idx] * min(natural_export_kw, bonus_export_kw[idx])
+                ) * self.dt_hours
         return {
             day: max(
                 0.0,
@@ -9150,7 +9318,8 @@ class BatteryOptimizer:
                     normalized.earnings_caps_by_day[day]
                     - normalized.forecast_import_costs_by_day.get(day, 0.0),
                 )
-                + actual_by_day.get(day, 0.0),
+                + actual_by_day.get(day, 0.0)
+                + solar_adjustment.get(day, 0.0),
             )
             for day in normalized.earnings_caps_by_day
         }
@@ -9423,6 +9592,12 @@ class BatteryOptimizer:
                 import_bonus_prices=import_bonus_prices,
                 import_bonus_cap_kwh=import_bonus_cap_kwh,
                 plan=cost_neutral_plan,
+                schedule=schedule,
+                solar=solar,
+                load=load,
+                export_prices=export_prices,
+                export_bonus_prices=export_bonus_prices,
+                export_bonus_cap_kwh=export_bonus_cap_kwh,
             )
         )
         planned_cost_neutral_by_day: dict[str, float] = {}
