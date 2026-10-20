@@ -866,52 +866,68 @@ def test_local_status_api_marks_missing_snapshot_unavailable():
     assert api["snapshot_available"] is False
 
 
-def test_snapshot_from_dcq_off_grid_mode():
+@pytest.mark.parametrize("mode", ["BACKUP", "ISLAND", "Backup", "OffGrid", None, "unexpected-status"])
+@pytest.mark.parametrize("closed,grid_ok,expected", [
+    (True, True, "SystemGridConnected"),
+    (False, False, "SystemIslandedActive"),
+    (False, True, "SystemIslandedActive"),
+])
+def test_snapshot_grid_state_uses_contactor_readback_not_requested_mode(mode, closed, grid_ok, expected):
+    """BACKUP is observed on the owner's connected gateway (ticket #409)."""
     dcq = _sample_dcq()
-    dcq["control"]["islanding"]["customerIslandMode"] = "OffGrid"
-    dcq["control"]["islanding"]["gridOK"] = False
+    dcq["control"]["islanding"].update(
+        customerIslandMode=mode, contactorClosed=closed, gridOK=grid_ok, microGridOK=True,
+    )
     snap = client_mod._snapshot_from_dcq(dcq, _sample_cfg())
-    assert snap.grid_status == "SystemIslandedActive"
+    assert snap.grid_status == expected
+    assert snap.system_island_state == expected
 
 
-def test_snapshot_from_dcq_keeps_established_mode_aliases():
-    expected_by_mode = {
-        "OnGrid": "SystemGridConnected",
-        "Normal": "SystemGridConnected",
-        "OffGrid": "SystemIslandedActive",
-        "Backup": "SystemIslandedActive",
-    }
-    for mode, expected in expected_by_mode.items():
-        dcq = _sample_dcq()
-        dcq["control"]["islanding"]["customerIslandMode"] = mode
-
-        snap = client_mod._snapshot_from_dcq(dcq, _sample_cfg())
-
-        assert snap.grid_status == expected
+@pytest.mark.parametrize("field", ["contactorClosed", "gridOK", "microGridOK"])
+@pytest.mark.parametrize("value", [None, "true", "false", 0, 1, {}, []])
+def test_snapshot_grid_state_requires_boolean_readback(field, value):
+    dcq = _sample_dcq()
+    dcq["control"]["islanding"][field] = value
+    snap = client_mod._snapshot_from_dcq(dcq, _sample_cfg())
+    assert snap.grid_status is None
+    assert snap.system_island_state is None
 
 
-def test_snapshot_from_dcq_does_not_infer_terminal_state_from_unknown_mode():
-    for mode in (
-        "ISLAND_MODE_UNKNOWN",
-        "SystemIslandedReady",
-        "SystemTransitionToGrid",
-        "SystemTransitionToIsland",
-        "SystemMicroGridFaulted",
-        "SystemWaitForUser",
-        "unexpected-status",
-        "",
-        None,
-    ):
-        dcq = _sample_dcq()
-        if mode is None:
-            dcq["control"]["islanding"].pop("customerIslandMode")
-        else:
-            dcq["control"]["islanding"]["customerIslandMode"] = mode
-        dcq["control"]["islanding"]["gridOK"] = True
+@pytest.mark.parametrize("closed,grid_ok,microgrid_ok", [
+    (True, False, True), (True, True, False), (False, False, False), (False, True, False),
+])
+def test_snapshot_grid_state_keeps_unhealthy_readback_unknown(closed, grid_ok, microgrid_ok):
+    dcq = _sample_dcq()
+    dcq["control"]["islanding"].update(
+        contactorClosed=closed, gridOK=grid_ok, microGridOK=microgrid_ok,
+    )
+    assert client_mod._snapshot_from_dcq(dcq, _sample_cfg()).grid_status is None
 
-        snap = client_mod._snapshot_from_dcq(dcq, _sample_cfg())
 
-        assert snap.grid_status is None
+@pytest.mark.parametrize("mode", ["BACKUP", "OnGrid", "Normal", "OffGrid", "Backup", "ISLAND_MODE_UNKNOWN", "SystemTransitionToGrid", "SystemTransitionToIsland"])
+def test_snapshot_grid_state_does_not_infer_connection_from_mode_or_grid_health(mode):
+    dcq = _sample_dcq()
+    dcq["control"]["islanding"].pop("contactorClosed")
+    dcq["control"]["islanding"]["customerIslandMode"] = mode
+    snap = client_mod._snapshot_from_dcq(dcq, _sample_cfg())
+    assert snap.grid_status is None
+    assert snap.system_island_state is None
+
+
+@pytest.mark.parametrize("islanding", [None, "BACKUP", [], True, 1])
+def test_snapshot_grid_state_malformed_islanding_is_unknown(islanding):
+    dcq = _sample_dcq()
+    dcq["control"]["islanding"] = islanding
+    assert client_mod._snapshot_from_dcq(dcq, _sample_cfg()).grid_status is None
+
+
+def test_snapshot_site_shutdown_is_not_proof_of_islanding():
+    dcq = _sample_dcq()
+    dcq["control"]["islanding"] = {}
+    dcq["control"]["siteShutdown"] = {"isShutDown": True, "reasons": []}
+    snap = client_mod._snapshot_from_dcq(dcq, _sample_cfg())
+    assert snap.grid_status is None
+    assert snap.system_island_state is None
 
 
 def test_snapshot_from_dcq_zero_full_pack_energy():

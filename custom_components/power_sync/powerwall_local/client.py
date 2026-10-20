@@ -808,17 +808,26 @@ def _int_or_none(value: Any) -> int | None:
         return None
 
 
-# DCQ "islanding.customerIslandMode" → grid_status string. Tesla's REST returned
-# "SystemGridConnected" / "SystemIslandedActive" / etc.; the DCQ uses simpler
-# enum names that we map back so downstream consumers (sensors that branch on
-# the historical strings) keep working.
-_DCQ_ISLAND_MODE_TO_GRID_STATUS = {
-    "ISLAND_MODE_UNKNOWN": None,
-    "OnGrid": "SystemGridConnected",
-    "Backup": "SystemIslandedActive",
-    "OffGrid": "SystemIslandedActive",
-    "Normal": "SystemGridConnected",
-}
+def _dcq_grid_status(islanding: Any) -> str | None:
+    """Report terminal connection state from contactor and health readback.
+
+    customerIslandMode is a requested policy, not contactor position: a healthy
+    connected gateway reports BACKUP too. Utility gridOK alone is also not proof
+    of connection, since intentional islanding can leave the utility healthy.
+    """
+    if not isinstance(islanding, dict):
+        return None
+    closed = islanding.get("contactorClosed")
+    grid_ok = islanding.get("gridOK")
+    microgrid_ok = islanding.get("microGridOK")
+    if not isinstance(closed, bool) or not isinstance(grid_ok, bool):
+        return None
+    if microgrid_ok is not True:
+        return None
+    if closed:
+        return "SystemGridConnected" if grid_ok else None
+    return "SystemIslandedActive"
+
 
 def _snapshot_from_dcq(
     dcq: dict[str, Any],
@@ -864,11 +873,7 @@ def _snapshot_from_dcq(
     else:
         soc_pct = None
 
-    # Grid status is terminal only when customerIslandMode is a recognized
-    # DCQ contract value. gridOK is advisory during transitions and faults.
-    islanding = control.get("islanding") or {}
-    island_mode = islanding.get("customerIslandMode")
-    grid_status = _DCQ_ISLAND_MODE_TO_GRID_STATUS.get(island_mode)
+    grid_status = _dcq_grid_status(control.get("islanding"))
 
     # Operation mode + backup reserve from config.json (RSA-read, same
     # transport, fired in parallel).
@@ -924,14 +929,9 @@ def _snapshot_from_dcq(
     )
     pw_count = len(battery_blocks) if battery_blocks else None
 
-    # site_shutdown + system_island_state best-effort.
-    site_shutdown = control.get("siteShutdown") or {}
-    if site_shutdown.get("isShutDown"):
-        system_island_state = "SystemIslandedActive"
-    elif grid_status:
-        system_island_state = grid_status
-    else:
-        system_island_state = None
+    # Shutting down the power electronics does not prove the grid contactor
+    # opened. Both status surfaces must follow the same physical readback.
+    system_island_state = grid_status
 
     return PowerwallSnapshot(
         soc=soc_pct,
