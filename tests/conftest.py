@@ -92,3 +92,21 @@ def restore_real_power_sync_const():
         sys.modules.pop("aiohttp", None)
 
     yield
+
+
+@pytest.fixture(autouse=True)
+def complete_ha_storage_stub(monkeypatch):
+    """Give lightweight HA Store fakes the async persistence API used by EV fences."""
+    storage = sys.modules.get("homeassistant.helpers.storage")
+    store_type = getattr(storage, "Store", None)
+    if store_type is None or hasattr(store_type, "async_load"):
+        return
+
+    async def load(store):
+        return getattr(store, "_test_value", None)
+
+    async def save(store, value):
+        store._test_value = value
+
+    monkeypatch.setattr(store_type, "async_load", load, raising=False)
+    monkeypatch.setattr(store_type, "async_save", save, raising=False)

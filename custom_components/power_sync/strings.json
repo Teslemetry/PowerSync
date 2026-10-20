@@ -3040,6 +3040,14 @@
     "sync_now": {
       "name": "Sync Now",
       "description": "Immediately refresh data from Amber and Tesla"
+    },
+    "get_teslemetry_charge_on_solar": {
+      "name": "Read native Tesla Charge on Solar",
+      "description": "Read settings through Teslemetry. This paid request may wake the car. Turn off PowerSync EV sessions first."
+    },
+    "set_teslemetry_charge_on_solar": {
+      "name": "Set native Tesla Charge on Solar",
+      "description": "Manage Tesla native solar charging and read back settings. Requires Teslemetry and eligible Powerwall setup. Uses paid requests and may wake the car."
     }
   }
 }

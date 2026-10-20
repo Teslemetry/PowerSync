@@ -1,0 +1,144 @@
+"""Native solar protocol, uncertain readback, and serialized ownership checks."""
+import asyncio
+import importlib.util
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+SPEC = importlib.util.spec_from_file_location('native_solar', Path(__file__).parents[1] / 'custom_components/power_sync/teslemetry_solar.py')
+m = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(m)
+VIN = '5YJ3E1EA7KF000001'
+SETTINGS = dict(enabled=True, lowerChargeLimit=50, upperChargeLimit=80)
+
+@pytest.mark.parametrize('value', [{}, {**SETTINGS, 'enabled': 1}, {**SETTINGS, 'lowerChargeLimit': True}, {**SETTINGS, 'lowerChargeLimit': 81}, {**SETTINGS, 'upperChargeLimit': 101}])
+def test_validation(value):
+    with pytest.raises(m.SolarError): m.validate_settings(value)
+
+class Response:
+    def __init__(self, body, status=200): self.body, self.status = body, status
+    async def __aenter__(self): return self
+    async def __aexit__(self, *args): pass
+    async def json(self): return self.body
+
+class Session:
+    def __init__(self, response): self.response, self.calls = response, []
+    def request(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return self.response
+
+@pytest.mark.asyncio
+async def test_explicit_get_and_ack_are_distinct():
+    s = Session(Response({'response': SETTINGS}))
+    assert await m.request_settings(s, 'secret', VIN) == SETTINGS
+    assert s.calls[0][0][0] == 'GET'
+    s = Session(Response({'response': {'result': True}}))
+    assert await m.request_settings(s, 'secret', VIN, SETTINGS) is None
+    with pytest.raises(m.SolarError): await m.request_settings(s, 'secret', VIN)
+    s = Session(Response({'response': {**SETTINGS, 'result': False}}))
+    with pytest.raises(m.SolarError): await m.request_settings(s, 'secret', VIN)
+
+class Store:
+    def __init__(self): self.value = None
+    async def async_load(self): return self.value
+    async def async_save(self, value): self.value = value
+
+@pytest.mark.asyncio
+async def test_restart_and_scoped_hold():
+    store = Store(); a = m.SolarOwnership(store); await a.load()
+    await a.hold(VIN, {'status': 'unconfirmed'})
+    b = m.SolarOwnership(store); await b.load()
+    assert b.blocked(VIN) and b.blocked(None)
+    assert not b.blocked('5YJ3E1EA7KF000002')
+    await b.release(VIN)
+    assert not b.blocked(VIN)
+
+@pytest.mark.asyncio
+async def test_ownership_waits_for_inflight_action_then_blocks(monkeypatch):
+    gate = m.SolarOwnership(Store()); await gate.load()
+    async def ownership(*args): return gate
+    monkeypatch.setattr(m, 'ownership', ownership)
+    entered, finish = asyncio.Event(), asyncio.Event()
+    calls = []
+    @m.guard_ev_control
+    async def action(hass, config_entry, params):
+        calls.append(params)
+        entered.set(); await finish.wait(); return True
+    entry = SimpleNamespace(entry_id='one')
+    task = asyncio.create_task(action(None, entry, {'vehicle_vin': VIN}))
+    await entered.wait()
+    async def handover():
+        async with gate.lock: await gate.hold(VIN, {'status': 'unconfirmed'})
+    transfer = asyncio.create_task(handover()); await asyncio.sleep(0)
+    assert not transfer.done()
+    finish.set(); assert await task; await transfer
+    assert not await action(None, entry, {'vehicle_vin': VIN})
+    assert len(calls) == 1
+    assert await action(None, entry, {'vehicle_vin': '5YJ3E1EA7KF000002'})
+
+@pytest.mark.asyncio
+async def test_service_provider_monitoring_handover_and_readback(monkeypatch):
+    import sys
+    import types
+    root = types.ModuleType('native_solar_service_test')
+    root.__path__ = []
+    provider = ['teslemetry']
+    root.get_tesla_ev_api_token = lambda *args: ('secret', provider[0])
+    monkeypatch.setitem(sys.modules, root.__name__, root)
+    monkeypatch.setattr(m, '__package__', root.__name__)
+    const = types.ModuleType(root.__name__ + '.const')
+    const.DOMAIN, const.CONF_MONITORING_MODE = 'power_sync', 'monitoring_mode'
+    monkeypatch.setitem(sys.modules, const.__name__, const)
+    actions = types.ModuleType(root.__name__ + '.automations.actions')
+    actions._dynamic_ev_state = {}
+    monkeypatch.setitem(sys.modules, actions.__name__, actions)
+    ha_core = types.ModuleType('homeassistant.core')
+    ha_core.SupportsResponse = SimpleNamespace(ONLY='only', OPTIONAL='optional')
+    monkeypatch.setitem(sys.modules, ha_core.__name__, ha_core)
+    ha_ex = types.ModuleType('homeassistant.exceptions')
+    ha_ex.HomeAssistantError = m.SolarError
+    monkeypatch.setitem(sys.modules, ha_ex.__name__, ha_ex)
+    ha_client = types.ModuleType('homeassistant.helpers.aiohttp_client')
+    ha_client.async_get_clientsession = lambda hass: None
+    monkeypatch.setitem(sys.modules, ha_client.__name__, ha_client)
+    gate = m.SolarOwnership(Store()); await gate.load()
+    async def ownership(*args): return gate
+    monkeypatch.setattr(m, 'ownership', ownership)
+    responses, calls = [], []
+    async def request(*args):
+        calls.append(args)
+        response = responses.pop(0)
+        if isinstance(response, Exception): raise response
+        return response
+    monkeypatch.setattr(m, 'request_settings', request)
+    services = {}
+    def register(domain, name, handler, **kwargs): services[name] = handler
+    entry = SimpleNamespace(entry_id='one', data={}, options={})
+    hass = SimpleNamespace(data={'power_sync': {'one': {}}},
+        config_entries=SimpleNamespace(async_entries=lambda _: [entry]),
+        services=SimpleNamespace(async_register=register))
+    m.register_services(hass)
+    async def call(service, **extra):
+        return await services[service](SimpleNamespace(service=service, data={
+            'entry_id':'one', 'vin':VIN, 'enabled':True, 'confirm_eligible':True,
+            'lower_charge_limit':50, 'upper_charge_limit':80, **extra}))
+    get, put = 'get_teslemetry_charge_on_solar', 'set_teslemetry_charge_on_solar'
+    provider[0] = 'tesla_fleet'
+    with pytest.raises(m.SolarError): await call(get)
+    provider[0] = 'teslemetry'; entry.options['monitoring_mode'] = True
+    with pytest.raises(m.SolarError): await call(put)
+    entry.options.clear()
+    with pytest.raises(m.SolarError): await call(put, confirm_eligible=False)
+    actions._dynamic_ev_state['one'] = {'v':{'active':True}}
+    with pytest.raises(m.SolarError): await call(get)
+    assert not calls
+    actions._dynamic_ev_state.clear()
+    responses.extend([None, m.SolarError('readback failed')])
+    with pytest.raises(m.SolarError): await call(put)
+    assert gate.blocked(VIN)
+    gate.requests.clear()
+    responses.append({**SETTINGS, 'enabled': False})
+    result = await call(get)
+    assert result['readback_confirmed'] and not result['powersync_control_blocked']
+    assert not gate.blocked(VIN)

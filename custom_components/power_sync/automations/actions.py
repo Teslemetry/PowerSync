@@ -41,6 +41,8 @@ from homeassistant.helpers.event import async_track_time_interval, async_track_p
 from datetime import timedelta, datetime, timezone as dt_timezone, time as dt_time
 from homeassistant.util import dt as dt_util
 
+from ..teslemetry_solar import guard_ev_control
+
 from ..const import (
     DOMAIN,
     CONF_EV_PROVIDER,
@@ -5167,6 +5169,7 @@ async def _stop_zaptec_charging(
         return False
 
 
+@guard_ev_control
 async def _action_start_ev_charging(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
@@ -5521,6 +5524,7 @@ async def _action_start_ev_charging(
     return True
 
 
+@guard_ev_control
 async def _action_stop_ev_charging(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
@@ -5715,6 +5719,7 @@ async def _action_stop_ev_charging(
     return False
 
 
+@guard_ev_control
 async def _action_set_ev_charge_limit(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
@@ -5804,6 +5809,7 @@ async def _action_set_ev_charge_limit(
     return False
 
 
+@guard_ev_control
 async def _action_set_ev_charging_amps(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
@@ -7387,6 +7393,7 @@ async def _solar_surplus_switch_to_next_vehicle(
     _LOGGER.info(f"⚡ Solar surplus EV: No other vehicles available for charging")
 
 
+@guard_ev_control
 async def _set_vehicle_amps(
     hass: HomeAssistant,
     config_entry: ConfigEntry | None,
@@ -11963,6 +11970,7 @@ async def _dynamic_ev_update_sigenergy_evdc_native_solar(
         state["native_solar_grid_import_logged"] = False
 
 
+@guard_ev_control
 async def _dynamic_ev_update(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
@@ -12564,6 +12572,7 @@ async def _dynamic_ev_update(
         _LOGGER.debug(f"Dynamic EV: Session tracking failed: {e}")
 
 
+@guard_ev_control
 async def _action_start_ev_charging_dynamic(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
@@ -13967,6 +13976,7 @@ async def _action_start_ev_charging_dynamic_locked(
     return True
 
 
+@guard_ev_control
 async def _action_stop_ev_charging_dynamic(
     hass: HomeAssistant,
     config_entry: ConfigEntry,

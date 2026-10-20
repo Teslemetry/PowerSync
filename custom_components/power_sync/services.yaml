@@ -507,3 +507,72 @@ preserve_battery:
           min: 1
           max: 240
           unit_of_measurement: min
+
+get_teslemetry_charge_on_solar:
+  name: Read native Tesla Charge on Solar
+  description: >-
+    Read native Tesla Charge on Solar settings through the configured Teslemetry
+    vehicle provider. Costs 1 Teslemetry credit and may wake the car (+20 credits
+    if asleep). A confirmed disabled read releases the PowerSync EV control hold.
+  fields:
+    entry_id:
+      name: PowerSync integration
+      required: true
+      selector:
+        config_entry:
+          integration: power_sync
+    vin:
+      name: Vehicle VIN
+      required: true
+      selector:
+        text:
+
+set_teslemetry_charge_on_solar:
+  name: Set native Tesla Charge on Solar
+  description: >-
+    Enable or disable Tesla-managed solar charging and read back the settings.
+    Requires a compatible Tesla, Powerwall, Tesla app setup and Teslemetry virtual
+    key. Turn off PowerSync EV sessions first. Writes are blocked in monitoring
+    mode. Uses 2 Teslemetry credits, plus possible sleeping-car wake costs.
+    Uncertain results retain the PowerSync EV control hold until disabled readback.
+  fields:
+    entry_id:
+      name: PowerSync integration
+      required: true
+      selector:
+        config_entry:
+          integration: power_sync
+    vin:
+      name: Vehicle VIN
+      required: true
+      selector:
+        text:
+    confirm_eligible:
+      name: Confirm native solar requirements
+      description: Required when enabling. Tesla setup is complete at a Powerwall site without export or site limits, other charging controllers are off, and request costs are accepted. Native mode does not enforce PowerSync phase or grid-import limits.
+      default: false
+      selector:
+        boolean:
+    enabled:
+      name: Enable native Charge on Solar
+      required: true
+      selector:
+        boolean:
+    lower_charge_limit:
+      name: Lower charge limit (solar and grid)
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 1
+          unit_of_measurement: '%'
+    upper_charge_limit:
+      name: Upper charge limit (excess solar)
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 1
+          unit_of_measurement: '%'
