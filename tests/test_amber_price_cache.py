@@ -466,8 +466,15 @@ def test_fetch_with_retry_raises_reauth_for_direct_token_401():
         raise AssertionError("Expected ConfigEntryAuthFailed")
 
 
-def test_fetch_with_retry_treats_fleet_token_401_as_update_failure():
-    session = _FakeSession(_FakeResponse(401, '{"error":"token expired (401)"}'))
+@pytest.mark.parametrize(
+    "body",
+    [
+        '{"error":"token expired (401)"}',
+        '{"error":"token_revoked","action":"reauth_required"}',
+    ],
+)
+def test_fetch_with_retry_treats_fleet_token_401_as_update_failure(body):
+    session = _FakeSession(_FakeResponse(401, body))
 
     try:
         asyncio.run(
@@ -481,7 +488,7 @@ def test_fetch_with_retry_treats_fleet_token_401_as_update_failure():
         )
     except coordinator.UpdateFailed as err:
         assert "Authentication failed: 401" in str(err)
-        assert "token expired" in str(err)
+        assert body in str(err)
     else:
         raise AssertionError("Expected UpdateFailed")
 
@@ -510,6 +517,66 @@ def test_fetch_with_retry_confirms_powersync_bearer_before_reauth():
         raise AssertionError("Expected retryable UpdateFailed")
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        '{"error":"token_revoked","action":"reauth_required"}',
+        '{"error":"token_revoked"}',
+        '{"error":"tesla_auth_expired","action":"reauth_required"}',
+    ],
+)
+def test_fetch_with_retry_reauths_revoked_tesla_connection_with_valid_powersync_bearer(body):
+    session = _SequenceSession(
+        [
+            _FakeResponse(401, body),
+            _FakeResponse(200, payload={"authenticated": True}),
+        ]
+    )
+    url = f"{coordinator.POWERSYNC_API_BASE_URL}/api/1/energy_sites/site-1/live_status"
+
+    with pytest.raises(coordinator.ConfigEntryAuthFailed, match="Tesla"):
+        asyncio.run(
+            coordinator._fetch_with_retry(
+                session,
+                url,
+                {"Authorization": "Bearer psync_test_token"},
+                max_retries=1,
+            )
+        )
+
+    # Explicit upstream revocation ends the retry loop immediately. The
+    # PowerSync session can remain valid independently of Tesla authorization.
+    assert session.urls == [url]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '{"error":"token_refresh_failed"}',
+        '<html>Unauthorized</html>',
+        'null',
+        '["token_revoked"]',
+    ],
+)
+@pytest.mark.parametrize("bearer_status", [200, 503])
+def test_fetch_with_retry_keeps_unspecified_proxy_401_retryable(body, bearer_status):
+    session = _SequenceSession(
+        [_FakeResponse(401, body), _FakeResponse(bearer_status)]
+    )
+
+    with pytest.raises(coordinator.UpdateFailed, match="Transient PowerSync"):
+        asyncio.run(
+            coordinator._fetch_with_retry(
+                session,
+                f"{coordinator.POWERSYNC_API_BASE_URL}/api/1/products",
+                {"Authorization": "Bearer psync_test_token"},
+                max_retries=1,
+            )
+        )
+
+    assert session.urls[-1] == coordinator.POWERSYNC_AUTH_ME_URL
+
+
 def test_fetch_with_retry_reauths_when_powersync_bearer_is_invalid():
     session = _SequenceSession(
         [
@@ -534,8 +601,13 @@ def test_fetch_with_retry_reauths_when_powersync_bearer_is_invalid():
         raise AssertionError("Expected ConfigEntryAuthFailed")
 
 
-def test_tesla_auth_expiry_sends_one_actionable_mobile_alert(monkeypatch):
+@pytest.mark.parametrize("revoked_tesla_auth", [False, True])
+def test_tesla_auth_expiry_sends_one_actionable_mobile_alert(monkeypatch, revoked_tesla_auth):
     hass = _FakeHass()
+    if revoked_tesla_auth:
+        hass.session = _FakeSession(
+            _FakeResponse(401, '{"error":"token_revoked","action":"reauth_required"}')
+        )
     tesla = coordinator.TeslaEnergyCoordinator(
         hass,
         "site-1",
@@ -559,7 +631,8 @@ def test_tesla_auth_expiry_sends_one_actionable_mobile_alert(monkeypatch):
     actions_module._send_expo_push = capture_push
     monkeypatch.setitem(sys.modules, "power_sync.automations", automations_package)
     monkeypatch.setitem(sys.modules, "power_sync.automations.actions", actions_module)
-    monkeypatch.setattr(coordinator, "_fetch_with_retry", rejected_bearer)
+    if not revoked_tesla_auth:
+        monkeypatch.setattr(coordinator, "_fetch_with_retry", rejected_bearer)
 
     for _ in range(2):
         try:
@@ -569,6 +642,8 @@ def test_tesla_auth_expiry_sends_one_actionable_mobile_alert(monkeypatch):
         else:
             raise AssertionError("Expected ConfigEntryAuthFailed")
 
+    assert tesla._consecutive_failures == 0
+    assert tesla._outage_notified is False
     assert alerts == [
         (
             hass,

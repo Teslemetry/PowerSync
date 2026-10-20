@@ -1800,6 +1800,27 @@ async def _fetch_with_retry(
                             and authorization.startswith("Bearer psync_")
                         )
                         if is_powersync_proxy:
+                            # The PowerSync session and its upstream Tesla
+                            # authorization have independent lifetimes. A
+                            # valid /auth/me cannot recover revoked Tesla
+                            # credentials, so honor explicit reauth responses
+                            # before checking the PowerSync bearer.
+                            try:
+                                auth_error = json.loads(error_text)
+                            except ValueError:
+                                auth_error = None
+                            if isinstance(auth_error, dict) and (
+                                auth_error.get("error") == "token_revoked"
+                                or auth_error.get("action") == "reauth_required"
+                            ):
+                                _LOGGER.warning(
+                                    "Tesla authorization expired or revoked — "
+                                    "triggering PowerSync reauthentication"
+                                )
+                                raise ConfigEntryAuthFailed(
+                                    "Tesla connection expired or revoked; "
+                                    "sign in again with PowerSync"
+                                )
                             bearer_status: bool | None = None
                             try:
                                 async with session.get(

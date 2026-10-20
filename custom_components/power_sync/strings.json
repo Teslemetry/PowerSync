@@ -900,7 +900,7 @@
       },
       "powersync_reauth": {
         "title": "Re-authenticate with PowerSync",
-        "description": "Your PowerSync token is no longer valid. Sign in again at **{auth_url}** and paste the new `psync_` token below.",
+        "description": "Your Tesla connection has expired or your PowerSync token is no longer valid. Sign in again at **{auth_url}** and paste the new `psync_` token below.",
         "data": {
           "teslemetry_api_token": "PowerSync token"
         },
