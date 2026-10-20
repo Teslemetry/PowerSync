@@ -81,6 +81,13 @@ async def test_ownership_waits_for_inflight_action_then_blocks(monkeypatch):
 async def test_service_provider_monitoring_handover_and_readback(monkeypatch):
     import sys
     import types
+    # Registration schemas are HA infrastructure; domain validation is tested above.
+    vol = types.ModuleType('voluptuous')
+    vol.Required = vol.Optional = lambda key, **kwargs: key
+    vol.Schema = lambda value: value
+    vol.All = lambda *args: args
+    vol.Range = lambda **kwargs: kwargs
+    monkeypatch.setitem(sys.modules, 'voluptuous', vol)
     root = types.ModuleType('native_solar_service_test')
     root.__path__ = []
     provider = ['teslemetry']
