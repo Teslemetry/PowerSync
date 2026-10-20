@@ -3077,6 +3077,8 @@ def _coordinator_data_is_fresh(coordinator: Any) -> bool:
         return False
     if getattr(coordinator, "data", None) is None:
         return False
+    if coordinator.data.get("telemetry_ready") is False:
+        return False
 
     last_update = getattr(coordinator, "last_update_success_time", None)
     update_interval = getattr(coordinator, "update_interval", None)
@@ -3089,11 +3091,20 @@ def _coordinator_data_is_fresh(coordinator: Any) -> bool:
             timedelta(seconds=_ENERGY_COORDINATOR_MIN_STALE_SECONDS),
         )
         now = dt_util.utcnow()
-        if getattr(now, "tzinfo", None) is None and getattr(last_update, "tzinfo", None) is not None:
-            now = now.replace(tzinfo=last_update.tzinfo)
-        elif getattr(now, "tzinfo", None) is not None and getattr(last_update, "tzinfo", None) is None:
-            last_update = last_update.replace(tzinfo=now.tzinfo)
-        age = now - last_update
+        stamps = [last_update]
+        source_stamp = coordinator.data.get("last_update")
+        if isinstance(source_stamp, datetime):
+            # Control-health publications can renew coordinator metadata without
+            # copying new power values. Keep the flow snapshot's own age too.
+            stamps.append(source_stamp)
+        ages = []
+        for stamp in stamps:
+            if getattr(now, "tzinfo", None) is None and getattr(stamp, "tzinfo", None) is not None:
+                stamp = stamp.replace(tzinfo=None)
+            elif getattr(now, "tzinfo", None) is not None and getattr(stamp, "tzinfo", None) is None:
+                stamp = stamp.replace(tzinfo=now.tzinfo)
+            ages.append(now - stamp)
+        age = max(ages)
     except Exception:
         return True
 

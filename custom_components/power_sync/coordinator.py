@@ -10397,7 +10397,7 @@ class SolarEdgeEnergyCoordinator(
             "ev_charger_connected": ev_power_kw is not None and ev_power_kw > 0.05,
             "ev_charger_charging": ev_power_kw is not None and ev_power_kw > 0.05,
             "ev_charger_discharging": False,
-            "last_update": dt_util.utcnow(),
+            "last_update": status.get("last_update"),
             "battery_temperature": status.get("battery_temperature"),
             "battery_soh": status.get("battery_soh"),
             "backup_reserve": status.get("backup_reserve"),
@@ -10698,6 +10698,10 @@ class SolarEdgeEnergyCoordinator(
                 status = self._controller.get_status()
                 self.async_set_updated_data({
                     **self.data,
+                    "telemetry_ready": (
+                        self.data.get("telemetry_ready") is True
+                        and status.get("telemetry_ready") is True
+                    ),
                     "control_health": status.get("control_health"),
                     "last_mutation": status.get("last_mutation"),
                     "last_reconciliation": status.get("last_reconciliation"),
@@ -10773,6 +10777,10 @@ class SolarEdgeEnergyCoordinator(
                 status = self._controller.get_status()
                 self.async_set_updated_data({
                     **self.data,
+                    "telemetry_ready": (
+                        self.data.get("telemetry_ready") is True
+                        and status.get("telemetry_ready") is True
+                    ),
                     "control_health": status.get("control_health"),
                     "last_mutation": status.get("last_mutation"),
                     "last_reconciliation": status.get("last_reconciliation"),

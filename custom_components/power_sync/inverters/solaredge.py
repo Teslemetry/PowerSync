@@ -753,6 +753,7 @@ class SolarEdgeEnergyController:
 
     WRITE_CONFIRM_TIMEOUT_SECONDS = 15.0
     WRITE_CONFIRM_INTERVAL_SECONDS = 0.25
+    TELEMETRY_MAX_AGE_SECONDS = 120
 
     def __init__(
         self,
@@ -815,6 +816,7 @@ class SolarEdgeEnergyController:
 
         status: dict[str, Any] = {
             "telemetry_ready": self.telemetry_ready(),
+            "last_update": self._telemetry_last_update(),
             "battery_level": self._read_float("battery_level"),
             "battery_power": battery_kw,
             "grid_power": grid_kw,
@@ -912,7 +914,68 @@ class SolarEdgeEnergyController:
             and battery_ready
             and grid_ready
             and solar_ready
+            and self._telemetry_is_fresh()
         )
+
+    def _telemetry_entity_ids(self) -> list[str]:
+        """Return the sources actually used for the current site calculation."""
+        self._ensure_entity_map()
+        keys = {"battery_level"}
+        entities = set(self._battery_power_entity_ids)
+        if not entities:
+            if any(
+                self._power_kw(key) is not None
+                for key in ("battery_charge", "battery_discharge")
+            ):
+                keys.update(("battery_charge", "battery_discharge"))
+            else:
+                keys.add("battery_power")
+        if any(self._power_kw(key) is not None for key in ("grid_import", "grid_export")):
+            keys.update(("grid_import", "grid_export"))
+        else:
+            keys.add("grid_power")
+
+        pv_keys = [
+            f"pv{idx}_power" for idx in range(1, 5)
+            if f"pv{idx}_power" in self._entity_map
+        ]
+        solar_kw = self._power_kw("solar_power")
+        if not self._has_battery_power_source():
+            keys.update(pv_keys)
+            if solar_kw is not None:
+                keys.add("solar_power")
+        elif pv_keys and all(self._power_kw(key) is not None for key in pv_keys):
+            keys.update(pv_keys)
+        elif (
+            solar_kw is not None
+            and self._entity_map.get("solar_power") != self._entity_map.get("inverter_dc_power")
+            and not self._is_ac_solar_source(self._entity_map.get("solar_power"))
+        ):
+            keys.add("solar_power")
+        else:
+            keys.add("inverter_dc_power")
+        if (self._power_kw("load_power") or 0) > 0:
+            keys.add("load_power")
+        entities.update(self._entity_map[key] for key in keys if key in self._entity_map)
+        return sorted(entities)
+
+    def _telemetry_last_update(self) -> datetime | None:
+        """Keep source age when rereading cached states, including stable values."""
+        stamps = []
+        now = datetime.now(timezone.utc)
+        for entity_id in self._telemetry_entity_ids():
+            state = self.hass.states.get(entity_id)
+            stamp = getattr(state, "last_reported", None) or getattr(state, "last_updated", None)
+            if not isinstance(stamp, datetime) or stamp.tzinfo is None or stamp > now:
+                return None
+            stamps.append(stamp)
+        return min(stamps) if stamps else None
+
+    def _telemetry_is_fresh(self) -> bool:
+        stamp = self._telemetry_last_update()
+        return stamp is not None and (
+            datetime.now(timezone.utc) - stamp
+        ).total_seconds() <= self.TELEMETRY_MAX_AGE_SECONDS
 
     async def disconnect(self) -> None:
         """No persistent connection to close."""

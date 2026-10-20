@@ -331,7 +331,8 @@ def test_solaredge_restore_forwards_timer_generation_and_failure():
     )
 
 
-def test_solaredge_coordinator_publishes_failure_health():
+@pytest.mark.parametrize("source_ready", [False, True])
+def test_solaredge_coordinator_publishes_failure_health(source_ready):
     path = ROOT / "custom_components" / "power_sync" / "coordinator.py"
     klass = next(
         n
@@ -343,6 +344,8 @@ def test_solaredge_coordinator_publishes_failure_health():
     controller = SimpleNamespace(
         get_status=lambda: {
             "control_health": "reconciliation_required",
+            "telemetry_ready": source_ready,
+            "last_update": "new source report without copied flow values",
             "last_mutation": {"outcome": "unknown"},
             "last_reconciliation": None,
             "mutation_active": False,
@@ -350,7 +353,7 @@ def test_solaredge_coordinator_publishes_failure_health():
     )
     update = Mock()
     coord = SimpleNamespace(
-        data={"battery_level": 50},
+        data={"battery_level": 50, "telemetry_ready": True, "last_update": "flow snapshot time"},
         _controller=controller,
         async_set_updated_data=update,
     )
@@ -361,6 +364,8 @@ def test_solaredge_coordinator_publishes_failure_health():
     assert asyncio.run(call(coord, operation())) is False
     assert update.call_args.args[0] == {
         "battery_level": 50,
+        "telemetry_ready": source_ready,
+        "last_update": "flow snapshot time",
         "control_health": "reconciliation_required",
         "last_mutation": {"outcome": "unknown"},
         "last_reconciliation": None,
@@ -1063,6 +1068,7 @@ def test_reconciliation_service_uses_real_coordinator_forwarding(success):
     }
     status = {
         "control_health": health,
+        "telemetry_ready": False,
         "last_mutation": {"outcome": "confirmed" if success else "unknown"},
         "last_reconciliation": diagnostic,
     }

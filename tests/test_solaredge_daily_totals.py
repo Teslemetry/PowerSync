@@ -343,3 +343,33 @@ def test_solaredge_daily_total_recorder_corrects_existing_midday_baseline():
     assert data["energy_summary"]["grid_export_today_kwh"] == pytest.approx(0.25)
     assert coordinator._daily_total_store.data["import_baseline_kwh"] == pytest.approx(9614.65)
     assert coordinator._daily_total_store.data["export_baseline_kwh"] == pytest.approx(150.0)
+
+
+def test_bridge_preserves_source_age_and_does_not_accumulate_stale_power():
+    from datetime import timedelta
+    from unittest.mock import Mock
+
+    stamp = datetime(2026, 5, 29, 0, 55, 0)
+    status = {
+        "telemetry_ready": False,
+        "last_update": stamp,
+        "solar_power": 2.29,
+        "grid_power": -1.81,
+        "battery_power": 0,
+        "load_power": .48,
+        "battery_level": 100,
+    }
+    coordinator = _new_coordinator([dict(status), dict(status)])
+    coordinator._energy_acc.update = Mock()
+    for _ in range(2):
+        data = asyncio.run(coordinator._async_update_data())
+        assert data["last_update"] == stamp
+        assert data["telemetry_ready"] is False
+    coordinator._energy_acc.update.assert_not_called()
+
+    fresh = {**status, "telemetry_ready": True, "last_update": stamp + timedelta(minutes=5)}
+    coordinator._controller.statuses.append(fresh)
+    data = asyncio.run(coordinator._async_update_data())
+    assert data["last_update"] == fresh["last_update"]
+    assert data["telemetry_ready"] is True
+    coordinator._energy_acc.update.assert_called_once()

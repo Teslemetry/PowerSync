@@ -337,6 +337,8 @@ class _SEState:
         self.entity_id = entity_id
         self.state = state
         self.attributes = attributes or {}
+        self.last_reported = datetime.now(timezone.utc)
+        self.last_updated = self.last_reported
 
 
 class _SEStates:
@@ -3341,3 +3343,53 @@ def test_solaredge_load_following_targets_require_usable_current_site_data():
     ]
     for data in invalid:
         assert target(data) is None
+
+
+@pytest.mark.parametrize("source", ["battery_level", "battery_power", "inverter_dc_power", "grid_power", "load_power"])
+@pytest.mark.parametrize("age", [121, -10, None])
+def test_solaredge_bridge_rejects_stale_source_even_when_reread_now(source, age):
+    """Ticket #108 recurrence: a new bridge read is not new inverter data."""
+    hass = _SEHass()
+    for suffix, value in (("m1_ac_power", "1810"), ("load_power", "483")):
+        entity_id = f"sensor.solaredge_{suffix}"
+        hass.states._states[entity_id] = _SEState(entity_id, value, {"unit_of_measurement": "W"})
+    controller = SolarEdgeEnergyController(hass, entity_prefix="solaredge")
+    assert asyncio.run(controller.connect())
+    entity = hass.states.get(controller._entity_map[source])
+    stamp = datetime.now(timezone.utc) - timedelta(seconds=age) if age is not None else None
+    entity.last_reported = stamp
+    entity.last_updated = stamp
+    for _ in range(2):
+        status = controller.get_status()
+        assert status["telemetry_ready"] is False
+        assert status["last_update"] == (stamp if age == 121 else None)
+        assert SolarEdgeController.load_following_target_w(status) is None
+    entity.last_reported = datetime.now(timezone.utc)
+    assert controller.get_status()["telemetry_ready"] is True
+    assert hass.services.calls == []
+
+
+def test_solaredge_bridge_accepts_unchanged_recently_reported_values():
+    hass = _SEHass()
+    now = datetime.now(timezone.utc)
+    for state in hass.states.async_all():
+        state.last_updated = now - timedelta(hours=4)
+        state.last_reported = now
+    controller = SolarEdgeEnergyController(hass, entity_prefix="solaredge")
+    status = controller.get_status()
+    assert status["telemetry_ready"] is True
+    assert status["last_update"] == now
+
+
+def test_solaredge_bridge_ignores_unused_stale_sources_and_uses_last_updated_fallback():
+    hass = _SEHass()
+    for entity_id in ("sensor.other_solaredge_b1_state_of_energy", "sensor.solaredge_i1_ac_power"):
+        hass.states._states[entity_id] = _SEState(entity_id, "2300", {"unit_of_measurement": "W"})
+        hass.states.get(entity_id).last_reported -= timedelta(hours=4)
+    controller = SolarEdgeEnergyController(hass, entity_prefix="solaredge")
+    state = hass.states.get("sensor.solaredge_b1_dc_power")
+    del state.last_reported
+    assert controller.telemetry_ready()
+    state.last_updated -= timedelta(minutes=3)
+    assert not controller.telemetry_ready()
+    assert hass.services.calls == []

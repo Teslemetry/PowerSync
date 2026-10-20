@@ -696,6 +696,37 @@ def test_energy_sensor_available_when_coordinator_data_is_recent():
     assert entity.available is True
 
 
+def test_energy_sensor_unavailable_when_bridge_rereads_stale_native_telemetry():
+    sensor = _sensor_module()
+    desc = next(d for d in sensor.ENERGY_SENSORS if d.key == "solar_power")
+    coordinator = SimpleNamespace(
+        data={"solar_power": 2.29, "grid_power": -1.81, "telemetry_ready": False},
+        last_update_success=True,
+        last_update_success_time=datetime(2026, 5, 3, 11, 59, 59, tzinfo=timezone.utc),
+        update_interval=timedelta(seconds=30),
+    )
+    entity = sensor.TeslaEnergySensor(coordinator, desc, _entry("amber"))
+    entity.hass = _hass("AUD")
+    assert entity.available is False
+    coordinator.data["telemetry_ready"] = True
+    assert entity.available is True
+
+
+def test_energy_sensor_health_publication_does_not_renew_old_flow_snapshot():
+    sensor = _sensor_module()
+    desc = next(d for d in sensor.ENERGY_SENSORS if d.key == "solar_power")
+    coordinator = SimpleNamespace(
+        data={"solar_power": 2.29, "telemetry_ready": True,
+              "last_update": datetime(2026, 5, 3, 11, 55, tzinfo=timezone.utc)},
+        last_update_success=True,
+        last_update_success_time=datetime(2026, 5, 3, 11, 59, 59, tzinfo=timezone.utc),
+        update_interval=timedelta(seconds=30),
+    )
+    entity = sensor.TeslaEnergySensor(coordinator, desc, _entry("amber"))
+    entity.hass = _hass("AUD")
+    assert entity.available is False
+
+
 def test_local_powerwall_home_load_excludes_observed_ev_power():
     sensor = _sensor_module()
     desc = next(d for d in sensor.ENERGY_SENSORS if d.key == "home_load")
