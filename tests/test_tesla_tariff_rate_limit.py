@@ -8,6 +8,7 @@ import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 import pytest
@@ -168,3 +169,35 @@ def test_accepted_unconfirmed_upload_preserves_status_and_releases_slot(upload_h
         assert len(session.posts) == 2
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("limited_site,expected_delay", [("site-a", 283), ("other-site", 60)])
+def test_restore_retry_waits_out_its_site_cooldown(limited_site, expected_delay):
+    """A known five-minute cooldown must not burn three one-minute retries."""
+    tree = ast.parse((ROOT / "custom_components/power_sync/__init__.py").read_text())
+    function = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "_schedule_tesla_restore_retry")
+    scheduled = []
+    now = datetime(2026, 10, 20, tzinfo=timezone.utc)
+    namespace = {
+        "restore_retry_count": 0,
+        "restore_was_force_charging": True,
+        "force_charge_state": {"active": True},
+        "force_discharge_state": {"active": False},
+        "_command_generation": [7],
+        "site_configs": [("site-a", "token", "teslemetry")],
+        "entry": SimpleNamespace(data={}),
+        "CONF_FLEET_API_BASE_URL": "fleet_base_url",
+        "get_tesla_api_base_url": lambda provider, region: region or provider,
+        "hass": SimpleNamespace(data={"power_sync": {"_tesla_tou_uploads": {
+            ("teslemetry", "teslemetry", limited_site): {"busy": False, "retry_at": 382.0},
+        }}}),
+        "DOMAIN": "power_sync",
+        "time": SimpleNamespace(monotonic=lambda: 100.0),
+        "dt_util": SimpleNamespace(utcnow=lambda: now),
+        "timedelta": timedelta,
+        "async_track_point_in_utc_time": lambda hass, callback, when: scheduled.append(when),
+        "_LOGGER": logging.getLogger(__name__),
+    }
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])), "<restore-retry>", "exec"), namespace)
+    assert namespace["_schedule_tesla_restore_retry"]("tariff deferred") is True
+    assert scheduled == [now + timedelta(seconds=expected_delay)]

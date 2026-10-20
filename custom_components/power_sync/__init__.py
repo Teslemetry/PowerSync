@@ -37242,7 +37242,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 if restore_was_force_charging or force_charge_state.get("active")
                 else force_discharge_state
             )
-            retry_at = dt_util.utcnow() + timedelta(seconds=60)
+            retry_delay = 60.0
+            uploads = (
+                getattr(hass, "data", {}).get(DOMAIN, {}).get("_tesla_tou_uploads", {})
+            )
+            if uploads:
+                for site_id, _token, provider in site_configs:
+                    key = (
+                        provider,
+                        get_tesla_api_base_url(provider, entry.data.get(CONF_FLEET_API_BASE_URL)),
+                        str(site_id),
+                    )
+                    retry_delay = max(
+                        retry_delay,
+                        uploads.get(key, {}).get("retry_at", 0.0) - time.monotonic() + 1.0,
+                    )
+            # Do not exhaust the bounded restore retries during a known cooldown.
+            retry_at = dt_util.utcnow() + timedelta(seconds=retry_delay)
             next_retry = restore_retry_count + 1
             retry_command_generation = _command_generation[0]
 
@@ -37292,8 +37308,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 retry_at,
             )
             _LOGGER.warning(
-                "Tesla restore_normal incomplete; retry %d scheduled in 60 seconds (%s)",
+                "Tesla restore_normal incomplete; retry %d scheduled in %.0f seconds (%s)",
                 next_retry,
+                retry_delay,
                 reason,
             )
             return True
