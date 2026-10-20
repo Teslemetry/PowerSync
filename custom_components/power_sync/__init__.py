@@ -45593,6 +45593,7 @@ def _optimization_ai_service(
                 api_key=configured_api_key(entry),
                 endpoint=configured_local_endpoint(entry),
                 local_model=configured_local_model(entry),
+                local_timeout=settings["ai_summary_local_timeout"],
                 openrouter_model=configured_openrouter_model(entry),
                 openai_model=configured_openai_model(entry),
             )
@@ -45684,6 +45685,8 @@ class OptimizationView(HomeAssistantView):
                 openrouter_model=configured_openrouter_model(config_entry),
                 openai_model=configured_openai_model(config_entry),
             )
+        if "ai_summary" in api_data:
+            api_data["ai_summary"]["client_timeout_seconds"] = ai_settings["ai_summary_client_timeout_seconds"]
         _LOGGER.debug(f"Optimization GET response: enabled={api_data.get('enabled')}, "
                       f"predicted_cost=${api_data.get('predicted_cost', 0):.2f}, "
                       f"savings=${api_data.get('predicted_savings', 0):.2f}, "
@@ -46348,6 +46351,7 @@ class OptimizationSettingsView(HomeAssistantView):
                 "clear_ai_summary_api_key",
                 "ai_summary_local_endpoint",
                 "ai_summary_local_model",
+                "ai_summary_local_timeout",
                 "ai_summary_openrouter_model",
                 "ai_summary_openai_model",                "ai_summary_auto_refresh",
             }
@@ -47123,7 +47127,7 @@ class OptimizationChatGPTView(HomeAssistantView):
                 "settings": {
                     "ai_summary_provider", "ai_summary_openai_model",
                     "ai_summary_api_key", "clear_ai_summary_api_key",
-                    "ai_summary_local_endpoint", "ai_summary_local_model",
+                    "ai_summary_local_endpoint", "ai_summary_local_model", "ai_summary_local_timeout",
                     "ai_summary_openrouter_model", "ai_summary_auto_refresh",
                 },
             }
@@ -47265,6 +47269,7 @@ class OptimizationAISummaryView(HomeAssistantView):
                 refresh=refresh,
                 endpoint=configured_local_endpoint(config_entry),
                 local_model=configured_local_model(config_entry),
+                local_timeout=public_settings["ai_summary_local_timeout"],
                 openrouter_model=configured_openrouter_model(config_entry),
                 openai_model=configured_openai_model(config_entry),
             )

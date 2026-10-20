@@ -39,6 +39,7 @@ def _load_module():
         const.CONF_OPTIMIZATION_AI_SUMMARY_API_KEY = "optimization_ai_summary_api_key"
         const.CONF_OPTIMIZATION_AI_SUMMARY_AUTO_REFRESH = "optimization_ai_summary_auto_refresh"
         const.CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_ENDPOINT = "optimization_ai_summary_local_endpoint"
+        const.CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_TIMEOUT = "optimization_ai_summary_local_timeout"
         const.CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_MODEL = "optimization_ai_summary_local_model"
         const.CONF_OPTIMIZATION_AI_SUMMARY_OPENAI_MODEL = "optimization_ai_summary_openai_model"
         const.CONF_OPTIMIZATION_AI_SUMMARY_OPENROUTER_MODEL = "optimization_ai_summary_openrouter_model"
@@ -532,6 +533,8 @@ def test_write_only_settings_replace_preserve_clear_and_isolate_provider_key():
 
     public = module.ai_summary_settings(SimpleNamespace(data={}, options=changed))
     assert public == {
+        "ai_summary_local_timeout": 120,
+        "ai_summary_client_timeout_seconds": 35,
         "ai_summary_provider": "grok",
         "ai_summary_api_key_configured": True,
         "ai_summary_key_configured": True,
@@ -1536,3 +1539,82 @@ def test_chatgpt_refresh_distinguishes_retryable_and_auth_errors(monkeypatch, fa
     assert "SECRET" not in caught.value.message
     if expected_code == "provider_unavailable":
         assert "reconnect" not in caught.value.message.lower()
+
+
+@pytest.mark.parametrize("timeout", [30, 120, 600])
+def test_local_timeout_settings_round_trip_and_client_budget(timeout):
+    module = _load_module()
+    options, changes = module.apply_ai_summary_settings({}, {"ai_summary_local_timeout": timeout})
+    entry = SimpleNamespace(data={}, options=options)
+    assert module.configured_local_timeout(entry) == timeout
+    options[module.CONF_OPTIMIZATION_AI_SUMMARY_PROVIDER] = "local_openai_compatible"
+    public = module.ai_summary_settings(entry)
+    assert public["ai_summary_local_timeout"] == timeout
+    assert public["ai_summary_client_timeout_seconds"] == timeout + 5
+    assert "updated local AI timeout" in changes
+
+
+@pytest.mark.parametrize("value", [None, True, False, 29, 601, 30.5, "120"])
+def test_local_timeout_rejects_invalid_writes_and_guards_persisted_values(value):
+    module = _load_module()
+    with pytest.raises(module.AISummaryError) as caught:
+        module.apply_ai_summary_settings({}, {"ai_summary_local_timeout": value})
+    assert caught.value.code == "invalid_local_ai_timeout"
+    assert caught.value.http_status == 400
+    assert module.configured_local_timeout(SimpleNamespace(data={}, options={module.CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_TIMEOUT: value})) == 120
+
+
+def test_local_service_passes_saved_timeout_to_http_and_cloud_stays_at_30_seconds():
+    module = _load_module()
+    response = {"choices": [{"message": {"content": json.dumps(_model_output())}}]}
+    session = _FakeSession(_FakeResponse(200, response))
+    service = module.AISummaryService(session, _snapshot)
+    asyncio.run(service.generate(provider="local_openai_compatible", api_key="", refresh=True,
+        endpoint="http://127.0.0.1:11434/v1", local_model="local-model", local_timeout=240))
+    assert session.calls[0][1]["timeout"].total == 240
+    cloud = _FakeSession(_FakeResponse(200, response))
+    asyncio.run(module.GrokAISummaryProvider().generate(session=cloud, api_key="key", model="grok-4.5", context=module.build_compact_context(_snapshot())))
+    assert cloud.calls[0][1]["timeout"].total == 30
+
+
+def test_local_compatibility_retry_shares_total_timeout_and_cleans_up(monkeypatch):
+    module = _load_module()
+    attempts = []
+    cancelled = []
+
+    async def post_json(*args, **kwargs):
+        attempts.append(kwargs)
+        try:
+            await asyncio.sleep(0.04)
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+        if len(attempts) == 1:
+            raise module.AISummaryError("provider_rejected", "Schema unsupported")
+        return {"choices": [{"message": {"content": json.dumps(_model_output())}}]}
+
+    monkeypatch.setattr(module, "_post_json", post_json)
+    with pytest.raises(module.AISummaryError) as caught:
+        asyncio.run(module.LocalOpenAICompatibleAISummaryProvider().generate(
+            session=None, api_key="", model="local", context=module.build_compact_context(_snapshot()),
+            endpoint="http://127.0.0.1:11434/v1", timeout_seconds=0.06))
+    assert caught.value.code == "provider_timeout"
+    assert caught.value.http_status == 504
+    assert len(attempts) == 2
+    assert cancelled == [True]
+
+
+def test_local_auto_refresh_keeps_configured_timeout(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(module, "AUTO_REFRESH_DEBOUNCE_SECONDS", 0)
+    monkeypatch.setattr(module, "AUTO_REFRESH_COOLDOWN_SECONDS", 0)
+    session = _FakeSession(_FakeResponse(200, {"choices": [{"message": {"content": json.dumps(_model_output())}}]}))
+
+    async def exercise():
+        service = module.AISummaryService(session, _snapshot)
+        service.schedule_auto_refresh(provider="local_openai_compatible", api_key="", endpoint="http://127.0.0.1:11434/v1", local_model="local-model", local_timeout=600)
+        await service._auto_task
+        assert session.calls[0][1]["timeout"].total == 600
+        await service.async_shutdown()
+
+    asyncio.run(exercise())

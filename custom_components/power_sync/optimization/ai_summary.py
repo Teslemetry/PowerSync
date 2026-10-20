@@ -28,6 +28,7 @@ from ..const import (
     CONF_OPTIMIZATION_AI_SUMMARY_AUTO_REFRESH,
     CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_ENDPOINT,
     CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_MODEL,
+    CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_TIMEOUT,
     CONF_OPTIMIZATION_AI_SUMMARY_OPENROUTER_MODEL,
     CONF_OPTIMIZATION_AI_SUMMARY_OPENAI_MODEL,
     CONF_OPTIMIZATION_AI_SUMMARY_PROVIDER,
@@ -50,6 +51,9 @@ MAX_CONTEXT_WINDOWS = 24
 MAX_ACTION_EXPLANATIONS = 6
 MAX_FORECAST_EVIDENCE_SLOTS = 24
 LOCAL_OPENAI_MAX_TOKENS = 2048
+DEFAULT_LOCAL_AI_TIMEOUT_SECONDS = 120
+MIN_LOCAL_AI_TIMEOUT_SECONDS = 30
+MAX_LOCAL_AI_TIMEOUT_SECONDS = 600
 MAX_LOCAL_ENDPOINT_LENGTH = 512
 MAX_LOCAL_MODEL_LENGTH = 128
 MAX_OPENROUTER_MODEL_LENGTH = 128
@@ -343,6 +347,10 @@ def ai_summary_settings(entry: Any | None, *, chatgpt_status: Mapping[str, Any] 
         ),
         "ai_summary_local_endpoint": public_endpoint,
         "ai_summary_local_model": str(local_model or "").strip(),
+        "ai_summary_local_timeout": configured_local_timeout(entry),
+        "ai_summary_client_timeout_seconds": (
+            configured_local_timeout(entry) + 5 if provider == "local_openai_compatible" else 35
+        ),
         "ai_summary_openrouter_model": str(openrouter_model or "").strip(),
         "ai_summary_openai_model": openai_model,
         "ai_summary_auto_refresh": bool(options.get(CONF_OPTIMIZATION_AI_SUMMARY_AUTO_REFRESH, data.get(CONF_OPTIMIZATION_AI_SUMMARY_AUTO_REFRESH, False))),
@@ -371,6 +379,16 @@ def configured_local_endpoint(entry: Any | None) -> str:
     data = getattr(entry, "data", {}) or {}
     options = getattr(entry, "options", {}) or {}
     return str(options.get(CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_ENDPOINT, data.get(CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_ENDPOINT, "")) or "").strip()
+
+
+def configured_local_timeout(entry: Any | None) -> int:
+    """Read a bounded budget, including safe fallback for old or invalid options."""
+    data = getattr(entry, "data", {}) or {}
+    options = getattr(entry, "options", {}) or {}
+    value = options.get(CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_TIMEOUT, data.get(CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_TIMEOUT))
+    if type(value) is int and MIN_LOCAL_AI_TIMEOUT_SECONDS <= value <= MAX_LOCAL_AI_TIMEOUT_SECONDS:
+        return value
+    return DEFAULT_LOCAL_AI_TIMEOUT_SECONDS
 
 
 def configured_local_model(entry: Any | None) -> str:
@@ -446,6 +464,10 @@ def apply_ai_summary_settings(
         )
     raw_endpoint = payload.get("ai_summary_local_endpoint")
     raw_model = payload.get("ai_summary_local_model")
+    if "ai_summary_local_timeout" in payload:
+        timeout = payload["ai_summary_local_timeout"]
+        if type(timeout) is not int or not MIN_LOCAL_AI_TIMEOUT_SECONDS <= timeout <= MAX_LOCAL_AI_TIMEOUT_SECONDS:
+            raise AISummaryError("invalid_local_ai_timeout", "Local AI timeout must be a whole number from 30 to 600 seconds.", http_status=400)
     raw_openrouter_model = payload.get("ai_summary_openrouter_model")
     if raw_endpoint is not None and not isinstance(raw_endpoint, str):
         raise AISummaryError("invalid_local_ai_endpoint", "The local AI endpoint must be text.", http_status=400)
@@ -481,6 +503,9 @@ def apply_ai_summary_settings(
     if requested_provider in {"openai", "chatgpt"}:
         provider_model(requested_provider, openai_model=openai_model)
     changes: list[str] = []
+    if "ai_summary_local_timeout" in payload and options.get(CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_TIMEOUT) != timeout:
+        options[CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_TIMEOUT] = timeout
+        changes.append("updated local AI timeout")
     if requested_provider != current_provider:
         options[CONF_OPTIMIZATION_AI_SUMMARY_PROVIDER] = requested_provider
         changes.append("updated AI summary provider")
@@ -1347,13 +1372,14 @@ async def _post_json(
     headers: Mapping[str, str],
     payload: Mapping[str, Any],
     request_kwargs: Mapping[str, Any] | None = None,
+    timeout_seconds: float = 30,
 ) -> Mapping[str, Any]:
     try:
         async with session.post(
             url,
             headers=dict(headers),
             json=dict(payload),
-            timeout=aiohttp.ClientTimeout(total=30),
+            timeout=aiohttp.ClientTimeout(total=timeout_seconds),
             allow_redirects=False,
             **dict(request_kwargs or {}),
         ) as response:
@@ -1750,7 +1776,15 @@ class ChatGPTResponsesAISummaryProvider:
 class LocalOpenAICompatibleAISummaryProvider:
     """Conservative OpenAI-compatible adapter for an explicitly local server."""
 
-    async def generate(
+    async def generate(self, *, timeout_seconds: int = DEFAULT_LOCAL_AI_TIMEOUT_SECONDS, **kwargs: Any) -> Mapping[str, Any]:
+        """Share one bounded budget across both schema compatibility attempts."""
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                return await self._generate(timeout_seconds=timeout_seconds, **kwargs)
+        except asyncio.TimeoutError as err:
+            raise AISummaryError("provider_timeout", "The selected AI provider timed out.", http_status=504) from err
+
+    async def _generate(
         self,
         *,
         session: Any,
@@ -1758,6 +1792,7 @@ class LocalOpenAICompatibleAISummaryProvider:
         model: str,
         context: Mapping[str, Any],
         endpoint: str,
+        timeout_seconds: int,
     ) -> Mapping[str, Any]:
         normalized = normalize_local_endpoint(endpoint)
         # Resolve immediately before each request.  aiohttp follows neither
@@ -1787,7 +1822,7 @@ class LocalOpenAICompatibleAISummaryProvider:
             },
         }
         try:
-            return _openai_message_text(await _post_json(session, pinned_url, headers=headers, payload=payload, request_kwargs={"server_hostname": server_hostname}))
+            return _openai_message_text(await _post_json(session, pinned_url, headers=headers, payload=payload, request_kwargs={"server_hostname": server_hostname}, timeout_seconds=timeout_seconds))
         except AISummaryError as err:
             # Several local implementations document that they do not support
             # json_schema.  One retry without it is the sole compatibility
@@ -1799,7 +1834,7 @@ class LocalOpenAICompatibleAISummaryProvider:
         # compatibility attempts.
         retry_url, retry_host, retry_sni = pin_local_endpoint(normalized, resolve_local_endpoint(normalized))
         headers["Host"] = retry_host
-        return _openai_message_text(await _post_json(session, retry_url, headers=headers, payload=payload, request_kwargs={"server_hostname": retry_sni}))
+        return _openai_message_text(await _post_json(session, retry_url, headers=headers, payload=payload, request_kwargs={"server_hostname": retry_sni}, timeout_seconds=timeout_seconds))
 
 
 PROVIDER_ADAPTERS: dict[str, AISummaryProvider] = {
@@ -1831,7 +1866,7 @@ class AISummaryService:
         self._last_explained_context: dict[str, Any] | None = None
         self._request_lock = asyncio.Lock()
         self._auto_task: asyncio.Task[None] | None = None
-        self._auto_pending: tuple[str, str, str, str, str, str, str] | None = None
+        self._auto_pending: tuple[str, str, str, str, str, str, str, int] | None = None
         self._auto_last_material_fingerprint: str | None = None
         self._auto_last_request_at = 0.0
         self._generation = 0
@@ -1895,6 +1930,7 @@ class AISummaryService:
         api_key: str,
         endpoint: str = "",
         local_model: str = "",
+        local_timeout: int = DEFAULT_LOCAL_AI_TIMEOUT_SECONDS,
         openrouter_model: str = "",
         openai_model: str = "",
     ) -> None:
@@ -1915,7 +1951,7 @@ class AISummaryService:
         if material == self._auto_last_material_fingerprint:
             return
         self._auto_last_material_fingerprint = material
-        self._auto_pending = (material, provider, "" if provider == "chatgpt" else api_key, endpoint, local_model, openrouter_model, openai_model)
+        self._auto_pending = (material, provider, "" if provider == "chatgpt" else api_key, endpoint, local_model, openrouter_model, openai_model, local_timeout)
         if self._auto_task is None or self._auto_task.done():
             generation = self._generation
             self._auto_task = asyncio.create_task(self._run_auto_refresh(generation))
@@ -1923,7 +1959,7 @@ class AISummaryService:
     async def _run_auto_refresh(self, generation: int) -> None:
         try:
             while self._auto_pending is not None and generation == self._generation:
-                _material, provider, api_key, endpoint, local_model, openrouter_model, openai_model = self._auto_pending
+                _material, provider, api_key, endpoint, local_model, openrouter_model, openai_model, local_timeout = self._auto_pending
                 self._auto_pending = None
                 await asyncio.sleep(AUTO_REFRESH_DEBOUNCE_SECONDS)
                 remaining = AUTO_REFRESH_COOLDOWN_SECONDS - (asyncio.get_running_loop().time() - self._auto_last_request_at)
@@ -1934,7 +1970,7 @@ class AISummaryService:
                     continue
                 self._auto_last_request_at = asyncio.get_running_loop().time()
                 try:
-                    await self.generate(provider=provider, api_key=api_key, refresh=False, endpoint=endpoint, local_model=local_model, openrouter_model=openrouter_model, openai_model=openai_model)
+                    await self.generate(provider=provider, api_key=api_key, refresh=False, endpoint=endpoint, local_model=local_model, local_timeout=local_timeout, openrouter_model=openrouter_model, openai_model=openai_model)
                 except (AISummaryError, asyncio.CancelledError):
                     if generation != self._generation:
                         return
@@ -2001,6 +2037,7 @@ class AISummaryService:
         refresh: bool,
         endpoint: str = "",
         local_model: str = "",
+        local_timeout: int = DEFAULT_LOCAL_AI_TIMEOUT_SECONDS,
         openrouter_model: str = "",
         openai_model: str = "",
     ) -> dict[str, Any]:
@@ -2049,6 +2086,7 @@ class AISummaryService:
                     fingerprint=fingerprint,
                     guard_fingerprint=guard_fingerprint,
                     endpoint=endpoint,
+                    local_timeout=local_timeout,
                     generation=generation,
                 )
             )
@@ -2085,6 +2123,7 @@ class AISummaryService:
         guard_fingerprint: str,
         generation: int,
         endpoint: str = "",
+        local_timeout: int = DEFAULT_LOCAL_AI_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
         adapter = PROVIDER_ADAPTERS[provider]
         async with self._request_lock:
@@ -2092,7 +2131,7 @@ class AISummaryService:
             if provider == "chatgpt":
                 raw = await adapter.generate(session=self._session, model=model, context=context, access_token=self._chatgpt_access_token)
             elif provider == "local_openai_compatible":
-                raw = await adapter.generate(session=self._session, api_key=api_key, model=model, context=context, endpoint=endpoint)
+                raw = await adapter.generate(session=self._session, api_key=api_key, model=model, context=context, endpoint=endpoint, timeout_seconds=local_timeout)
             else:
                 raw = await adapter.generate(session=self._session, api_key=api_key, model=model, context=context)
         self._require_generation(generation)

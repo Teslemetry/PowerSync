@@ -3838,6 +3838,7 @@ class PowerSyncAIPlanExplanation extends HTMLElement {
       ['_apiModel', 'ai_summary_openai_model'],
       ['_localEndpoint', 'ai_summary_local_endpoint'],
       ['_localModel', 'ai_summary_local_model'],
+      ['_localTimeout', 'ai_summary_local_timeout'],
       ['_openrouterModel', 'ai_summary_openrouter_model'],
     ]) {
       if (!this._settingsTouched.has(field)) this[field] = this._aiSettings[setting] || '';
@@ -4160,6 +4161,8 @@ class PowerSyncAIPlanExplanation extends HTMLElement {
       message('Use your Ollama, Open WebUI, or other local OpenAI-compatible server.');
       fields.push(['local-endpoint', 'Local server address', 'text', this._localEndpoint, 'http://192.168.1.10:11434/v1', value => { this._localEndpoint = value; this._settingsTouched.add('_localEndpoint'); }]);
       fields.push(['local-model', 'Installed model', 'text', this._localModel, 'Model name on your server', value => { this._localModel = value; this._settingsTouched.add('_localModel'); }]);
+      fields.push(['local-timeout', 'Local AI timeout (seconds)', 'number', this._localTimeout || 120, '120', value => { this._localTimeout = value; this._settingsTouched.add('_localTimeout'); }]);
+      message('Wait 30–600 seconds for an explanation. Default: 120 seconds.');
     }
     const keyId = provider === 'openai' ? 'openai-key' : 'provider-key';
     fields.push([keyId, provider === 'local_openai_compatible' ? 'API key (optional)' : 'API key', 'password', this._apiKey, savedKey ? 'Saved key — leave blank to keep it' : 'Enter your provider API key', value => this._apiKey = value]);
@@ -4171,6 +4174,7 @@ class PowerSyncAIPlanExplanation extends HTMLElement {
       input.id = id;
       input.type = type;
       input.value = value;
+      if (id === 'local-timeout') { input.min = '30'; input.max = '600'; input.step = '1'; }
       input.placeholder = placeholder;
       input.autocomplete = 'off';
       input.spellcheck = false;
@@ -4194,6 +4198,7 @@ class PowerSyncAIPlanExplanation extends HTMLElement {
       if (provider === 'local_openai_compatible') {
         values.ai_summary_local_endpoint = this._localEndpoint.trim();
         values.ai_summary_local_model = this._localModel.trim();
+        values.ai_summary_local_timeout = Number(this._localTimeout || 120);
       }
       if (this._apiKey.trim()) values.ai_summary_api_key = this._apiKey.trim();
       this._connectionAction('settings', values);
@@ -4424,6 +4429,7 @@ class PowerSyncAIPlanExplanation extends HTMLElement {
       const response = await this._hass.callApi('GET', this._optimizationPath());
       if (token !== this._statusToken) return;
       const status = response?.ai_summary;
+      this._summaryTimeoutSeconds = status?.client_timeout_seconds;
       if (response?.features?.ai_summary === false || !status) {
         this._state = 'unavailable';
       } else if (!status.configured || status.state === 'not_configured') {
@@ -4478,7 +4484,7 @@ class PowerSyncAIPlanExplanation extends HTMLElement {
           const error = new Error('AI summary response timed out');
           error.code = 'client_timeout';
           reject(error);
-        }, AI_SUMMARY_CLIENT_TIMEOUT_MS);
+        }, Math.min(605000, Math.max(35000, Number(this._aiSettings.ai_summary_client_timeout_seconds || this._summaryTimeoutSeconds) * 1000 || AI_SUMMARY_CLIENT_TIMEOUT_MS)));
       });
       let response;
       try {

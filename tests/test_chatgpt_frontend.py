@@ -944,3 +944,42 @@ def test_status_hydrates_untouched_fields_and_preserves_each_edited_field():
         card.disconnectedCallback();
       }
     """)
+
+
+def test_local_timeout_save_and_summary_watchdog_follow_server_budget():
+    _run_component_runtime(r"""
+      let savedTimeout;
+      const pending = deferred();
+      const local = { ...disconnected, settings: { ai_summary_provider: 'local_openai_compatible',
+        ai_summary_local_endpoint: 'http://127.0.0.1:11434/v1', ai_summary_local_model: 'local-model',
+        ai_summary_local_timeout: 120, ai_summary_client_timeout_seconds: 125, ai_summary_key_configured: true } };
+      const { card } = await setup(async (method, route, body) => {
+        if (route === 'power_sync/optimization') return { ...ready, ai_summary: { ...ready.ai_summary, client_timeout_seconds: 125 } };
+        if (route === 'power_sync/optimization/ai_summary') return pending.promise;
+        if (method === 'GET') return local;
+        savedTimeout = body.ai_summary_local_timeout;
+        return { ...local, settings: { ...local.settings, ai_summary_local_timeout: savedTimeout,
+          ai_summary_client_timeout_seconds: savedTimeout + 5 } };
+      });
+      openSettings(card);
+      const timeout = card.shadowRoot.getElementById('local-timeout');
+      expect(timeout.value == 120 && timeout.min === '30' && timeout.max === '600', 'timeout bounds/default missing');
+      input(card, 'local-timeout', '240');
+      const form = nodes(card).find(node => node.tag === 'form' && node.children.some(child => child.id === 'local-timeout'));
+      form.listeners.submit({ preventDefault() {} }); await settle();
+      expect(savedTimeout === 240, 'saved timeout was not a number');
+      const generation = card._generate(true); await settle();
+      expect([...timers.values()].some(timer => timer.delay === 245000), 'card timed out before local server budget');
+      pending.resolve({ success: true, summary: { headline: 'Local model finished' } }); await generation;
+      expect(card._state === 'content' && ![...timers.values()].some(timer => timer.delay === 245000), 'success did not clear timeout');
+      card.disconnectedCallback();
+      // Non-admin readers receive the same budget from the public plan status.
+      const wait = deferred();
+      const { card: reader } = await setup(async (method, route) => route === 'power_sync/optimization'
+        ? { ...ready, ai_summary: { ...ready.ai_summary, client_timeout_seconds: 605 } }
+        : wait.promise, false);
+      const task = reader._generate(true); await settle();
+      expect([...timers.values()].some(timer => timer.delay === 605000), 'non-admin reader lost configured timeout');
+      wait.resolve({ success: true, summary: { headline: 'Done' } }); await task;
+      reader.disconnectedCallback();
+    """)

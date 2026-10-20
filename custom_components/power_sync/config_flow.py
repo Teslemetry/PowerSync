@@ -70,7 +70,7 @@ from .flow_power import (
     has_custom_export_tiers,
     validate_flow_power_plan_selection,
 )
-from .optimization.ai_summary import AISummaryError, apply_ai_summary_settings, configured_openai_model
+from .optimization.ai_summary import AISummaryError, apply_ai_summary_settings, configured_openai_model, configured_local_timeout
 from .optimization.chatgpt_auth import get_chatgpt_auth
 from .amber_smartshift.flow import AmberSetupMixin, AmberOptionsMixin
 from .const import (
@@ -588,6 +588,7 @@ from .const import (
     CONF_OPTIMIZATION_AI_SUMMARY_CLEAR_API_KEY,
     CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_ENDPOINT,
     CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_MODEL,
+    CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_TIMEOUT,
     CONF_OPTIMIZATION_AI_SUMMARY_OPENROUTER_MODEL,
     CONF_OPTIMIZATION_AI_SUMMARY_OPENAI_MODEL,
     CONF_OPTIMIZATION_AI_SUMMARY_AUTO_REFRESH,
@@ -12062,6 +12063,7 @@ class PowerSyncOptionsFlow(AmberOptionsMixin, config_entries.OptionsFlow):
                 CONF_OPTIMIZATION_AI_SUMMARY_API_KEY,
                 CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_ENDPOINT,
                 CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_MODEL,
+                CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_TIMEOUT,
                 CONF_OPTIMIZATION_AI_SUMMARY_OPENROUTER_MODEL,
                 CONF_OPTIMIZATION_AI_SUMMARY_OPENAI_MODEL,
                 CONF_OPTIMIZATION_AI_SUMMARY_AUTO_REFRESH,
@@ -12087,6 +12089,7 @@ class PowerSyncOptionsFlow(AmberOptionsMixin, config_entries.OptionsFlow):
                         "ai_summary_local_endpoint": user_input.get(
                             CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_ENDPOINT, ""
                         ),
+                        "ai_summary_local_timeout": int(user_input.get(CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_TIMEOUT, configured_local_timeout(self.config_entry))),
                         "ai_summary_local_model": user_input.get(
                             CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_MODEL, ""
                         ),
@@ -12104,6 +12107,7 @@ class PowerSyncOptionsFlow(AmberOptionsMixin, config_entries.OptionsFlow):
                 new_data.pop(CONF_OPTIMIZATION_AI_SUMMARY_PROVIDER, None)
                 new_data.pop(CONF_OPTIMIZATION_AI_SUMMARY_API_KEY, None)
                 new_data.pop(CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_ENDPOINT, None)
+                new_data.pop(CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_TIMEOUT, None)
                 new_data.pop(CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_MODEL, None)
                 new_data.pop(CONF_OPTIMIZATION_AI_SUMMARY_OPENROUTER_MODEL, None)
                 new_data.pop(CONF_OPTIMIZATION_AI_SUMMARY_OPENAI_MODEL, None)
@@ -13027,6 +13031,7 @@ class PowerSyncOptionsFlow(AmberOptionsMixin, config_entries.OptionsFlow):
             CONF_OPTIMIZATION_AI_SUMMARY_CLEAR_API_KEY: False,
             CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_ENDPOINT: current_ai_local_endpoint,
             CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_MODEL: current_ai_local_model,
+            CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_TIMEOUT: configured_local_timeout(self.config_entry),
             CONF_OPTIMIZATION_AI_SUMMARY_OPENROUTER_MODEL: current_ai_openrouter_model,
             CONF_OPTIMIZATION_AI_SUMMARY_OPENAI_MODEL: current_ai_openai_model,
             CONF_OPTIMIZATION_AI_SUMMARY_AUTO_REFRESH: current_ai_auto_refresh,
@@ -13128,6 +13133,10 @@ class PowerSyncOptionsFlow(AmberOptionsMixin, config_entries.OptionsFlow):
                 CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_MODEL,
                 description={"suggested_value": current_ai_local_model} if current_ai_local_model else None,
             ): TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT)),
+            vol.Optional(
+                CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_TIMEOUT,
+                default=configured_local_timeout(self.config_entry),
+            ): NumberSelector(NumberSelectorConfig(min=30, max=600, step=1, mode=NumberSelectorMode.BOX, unit_of_measurement="s")),
             vol.Optional(
                 CONF_OPTIMIZATION_AI_SUMMARY_OPENROUTER_MODEL,
                 description={"suggested_value": current_ai_openrouter_model} if current_ai_openrouter_model else None,
@@ -13387,6 +13396,7 @@ class PowerSyncOptionsFlow(AmberOptionsMixin, config_entries.OptionsFlow):
                 CONF_OPTIMIZATION_AI_SUMMARY_CLEAR_API_KEY,
                 CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_ENDPOINT,
                 CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_MODEL,
+                CONF_OPTIMIZATION_AI_SUMMARY_LOCAL_TIMEOUT,
                 CONF_OPTIMIZATION_AI_SUMMARY_OPENROUTER_MODEL,
                 CONF_OPTIMIZATION_AI_SUMMARY_OPENAI_MODEL,
                 CONF_OPTIMIZATION_AI_SUMMARY_AUTO_REFRESH,
