@@ -25955,7 +25955,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             custom_tariff = entry.data.get("initial_custom_tariff")
         return custom_tariff if isinstance(custom_tariff, dict) else None
 
-    async def handle_sync_rest_api_check(check_name="manual") -> None:
+    async def handle_sync_rest_api_check(check_name="manual") -> bool | None:
         """Run a single TOU sync against the live (settled) price.
 
         Used by:
@@ -25980,7 +25980,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             return
 
         _LOGGER.info(f"⏰ TOU sync ({check_name})")
-        await _handle_sync_tou_internal(None, sync_mode='settled_price')
+        return await _handle_sync_tou_internal(None, sync_mode='settled_price')
 
     async def handle_sync_tou(call: ServiceCall) -> None:
         """Service handler for `power_sync.sync_tou` — manual user-triggered sync."""
@@ -26793,7 +26793,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         except Exception as e:
             _LOGGER.error(f"Error in FoxESS schedule sync: {e}", exc_info=True)
 
-    async def _handle_sync_tou_internal(websocket_data, sync_mode='settled_price') -> None:
+    async def _handle_sync_tou_internal(websocket_data, sync_mode='settled_price') -> bool | None:
         """Internal sync logic with price-aware de-dupe.
 
         Args:
@@ -28390,6 +28390,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     )
         else:
             _LOGGER.error("Failed to sync TOU schedule")
+        return success
 
     async def handle_sync_now(call: ServiceCall) -> None:
         """Handle the sync now service call."""
@@ -31356,6 +31357,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             # in-process retry that was scheduled for it died with that
             # process, and nothing else will ever pick it up.
             if persisted_pending_restore:
+                hass.data[DOMAIN][entry.entry_id][
+                    "optimizer_force_restart_restore_pending"
+                ] = True
                 _LOGGER.warning(
                     "Completing an unfinished Tesla restore from a previous "
                     "run (%s)",
@@ -31373,6 +31377,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                                 )
                             ),
                             "source": "startup_pending_restore",
+                            "_force_restore": True,
                         })),
                         blocking=True,
                     )
@@ -31444,6 +31449,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         (entry_service_data(entry.entry_id, service_data)),
                         blocking=True,
                     )
+                    # A Tesla handler can return normally after preserving an
+                    # incomplete restore and scheduling a cooldown-aware retry.
+                    # Service completion alone must not release startup ownership.
+                    if active_battery_system == "tesla":
+                        entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+                        if (
+                            entry_data.get("pending_tesla_restore")
+                            or force_charge_state.get("active")
+                            or force_discharge_state.get("active")
+                        ):
+                            return False
                     return True
                 except Exception as err:
                     if coordinator is None:
@@ -37326,6 +37342,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 if not (
                     force_charge_state.get("active")
                     or force_discharge_state.get("active")
+                    or hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get(
+                        "pending_tesla_restore"
+                    )
                 ):
                     _LOGGER.debug(
                         "Tesla restore retry skipped; force state is no longer active"
@@ -37347,6 +37366,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     SERVICE_RESTORE_NORMAL,
                     (entry_service_data(entry.entry_id, {
                         "_restore_retry": next_retry,
+                        "_force_restore": True,
                         "_allow_monitoring_restore": True,
                         "_skip_backup_reserve_restore": (
                             skip_backup_reserve_restore
@@ -38494,9 +38514,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 hass.data.setdefault(DOMAIN, {}).setdefault(entry.entry_id, {})[
                     "_allow_force_restore_tou_sync_once"
                 ] = "restore_normal is replacing an active PowerSync force tariff"
-                await hass.services.async_call(DOMAIN, SERVICE_SYNC_TOU, {}, blocking=True)
+                tariff_restored = await handle_sync_rest_api_check(
+                    check_name="restore normal"
+                )
                 if _restore_superseded("TOU sync"):
                     return
+                if tariff_restored is not True:
+                    _mark_tesla_restore_failed("dynamic tariff restore did not verify")
             elif saved_tariff:
                 # Non-dynamic users - restore saved tariffs per site
                 _LOGGER.info("Restoring saved tariffs...")
@@ -38927,6 +38951,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 _clear_hold_soc_state()
 
             await persist_pending_tesla_restore(None)
+            if _restore_superseded("restore completion"):
+                return
+            hass.data[DOMAIN][entry.entry_id][
+                "optimizer_force_restart_restore_pending"
+            ] = False
 
             _LOGGER.info("NORMAL OPERATION RESTORED")
 

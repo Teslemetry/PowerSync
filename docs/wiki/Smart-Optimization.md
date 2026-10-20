@@ -114,6 +114,12 @@ cannot block an eligible export today.
 The battery's own backup reserve. PowerSync restores this value after temporary
 hold or force-control modes.
 
+For Tesla sites, restoration also requires the normal tariff upload to verify.
+If an upload is throttled or a setting cannot be confirmed, PowerSync retains
+cleanup for retry. After a restart, Smart Optimization waits for that cleanup
+to finish; a 30-second startup warning means that optimisation attempt was
+skipped while restoration remains pending. Tesla/Teslemetry cooldowns still apply.
+
 ### Timed manual controls in the Action Plan
 
 When an external PowerSync control is active — Force Charge, Force Discharge,

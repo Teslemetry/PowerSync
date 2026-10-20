@@ -676,7 +676,7 @@ def test_restore_normal_suppresses_tesla_force_toggle_during_dynamic_sync():
     assert '"_allow_monitoring_tou_sync_once"' in restore_source
     assert "restore_was_force_discharging" in restore_source
     assert 'force_discharge_state["active"] = False' in restore_source
-    assert "SERVICE_SYNC_TOU" in restore_source
+    assert "tariff_restored = await handle_sync_rest_api_check(" in restore_source
     assert '"_suppress_force_mode_toggle_once"' in sync_source
     assert '"_allow_monitoring_tou_sync_once"' in sync_source
     assert "Allowing one Tesla TOU sync during restore cleanup" in sync_source
@@ -2790,6 +2790,7 @@ def test_native_persisted_cleanup_retries_readiness_and_restore_failure():
 
     namespace = {
         "Any": object,
+        "active_battery_system": "native",
         "DOMAIN": "power_sync",
         "SERVICE_RESTORE_NORMAL": "restore_normal",
         "_LOGGER": SimpleNamespace(
@@ -3679,7 +3680,7 @@ def test_tesla_dynamic_restore_bypasses_active_force_tariff_defer_once():
     dynamic_restore = restore_source[dynamic_start:dynamic_end]
     assert override_key in dynamic_restore
     assert dynamic_restore.index(override_key) < dynamic_restore.index(
-        "await hass.services.async_call(DOMAIN, SERVICE_SYNC_TOU"
+        "await handle_sync_rest_api_check("
     )
     assert '.pop("_allow_force_restore_tou_sync_once", None)' in sync_source
     assert (
