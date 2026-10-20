@@ -30725,6 +30725,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         force_discharge_state["_skip_backup_reserve_restore"] = bool(
             persisted_force_state.get("_skip_backup_reserve_restore")
         )
+        force_discharge_state["command_status"] = persisted_force_state.get("command_status")
 
     # Hold-SoC mode: brand-specific battery movement suppression. Some brands
     # can block both directions; others only block discharge while still
@@ -31257,6 +31258,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 ),
                 "source": force_discharge_state.get("source", "user"),
                 "scope": force_discharge_state.get("scope", "external"),
+                "command_status": force_discharge_state.get("command_status"),
                 "started_at": (
                     force_discharge_state["started_at"].isoformat()
                     if isinstance(force_discharge_state.get("started_at"), datetime)
@@ -34587,6 +34589,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 force_discharge_state["source"] = source
                 force_discharge_state["scope"] = "external"
                 force_discharge_state["commitment_eligible"] = False
+                force_discharge_state["command_status"] = "restore_pending"
                 force_discharge_state["expires_at"] = dt_util.utcnow() + timedelta(
                     minutes=2
                 )
@@ -34601,6 +34604,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 )
                 try:
                     await persist_force_mode_state()
+                    async_dispatcher_send(hass, f"{DOMAIN}_force_discharge_state", {
+                        "active": True,
+                        "expires_at": force_discharge_state["expires_at"].isoformat(),
+                        "command_status": "restore_pending",
+                    })
                     await hass.services.async_call(
                         DOMAIN,
                         SERVICE_RESTORE_NORMAL,
@@ -38897,6 +38905,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             force_discharge_state["commitment_eligible"] = False
             force_discharge_state["source"] = "user"
             force_discharge_state["_skip_backup_reserve_restore"] = False
+            force_discharge_state.pop("command_status", None)
 
             # Clear charge state
             force_charge_state["active"] = False
