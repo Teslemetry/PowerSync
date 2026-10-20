@@ -50,6 +50,8 @@ from .const import (
     FLOW_POWER_KWATCH_REGIONS,
     CONF_FLEET_API_BASE_URL,
     CONF_MONITORING_MODE,
+    CONF_DAILY_SUPPLY_CHARGE,
+    CONF_MONTHLY_SUPPLY_CHARGE,
     CONF_POWERSYNC_CLIENT_INSTANCE_ID,
     TESLA_SITE_INFO_CACHE_TTL_SECONDS,
     CONF_SIGENERGY_CHARGER_ENABLED,
@@ -2694,25 +2696,47 @@ class AmberUsageCoordinator:
         ]
 
     def _daily_supply_fee(self, date_str: str) -> float:
-        """Calculate the daily supply fee for a given date.
+        """Use the saved daily charge, falling back to a prorated monthly fee.
 
-        Pro-rates the monthly fee by the actual number of days in that month
-        so monthly totals always sum to exactly the monthly fee.
+        Read the current entry so API settings saves that skip integration
+        reloads also update usage summaries. An explicit daily zero is valid.
         """
-        if self._monthly_supply_fee <= 0:
+        entry = self.hass.config_entries.async_get_entry(self._entry_id)
+        options = entry.options if entry else {}
+        data = entry.data if entry else {}
+        daily = options.get(CONF_DAILY_SUPPLY_CHARGE, data.get(CONF_DAILY_SUPPLY_CHARGE))
+        try:
+            if not isinstance(daily, bool):
+                value = float(daily)
+                if math.isfinite(value) and value >= 0:
+                    return value
+        except (ValueError, TypeError):
+            pass
+
+        monthly = options.get(
+            CONF_MONTHLY_SUPPLY_CHARGE,
+            data.get(CONF_MONTHLY_SUPPLY_CHARGE, self._monthly_supply_fee),
+        )
+        try:
+            if isinstance(monthly, bool):
+                return 0.0
+            monthly = float(monthly)
+        except (ValueError, TypeError):
+            return 0.0
+        if not math.isfinite(monthly) or monthly <= 0:
             return 0.0
         import calendar
         try:
             d = date.fromisoformat(date_str)
             days_in_month = calendar.monthrange(d.year, d.month)[1]
-            return self._monthly_supply_fee / days_in_month
+            return monthly / days_in_month
         except (ValueError, TypeError):
-            return self._monthly_supply_fee / 30.0
+            return monthly / 30.0
 
     def _aggregate(self, days: list[DayUsage]) -> dict[str, Any]:
         """Aggregate a list of DayUsage into a summary dict.
 
-        Includes the daily supply fee (pro-rated from monthly) in the totals.
+        Includes the configured daily supply fee in the totals.
         """
         if not days:
             return {
