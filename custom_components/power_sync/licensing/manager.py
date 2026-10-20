@@ -114,6 +114,10 @@ class HALicenseManager(LicenseRuntime):
         state["generation"] = state.get("generation", 0) + 1
         state["unloaded"] = True
 
+    def entry_loaded(self, entry_id):
+        """Reopen a loaded entry without readmitting work from its retired optimizer."""
+        self.entries.setdefault(entry_id, {})["unloaded"] = False
+
     def _stop(self, _event):
         self.admission.suspend()  # Fence queued commands before HA shuts down.
         if self._task:

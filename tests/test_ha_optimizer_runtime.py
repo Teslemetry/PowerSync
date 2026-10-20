@@ -478,3 +478,26 @@ def test_shadow_subscription_denial_does_not_invent_a_future_resume_requirement(
         h.policy=rollout();await h.client.maintain(force=True)
         assert h.client.permits('one') and not h.client.status('one')['requires_resume']
     asyncio.run(run())
+
+
+@pytest.mark.parametrize('blocked_by', ['resume', 'recovery', 'denial', 'storage', 'permission'])
+def test_loaded_entry_keeps_remaining_access_and_recovery_gates(blocked_by):
+    async def run():
+        h=Harness();await h.activate()
+        h.client.entries={'one':{'generation':4,'unloaded':True},
+                          'two':{'generation':7,'unloaded':True}}
+        if blocked_by in ('resume','recovery'):
+            h.client.entries['one']['resume_required']=True
+            if blocked_by=='recovery':h.client.entries['one']['recovery_pending']=True
+        elif blocked_by=='denial':
+            h.denied=True;h.revision=2;await h.client.maintain(force=True)
+        elif blocked_by=='storage':
+            h.client.storage_ok=False
+        else:
+            h.client.admission.permission=None
+        before=copy.deepcopy(h.client.entries['one'])
+        manager_method('entry_loaded')(h.client,'one')
+        assert h.client.entries['one']=={**before,'unloaded':False}
+        assert h.client.entries['two']=={'generation':7,'unloaded':True}
+        assert not h.client.permits('one') and not h.client.permits('two')
+    asyncio.run(run())

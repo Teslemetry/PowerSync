@@ -149,3 +149,109 @@ def test_translations_render_the_actual_placeholders():
     assert "Resume required: False" not in rendered
     assert "Not started" not in rendered
     assert "No Resume action is needed" in rendered
+
+
+def setup_licensing(manager):
+    """Run setup's licensing lifecycle hooks, with unrelated HA setup excluded."""
+    from copy import deepcopy
+
+    tree = ast.parse((COMPONENT / "__init__.py").read_text())
+    function = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "async_setup_entry")
+    function = deepcopy(function)
+    hooks = []
+    for node in function.body:
+        value = getattr(node, "value", None)
+        if isinstance(value, ast.Await):
+            value = value.value
+        if isinstance(value, ast.Call) and (
+            isinstance(value.func, ast.Name) and value.func.id == "async_get_manager"
+            or isinstance(value.func, ast.Attribute) and value.func.attr == "entry_loaded"
+        ):
+            hooks.append(node)
+    function.body = hooks + [ast.Return(value=ast.Constant(value=True))]
+    namespace = dict(HomeAssistant=object, ConfigEntry=object, license_manager=manager,
+                     async_get_manager=AsyncMock(return_value=manager))
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])), "__init__.py", "exec"), namespace)
+    return namespace[function.name]
+
+
+def switch_turn_on(monkeypatch, runtime):
+    """Execute the real switch guard and option writes without loading all HA platforms."""
+    import logging
+
+    package = "_ha_access_flow_tests"
+    monkeypatch.setitem(sys.modules, package + ".licensing.runtime", runtime)
+    exceptions = ModuleType("homeassistant.exceptions")
+    exceptions.HomeAssistantError = type("HomeAssistantError", (Exception,), {})
+    monkeypatch.setitem(sys.modules, exceptions.__name__, exceptions)
+    tree = ast.parse((COMPONENT / "switch.py").read_text())
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "OptimizationEnabledSwitch")
+    method = next(node for node in cls.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "async_turn_on")
+    namespace = dict(__package__=package, Any=object, _LOGGER=logging.getLogger(__name__),
+                     CONF_OPTIMIZATION_PROVIDER="optimization_provider", OPT_PROVIDER_POWERSYNC="powersync",
+                     CONF_OPTIMIZATION_ENABLED="optimization_enabled")
+    exec(compile(ast.Module(body=[method], type_ignores=[]), "switch.py", "exec"), namespace)
+    return namespace[method.name]
+
+
+@pytest.mark.parametrize("source", ["trial", "billing_pending", "paid"])
+@pytest.mark.parametrize("disabled_options", [
+    {"optimization_enabled": False, "optimization_provider": "powersync"},
+    {"optimization_enabled": True, "optimization_provider": "native"},
+])
+def test_refresh_resume_and_switch_after_reload_without_optimizer(monkeypatch, source, disabled_options):
+    from unittest.mock import Mock
+    import test_ha_optimizer_runtime as rt
+
+    async def run():
+        h = rt.Harness()
+        await h.activate()
+        manager = h.client
+        entry = SimpleNamespace(entry_id="one", domain="power_sync", data={}, options=disabled_options.copy())
+        update = Mock()
+        hass = SimpleNamespace(data={rt.runtime.DATA_KEY: manager},
+                               config_entries=SimpleNamespace(async_get_entry=lambda _: entry, async_update_entry=update))
+        manager.hass = hass
+        manager.entry_loaded = lambda entry_id: rt.manager_method("entry_loaded")(manager, entry_id)
+        manager.coordinators = {}
+        manager.entries["one"] = {"generation": 1}
+        old_owner = SimpleNamespace(hass=hass, entry_id="one", _licensing_entry_generation=1)
+        writes = []
+
+        @rt.guard.optimizer_work
+        async def stale_work(owner):
+            writes.append("old control")
+
+        # Unload fences the retired optimizer; disabled/native setup has no new
+        # optimizer to attach. Both states must still allow the HA switch later.
+        rt.manager_method("detach")(manager, "one")
+        generation = manager.entries["one"]["generation"]
+        assert manager.entries["one"]["unloaded"]
+        assert await stale_work(old_owner) is False
+        assert await setup_licensing(manager)(hass, entry)
+
+        async def request(path, body):
+            if path == "/policy":
+                return {"policy": rt.sign(h.policy, "PSHP1")}
+            assert path == "/refresh"
+            return {"permission": rt.sign({**rt.fixture["claims"],
+                "installation_id": manager.installation_id, "entitlement_revision": 2, "source_state": source})}
+
+        manager._request = request
+        manager.reconcile_entries = lambda: rt.manager_method("reconcile_entries")(manager)
+        manager.resume_entry = lambda entry_id: rt.manager_method("resume_entry")(manager, entry_id)
+        flow = SimpleNamespace(hass=hass, config_entry=entry, async_show_form=lambda **kwargs: kwargs)
+        step = flow_method(monkeypatch, manager)
+        assert not (await step(flow, {"action": "refresh"}))["errors"]
+        assert not (await step(flow, {"action": "resume"}))["errors"]
+        switch = SimpleNamespace(hass=hass, _entry=entry, _attr_is_on=False, async_write_ha_state=Mock())
+        await switch_turn_on(monkeypatch, rt.runtime)(switch)
+        assert switch._attr_is_on
+        assert update.call_args.kwargs["options"]["optimization_enabled"] is True
+        assert update.call_args.kwargs["options"]["optimization_provider"] == "powersync"
+        assert manager.status("one")["can_optimize"]
+        assert manager.entries["one"]["generation"] == generation
+        assert await stale_work(old_owner) is False
+        assert writes == []
+
+    asyncio.run(run())

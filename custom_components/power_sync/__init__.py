@@ -45483,7 +45483,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Register HTTP endpoints for Smart Optimization
     from .licensing.views import LicensingStatusView, licensing_status
     from .licensing.manager import async_get_manager
-    await async_get_manager(hass)
+    license_manager = await async_get_manager(hass)
     hass.http.register_view(LicensingStatusView(hass))
     hass.http.register_view(OptimizationView(hass))
     hass.http.register_view(OptimizationSettingsView(hass))
@@ -45510,6 +45510,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # a reconnect task; Fleet API and PowerSync Cloud remain REST-backed.
     if tesla_coordinator:
         tesla_coordinator.async_start_teslemetry_stream()
+
+    # Disabled/native setups do not attach an optimizer, but the loaded entry
+    # must still be eligible for the user's next Smart Optimization enable.
+    license_manager.entry_loaded(entry.entry_id)
 
     _LOGGER.info("=" * 60)
     _LOGGER.info("PowerSync integration setup complete!")
