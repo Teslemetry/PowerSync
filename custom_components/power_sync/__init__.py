@@ -38643,7 +38643,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     should_restore_reserve = True
                     if was_discharging:
                         try:
-                            coordinator = hass.data[DOMAIN][entry.entry_id].get("coordinator")
+                            coordinator = hass.data[DOMAIN][entry.entry_id].get("tesla_coordinator")
                             if coordinator and coordinator.data:
                                 current_soc = coordinator.data.get("battery_level", 100)
                                 if current_soc < saved_backup_reserve:

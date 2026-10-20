@@ -22,6 +22,68 @@ def extract(path, name, env):
     return env[name]
 
 
+@pytest.mark.parametrize('soc,saved,was_discharging,expected', [
+    (80, 100, True, []),  # Failed discharge pulse; cleanup must not trigger charging.
+    (0, 1, True, []),
+    (80, 20, True, [20]),
+    (20, 20, True, [20]),
+    (80, None, True, []),
+    (80, 100, False, [100]),  # Preserve the separate charge-restore contract.
+])
+def test_discharge_cleanup_checks_tesla_soc_before_emitting_reserve_pulse(
+    soc, saved, was_discharging, expected,
+):
+    """Exercise saved-state selection and the final actuator with setup's real key."""
+    tree = ast.parse((ROOT / '__init__.py').read_text())
+    restore = next(n for n in ast.walk(tree)
+                   if isinstance(n, ast.AsyncFunctionDef) and n.name == 'handle_restore_normal')
+    site_loop = next(n for n in ast.walk(restore) if isinstance(n, ast.For)
+                     and any(isinstance(s, ast.Assign)
+                             and any(isinstance(t, ast.Name) and t.id == 'saved_backup_reserve'
+                                     for t in s.targets) for s in n.body))
+    start = next(i for i, n in enumerate(site_loop.body) if isinstance(n, ast.Assign)
+                 and any(isinstance(t, ast.Name) and t.id == 'saved_backup_reserve'
+                         for t in n.targets))
+    end = next(i for i, n in enumerate(site_loop.body) if isinstance(n, ast.Assign)
+               and any(isinstance(t, ast.Name) and t.id == 'saved_export_rule'
+                       for t in n.targets))
+    pulse_loop = next(n for n in ast.walk(restore) if isinstance(n, ast.For)
+                      and isinstance(n.iter, ast.Name) and n.iter.id == 'restore_reserve_targets')
+    body = site_loop.body[start:end] + [pulse_loop]
+    function = ast.AsyncFunctionDef(
+        name='run_restore', args=ast.arguments(posonlyargs=[], args=[ast.arg(arg='site_id')], kwonlyargs=[],
+                                             kw_defaults=[], defaults=[]),
+        body=body, decorator_list=[],
+    )
+    writes = []
+
+    async def pulse(configs, target, **kwargs):
+        assert kwargs['is_current']()
+        writes.append(target)
+        return {'confirmed_sites': [c[0] for c in configs]}
+
+    site = ('site-a', 'fake-token', 'fleet')
+    # Setup stores Tesla telemetry here; a generic coordinator is not registered.
+    hass = NS(data={'power_sync': {'entry': {
+        'tesla_coordinator': NS(data={'battery_level': soc}),
+    }}})
+    env = dict(hass=hass, entry=NS(entry_id='entry'), DOMAIN='power_sync',
+               site_id=site[0], current_token=site[1], provider=site[2], site_configs=[site],
+               discharge_saved={site[0]: {'saved_backup_reserve': saved}}, charge_saved={},
+               force_discharge_state={'saved_backup_reserve': saved}, force_charge_state={},
+               restore_was_hold_soc=False, restore_was_force_discharging=was_discharging,
+               restore_reserve_targets=[], _normalize_tesla_backup_reserve_percent=int,
+               _tesla_force_pulse_backup_reserve=pulse, _restore_superseded=lambda _: False,
+               _command_generation=[1], _restore_generation=1,
+               _tesla_reserve_generation=[1], _restore_reserve_generation=1,
+               _tesla_force_result_all_confirmed=lambda result, configs: True,
+               _LOGGER=logging.getLogger(__name__))
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])),
+                 '<tesla restore reserve path>', 'exec'), env)
+    asyncio.run(env['run_restore'](site[0]))
+    assert writes == expected
+
+
 @pytest.mark.parametrize('offset,cloud,age,pending', [
     (5, 20, 1800, None),  # Reported variant: stale poll corrupts known offset.
     (None, 20, 1800, None),  # Independent first-write bootstrap defect.
