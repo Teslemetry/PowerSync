@@ -2836,6 +2836,7 @@
         "title": "Weather & solar forecast",
         "description": "Update weather automations and solar forecasting settings. Changes take effect immediately.",
         "data": {
+          "no_solar_installed": "No solar installed",
           "weather_location": "Weather location",
           "openweathermap_api_key": "OpenWeatherMap API key",
           "weather_entity": "Home Assistant weather entity",
@@ -2846,6 +2847,7 @@
           "solcast_estimate_type": "Solcast estimate"
         },
         "data_description": {
+          "no_solar_installed": "Tick if your property has no solar panels. PowerSync plans with zero solar and does not warn about missing solar forecasts. Saved forecast settings are kept for future use.",
           "weather_location": "Suburb, city, postcode, or lat,lon coordinates (e.g. 'Melbourne', '3000', '-37.81,144.96'). Leave blank to auto-detect from timezone.",
           "openweathermap_api_key": "Free API key from openweathermap.org for weather-based automations (sunny, cloudy, rain, snow, and storm triggers). Leave blank to disable.",
           "weather_entity": "Optional. Used for temperature-aware load forecasting if Home Assistant has a weather entity. Leave blank when using OpenWeatherMap.",

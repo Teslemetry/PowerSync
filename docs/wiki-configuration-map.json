@@ -9,13 +9,13 @@
   },
   "source_state": {
     "components": {
-      "config_flow.py": "425add48ca988085cb2e1e8cd67eecab6c491610e5d393db4e85cb4089646555",
-      "const.py": "1665db9908d53b8b4a9ec2a7b51a3903a40edaf89676ca215460ee26c246b7a9",
+      "config_flow.py": "a0795d0e9f959f58460b1e829789740f7be5c366b4ddfc4fe9bcc7ada3bbc26f",
+      "const.py": "7653ed830e362798fd8e90cd467368c0df977b60106dff9d559552b0a4f8b138",
       "battery_backend/profiles.py": "b192164b20cc0b39ce23580a4a90ade9279d281f1f9e692158aa9a3a31a396b3",
       "battery_backend/discovery.py": "3a8c88c00d6c57f6101d55056968524d7971d1ac3b8e16365923bca978f9489b",
       "settings_metadata.py": "7d942632666c27c60793ce26cc5bb0a783721a5347863aca4c5e4e8a5a18b0e7",
-      "strings.json": "cdd04643461f29349c16b110c87c3209a999cccd1f6a9645b12e7cd012a4a1d8",
-      "translations/en.json": "a8e1071edc58bb95f6f2ff0453450f14fd677b4fbfe2926c7cf2b3f47a8232c5",
+      "strings.json": "6c9bae04d1daad32c2fb0d943a01d010b5ffc4274c967744f6dbc2e86f7afbb5",
+      "translations/en.json": "c59477ae1576384321e100317ad1978043e85e59228bbe1208b41c1cf715f0a1",
       "services.yaml": "9bd8e8245778ead339f8f452760f20bb6c0a4da95fd8b3274e60938fe00c3608",
       "switch.py": "11aa8bac614b33f6d45d8402cd7a532e18aab2300549d5cfe3b0ece678d4fd41",
       "select.py": "78e64714e13add7ee5fc36c475597e42be4fb241b7268fac5aff93203e9eb0eb",
@@ -996,6 +996,7 @@
       "options.tesla_connection.update_teslemetry_token": "New API token (leave blank to keep current)",
       "options.tesla_site.tesla_energy_site_id": "Tesla energy site",
       "options.teslemetry_token.teslemetry_api_token": "API token",
+      "options.weather_options.no_solar_installed": "No solar installed",
       "options.weather_options.openweathermap_api_key": "OpenWeatherMap API key",
       "options.weather_options.solar_forecast_provider": "Solar forecast provider",
       "options.weather_options.solcast_api_key": "Solcast API key",
@@ -8617,6 +8618,16 @@
       "source_line": 14620,
       "group": null,
       "rendering": "shown when Tesla has no saved energy site; validated account sites only"
+    },
+    {
+      "scope": "options",
+      "form": "weather_options",
+      "field": "no_solar_installed",
+      "label": "No solar installed",
+      "page": "Weather-and-Solar-Forecasts.md",
+      "source_line": 15500,
+      "group": null,
+      "rendering": "existing-installation weather and solar settings"
     }
   ],
   "profiles": [
@@ -12671,6 +12682,10 @@
     },
     "options.optimization.optimization_ai_summary_local_timeout": {
       "page": "Optimization-Settings",
+      "status": "documented"
+    },
+    "options.weather_options.no_solar_installed": {
+      "page": "Weather-and-Solar-Forecasts",
       "status": "documented"
     }
   }

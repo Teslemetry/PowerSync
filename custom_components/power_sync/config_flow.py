@@ -503,6 +503,7 @@ from .const import (
     SIGENERGY_CHARGER_TYPES,
     SIGENERGY_CHARGER_EVAC,
     # Solcast Solar Forecast configuration
+    CONF_NO_SOLAR_INSTALLED,
     CONF_SOLAR_FORECAST_PROVIDER,
     DEFAULT_SOLAR_FORECAST_PROVIDER,
     SOLAR_FORECAST_PROVIDERS,
@@ -15439,6 +15440,7 @@ class PowerSyncOptionsFlow(AmberOptionsMixin, config_entries.OptionsFlow):
 
             # Store weather and Solcast settings
             weather_options = {
+                CONF_NO_SOLAR_INSTALLED: user_input.get(CONF_NO_SOLAR_INSTALLED, False),
                 CONF_WEATHER_LOCATION: user_input.get(CONF_WEATHER_LOCATION, ""),
                 CONF_OPENWEATHERMAP_API_KEY: user_input.get(
                     CONF_OPENWEATHERMAP_API_KEY, ""
@@ -15460,6 +15462,7 @@ class PowerSyncOptionsFlow(AmberOptionsMixin, config_entries.OptionsFlow):
             }
             self._remove_legacy_data_keys(
                 (
+                    CONF_NO_SOLAR_INSTALLED,
                     CONF_SOLCAST_ENABLED,
                     CONF_SOLCAST_API_KEY,
                     CONF_SOLCAST_RESOURCE_ID,
@@ -15493,6 +15496,10 @@ class PowerSyncOptionsFlow(AmberOptionsMixin, config_entries.OptionsFlow):
             return await self.async_step_ev_charging()
 
         schema_dict: dict[vol.Marker, Any] = {
+            vol.Optional(
+                CONF_NO_SOLAR_INSTALLED,
+                default=self._get_option(CONF_NO_SOLAR_INSTALLED, False),
+            ): BooleanSelector(),
             vol.Optional(
                 CONF_WEATHER_LOCATION,
                 default=self._get_option(CONF_WEATHER_LOCATION, ""),

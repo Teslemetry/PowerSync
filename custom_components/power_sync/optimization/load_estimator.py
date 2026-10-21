@@ -1642,6 +1642,7 @@ class SolcastForecaster:
         interval_minutes: int = 5,
         estimate_type: str = DEFAULT_SOLCAST_ESTIMATE_TYPE,
         provider_preference: str = DEFAULT_SOLAR_FORECAST_PROVIDER,
+        no_solar_installed: bool = False,
     ):
         """
         Initialize Solcast forecaster.
@@ -1653,6 +1654,7 @@ class SolcastForecaster:
             estimate_type: Solcast estimate to use: estimate, estimate10, or estimate90
             provider_preference: Preferred forecast source
         """
+        self.no_solar_installed = no_solar_installed is True
         self.hass = hass
         self.solcast_entity = solcast_entity
         self.interval_minutes = interval_minutes
@@ -1737,6 +1739,10 @@ class SolcastForecaster:
             start_time = dt_util.now()
 
         n_intervals = horizon_hours * 60 // self.interval_minutes
+
+        if getattr(self, "no_solar_installed", False):
+            self.last_forecast_source = "no_solar_installed"
+            return [0.0] * n_intervals
 
         for provider in self._provider_order():
             if provider == SOLAR_FORECAST_PROVIDER_SOLCAST:

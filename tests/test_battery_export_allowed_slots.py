@@ -13450,3 +13450,19 @@ def test_solar_export_hold_ignores_grid_charging_before_the_hold(opt_module):
     )
 
     assert revised == held
+
+
+def test_confirmed_no_solar_site_suppresses_missing_forecast_warning(opt_module):
+    coordinator = _coordinator(opt_module, "octopus")
+    coordinator._solar_forecaster = SimpleNamespace(
+        no_solar_installed=True, last_forecast_source="no_solar_installed"
+    )
+    coordinator._has_solar_forecast = False
+    assert coordinator._get_warnings() == []
+    coordinator._record_solar_forecast_availability([0.0, 0.0])
+    assert coordinator._get_warnings() == []
+
+    coordinator._solar_forecaster.no_solar_installed = False
+    coordinator._solar_forecaster.last_forecast_source = None
+    coordinator._record_solar_forecast_availability([0.0, 0.0])
+    assert [warning["type"] for warning in coordinator._get_warnings()] == ["no_solar_forecast"]

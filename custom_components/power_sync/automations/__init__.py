@@ -14,6 +14,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 
 from ..const import (
+    CONF_NO_SOLAR_INSTALLED,
     CONF_SOLAR_FORECAST_PROVIDER,
     CONF_SOLCAST_ESTIMATE_TYPE,
     CONF_ZAPTEC_STANDALONE_ENABLED,
@@ -1423,6 +1424,10 @@ class AutomationEngine:
             interval_minutes=30,
             estimate_type=estimate_type,
             provider_preference=provider,
+            no_solar_installed=self._config_entry.options.get(
+                CONF_NO_SOLAR_INSTALLED,
+                self._config_entry.data.get(CONF_NO_SOLAR_INSTALLED, False),
+            ) is True,
         )
         forecast = await forecaster.get_daily_summary()
         if not forecast.get("source"):

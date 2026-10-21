@@ -49,6 +49,7 @@ def test_solcast_builtin_config_requires_enabled_key_and_resource_id():
     ast.fix_missing_locations(module)
     namespace = {
         "Any": object,
+        "CONF_NO_SOLAR_INSTALLED": "no_solar_installed",
         "CONF_SOLCAST_ENABLED": "solcast_enabled",
         "CONF_SOLCAST_API_KEY": "solcast_api_key",
         "CONF_SOLCAST_RESOURCE_ID": "solcast_resource_id",

@@ -544,6 +544,7 @@ from .const import (
     DEFAULT_GLOBIRD_ZEROCHARGE_END,
     DEFAULT_GLOBIRD_ZEROCHARGE_IMPORT_CAP_KWH,
     # Solcast solar forecasting
+    CONF_NO_SOLAR_INSTALLED,
     CONF_SOLAR_FORECAST_PROVIDER,
     DEFAULT_SOLAR_FORECAST_PROVIDER,
     SOLAR_FORECAST_PROVIDER_VOLCAST,
@@ -14487,6 +14488,7 @@ class CurrentWeatherView(HomeAssistantView):
 
 
 _SOLCAST_SETTINGS_KEYS = (
+    CONF_NO_SOLAR_INSTALLED,
     CONF_SOLCAST_ENABLED,
     CONF_SOLCAST_API_KEY,
     CONF_SOLCAST_RESOURCE_ID,
@@ -14534,7 +14536,8 @@ def _has_external_volcast_integration(hass: HomeAssistant) -> bool:
 def _solcast_builtin_configured(config: dict[str, Any]) -> bool:
     """Return whether PowerSync's own Solcast API polling is configured."""
     return bool(
-        config.get(CONF_SOLCAST_ENABLED)
+        config.get(CONF_NO_SOLAR_INSTALLED) is not True
+        and config.get(CONF_SOLCAST_ENABLED)
         and str(config.get(CONF_SOLCAST_API_KEY) or "").strip()
         and str(config.get(CONF_SOLCAST_RESOURCE_ID) or "").strip()
     )
@@ -14569,6 +14572,7 @@ class WeatherSolcastSettingsView(HomeAssistantView):
             return web.json_response({"success": False, "error": "Not configured"}, status=503)
 
         opts = {**entry.data, **entry.options}
+        no_solar_installed = opts.get(CONF_NO_SOLAR_INSTALLED) is True
         builtin_configured = _solcast_builtin_configured(opts)
         selected_provider = _normalize_solar_forecast_provider(
             opts.get(CONF_SOLAR_FORECAST_PROVIDER)
@@ -14595,7 +14599,9 @@ class WeatherSolcastSettingsView(HomeAssistantView):
         domain_data = self._hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
         solcast_init_error = domain_data.get("solcast_init_error") if isinstance(domain_data, dict) else None
         solcast_coord = domain_data.get("solcast_coordinator") if isinstance(domain_data, dict) else None
-        solar_forecast_active = bool(
+        if no_solar_installed:
+            solcast_source = "no_solar_installed"
+        solar_forecast_active = not no_solar_installed and bool(
             solcast_source != "none"
             or solcast_coord is not None
         )
@@ -14612,11 +14618,13 @@ class WeatherSolcastSettingsView(HomeAssistantView):
             "success": True,
             "weather_location": opts.get(CONF_WEATHER_LOCATION, ""),
             "openweathermap_api_key": opts.get(CONF_OPENWEATHERMAP_API_KEY, ""),
+            "no_solar_installed": no_solar_installed,
+            "no_solar_installed_supported": True,
             "solar_forecast_provider": selected_provider,
             "solar_forecast_source": solcast_source,
             "solar_forecast_active": solar_forecast_active,
             "solcast_enabled": (
-                builtin_configured
+                opts.get(CONF_SOLCAST_ENABLED, False) is True
                 or external_solcast
                 or (
                     selected_provider == SOLAR_FORECAST_PROVIDER_VOLCAST
@@ -14654,6 +14662,11 @@ class WeatherSolcastSettingsView(HomeAssistantView):
                 new_options[CONF_WEATHER_LOCATION] = data["weather_location"]
             if "openweathermap_api_key" in data:
                 new_options[CONF_OPENWEATHERMAP_API_KEY] = data["openweathermap_api_key"]
+            if "no_solar_installed" in data:
+                if type(data["no_solar_installed"]) is not bool:
+                    return web.json_response({"success": False, "error": "no_solar_installed must be a boolean"}, status=400)
+                new_options[CONF_NO_SOLAR_INSTALLED] = data["no_solar_installed"]
+                new_data.pop(CONF_NO_SOLAR_INSTALLED, None)
             if "solar_forecast_provider" in data:
                 new_options[CONF_SOLAR_FORECAST_PROVIDER] = _normalize_solar_forecast_provider(
                     data["solar_forecast_provider"]
@@ -23980,7 +23993,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     solcast_init_error: str | None = None
-    if solcast_integration_installed:
+    if entry.options.get(CONF_NO_SOLAR_INSTALLED, entry.data.get(CONF_NO_SOLAR_INSTALLED, False)) is True:
+        _LOGGER.info("No solar installed: skipping built-in solar forecast polling")
+    elif solcast_integration_installed:
         _LOGGER.info(
             "Solcast Solar integration detected - using its data instead of PowerSync's own coordinator "
             "(avoids double-polling API and exceeding rate limits)"

@@ -1755,3 +1755,42 @@ def test_get_forecast_offloads_history_build_to_executor(monkeypatch):
     assert "_forecast_from_history" in offloaded, (
         f"forecast build was not offloaded to the executor; saw {offloaded}"
     )
+
+
+def test_no_solar_installed_bypasses_all_forecast_providers(monkeypatch, caplog):
+    module = _load_estimator_module(monkeypatch)
+    forecaster = module.SolcastForecaster(
+        SimpleNamespace(), interval_minutes=5, no_solar_installed=True
+    )
+
+    def unexpected_provider_lookup():
+        raise AssertionError("A battery-only site must not query solar providers")
+
+    forecaster._provider_order = unexpected_provider_lookup
+    forecast = _run(forecaster.get_forecast(horizon_hours=24))
+    summary = _run(forecaster.get_daily_summary(horizon_hours=24))
+
+    assert forecast == [0.0] * 288
+    assert summary["today_kwh"] == 0.0
+    assert summary["tomorrow_kwh"] == 0.0
+    assert summary["source"] == "no_solar_installed"
+    assert not caplog.records
+
+
+def test_removing_no_solar_confirmation_restores_forecast_and_missing_warning(monkeypatch, caplog):
+    module = _load_estimator_module(monkeypatch)
+    forecaster = module.SolcastForecaster(
+        SimpleNamespace(), interval_minutes=30, no_solar_installed=True
+    )
+    forecaster._provider_order = lambda: ("open_meteo",)
+    forecaster._get_open_meteo_forecast = lambda start, count: [1500.0] * count
+    assert _run(forecaster.get_forecast(horizon_hours=1)) == [0.0, 0.0]
+
+    forecaster.no_solar_installed = False
+    assert _run(forecaster.get_forecast(horizon_hours=1)) == [1500.0, 1500.0]
+    assert forecaster.last_forecast_source == "open_meteo"
+
+    forecaster._get_open_meteo_forecast = lambda start, count: None
+    assert _run(forecaster.get_forecast(horizon_hours=1)) == [0.0, 0.0]
+    assert forecaster.last_forecast_source is None
+    assert any(record.levelname == "WARNING" for record in caplog.records)

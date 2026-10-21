@@ -4939,6 +4939,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Initialize solar forecaster
         from ..const import (
+            CONF_NO_SOLAR_INSTALLED,
             CONF_SOLAR_FORECAST_PROVIDER,
             CONF_SOLCAST_ESTIMATE_TYPE,
             DEFAULT_SOLAR_FORECAST_PROVIDER,
@@ -4967,6 +4968,12 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             interval_minutes=self._config.interval_minutes,
             estimate_type=solcast_estimate_type,
             provider_preference=solar_forecast_provider,
+            no_solar_installed=(
+                self._entry is not None and self._entry.options.get(
+                    CONF_NO_SOLAR_INSTALLED,
+                    self._entry.data.get(CONF_NO_SOLAR_INSTALLED, False),
+                ) is True
+            ),
         )
         await self._restore_solar_forecast_learning()
         await self._restore_battery_efficiency_learning()
@@ -15375,7 +15382,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         learner = getattr(self, "_solar_forecast_learner", None)
         forecaster = getattr(self, "_solar_forecaster", None)
         source = getattr(forecaster, "last_forecast_source", None)
-        if learner is None or not source or not solar_forecast:
+        if learner is None or not source or source == "no_solar_installed" or not solar_forecast:
             return
 
         data = self._get_energy_data() or {}
@@ -16886,7 +16893,10 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _get_warnings(self) -> list[dict[str, str]]:
         """Get active warnings for the optimizer."""
         warnings = []
-        if getattr(self, "_has_solar_forecast", None) is False:
+        no_solar_installed = getattr(
+            getattr(self, "_solar_forecaster", None), "no_solar_installed", False
+        )
+        if not no_solar_installed and getattr(self, "_has_solar_forecast", None) is False:
             warnings.append({
                 "type": "no_solar_forecast",
                 "title": "Solar Forecast Unavailable",
