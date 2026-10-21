@@ -80,14 +80,20 @@ def view(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('provider', ['teslemetry', 'none'])
-async def test_startup_registration_and_status_use_real_vehicle_credentials(view, provider):
+@pytest.mark.parametrize('provider,energy_provider,available,native_provider', [
+    ('teslemetry', 'powersync', True, 'teslemetry'),
+    ('none', 'powersync', True, 'powersync'),
+    ('none', 'teslemetry', False, 'none'),
+])
+async def test_startup_registration_and_status_use_real_vehicle_credentials(view, provider, energy_provider, available, native_provider):
     api, _, entry, calls = view
     entry.data['tesla_ev_api_provider'] = provider
+    entry.data['tesla_api_provider'] = energy_provider
     status, result = await api.get(request())
     assert api.url == '/api/power_sync/ev/native_solar'
     assert status == 200 and result['success']
-    assert result['entries'][0]['available'] is (provider == 'teslemetry')
+    assert result['entries'][0]['available'] is available
+    assert result['entries'][0]['provider'] == native_provider
     assert calls == []
     assert 'secret' not in str(result)
 
@@ -114,11 +120,9 @@ async def test_get_returns_uncertain_hold_without_any_vehicle_or_service_request
 
 
 @pytest.mark.asyncio
-async def test_powersync_fleet_metadata_never_contacts_cloud_or_tesla(view, monkeypatch):
-    api, _, _, calls = view
-    package = sys.modules['native_solar_api_probe']
-    monkeypatch.setattr(package, 'get_tesla_vehicle_api_token', lambda *args: (None, 'none'))
-    monkeypatch.setattr(package, 'get_tesla_api_token', lambda *args: ('psync-secret', 'powersync'))
+async def test_powersync_fleet_metadata_never_contacts_cloud_or_tesla(view):
+    api, _, entry, calls = view
+    entry.data.update(tesla_ev_api_provider='none', tesla_api_provider='powersync', teslemetry_api_token='psync-secret')
     status, result = await api.get(request())
     assert status == 200 and not calls
     assert result['entries'][0]['available']
