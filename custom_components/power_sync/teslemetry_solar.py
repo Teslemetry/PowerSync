@@ -1,6 +1,6 @@
 """Explicit native Tesla Charge on Solar control, with persistent EV ownership.
 
-No background polling: both the Teslemetry read and write can spend credits and
+No background polling: both provider reads and writes can spend credits and
 wake a vehicle. The hold is intentionally retained after an uncertain command.
 """
 from __future__ import annotations
@@ -27,20 +27,54 @@ def validate_settings(value):
     return {key: value[key] for key in ("enabled", "lowerChargeLimit", "upperChargeLimit")}
 
 
-async def request_settings(session, token, vin, settings=None):
+def native_solar_connection(hass, entry):
+    """Prefer the selected Teslemetry provider, otherwise PowerSync's Fleet key.
+
+    HA's separate Tesla Fleet integration cannot sign our custom command.
+    PowerSync Fleet uses the existing PowerSync energy-account credentials.
+    """
+    from . import get_tesla_vehicle_api_token, get_tesla_api_token
+    token, provider = get_tesla_vehicle_api_token(hass, entry)
+    if token and provider == "teslemetry":
+        return token, provider
+    token, provider = get_tesla_api_token(hass, entry)
+    if token and provider == "powersync":
+        return token, provider
+    return None, "none"
+
+
+async def request_settings(session, token, vin, settings=None, *, provider="teslemetry"):
     if not re.fullmatch(r"[A-HJ-NPR-Z0-9]{17}", vin):
         raise SolarError("A valid vehicle VIN is required")
-    url = f"https://api.teslemetry.com/api/1/vehicles/{vin}/custom_command/charge_on_solar"
+    if provider not in {"teslemetry", "powersync"}:
+        raise SolarError("Select PowerSync Fleet or Teslemetry for native Charge on Solar")
+    fleet = provider == "powersync"
+    label = "PowerSync Fleet" if fleet else "Teslemetry"
+    url = (f"https://api.powersync.cc/v1/vehicles/{vin}/native-solar" if fleet else
+           f"https://api.teslemetry.com/api/1/vehicles/{vin}/custom_command/charge_on_solar")
+    payload = {"action": "set" if settings is not None else "refresh", "provider": "fleet"} if fleet else None
+    if settings is not None:
+        validated = validate_settings(settings)
+        if fleet:
+            payload.update(settings=validated, confirm_eligible=validated["enabled"])
+        else:
+            payload = validated
     try:
         async with session.request(
-            "POST" if settings is not None else "GET", url,
+            "POST" if fleet or settings is not None else "GET", url,
             headers={"Authorization": f"Bearer {token}"},
-            **({"json": validate_settings(settings)} if settings is not None else {}),
-            timeout=45, allow_redirects=False,
+            **({"json": payload} if payload is not None else {}),
+            timeout=100 if fleet else 45, allow_redirects=False,
         ) as response:
             if response.status != 200:
-                raise SolarError(f"Teslemetry request failed (HTTP {response.status}); check connection, credits and vehicle compatibility")
+                raise SolarError(f"{label} request failed (HTTP {response.status}); check vehicle registration, connection, virtual-key pairing and compatibility")
             body = await response.json()
+        if fleet:
+            # PowerSync serializes write + readback in one DO request. Do not
+            # issue a second read: it would hit the shared paid-request cooldown.
+            if not isinstance(body, dict):
+                raise SolarError("PowerSync Fleet readback could not be confirmed")
+            return validate_settings(body.get("settings"))
         result = body.get("response") if isinstance(body, dict) else None
         if not isinstance(result, dict) or result.get("result") is False:
             raise SolarError("Teslemetry did not accept the request")
@@ -52,7 +86,7 @@ async def request_settings(session, token, vin, settings=None):
     except SolarError:
         raise
     except Exception as err:
-        raise SolarError("Teslemetry request could not be confirmed; refresh before changing controller ownership") from err
+        raise SolarError(f"{label} request could not be confirmed; refresh before changing controller ownership") from err
 
 
 class SolarOwnership:
@@ -133,16 +167,15 @@ def register_services(hass):
     from .const import DOMAIN, CONF_MONITORING_MODE
 
     async def handle(call):
-        from . import get_tesla_vehicle_api_token
         from .automations.actions import _dynamic_ev_state
         entries = [e for e in hass.config_entries.async_entries(DOMAIN)
                    if e.entry_id == call.data["entry_id"] and e.entry_id in hass.data.get(DOMAIN, {})]
         if len(entries) != 1:
             raise HomeAssistantError("Select a loaded PowerSync entry")
         entry = entries[0]
-        token, provider = get_tesla_vehicle_api_token(hass, entry)
-        if provider != "teslemetry" or not token:
-            raise HomeAssistantError("Select Teslemetry as the vehicle API provider in PowerSync settings")
+        token, provider = native_solar_connection(hass, entry)
+        if not token:
+            raise HomeAssistantError("Connect PowerSync Fleet or select Teslemetry as the vehicle API provider in PowerSync settings")
         vin = call.data["vin"].upper()
         if not re.fullmatch(r"[A-HJ-NPR-Z0-9]{17}", vin):
             raise HomeAssistantError("A valid vehicle VIN is required")
@@ -169,9 +202,12 @@ def register_services(hass):
                     raise SolarError("Wait 15 seconds before another native solar request")
                 gate.requests[vin] = time.time()
                 await gate.hold(vin, {"status": "unconfirmed"})
-                if settings is not None:
-                    await request_settings(async_get_clientsession(hass), token, vin, settings)
-                observed = await request_settings(async_get_clientsession(hass), token, vin)
+                if provider == "powersync":
+                    observed = await request_settings(async_get_clientsession(hass), token, vin, settings, provider=provider)
+                else:
+                    if settings is not None:
+                        await request_settings(async_get_clientsession(hass), token, vin, settings)
+                    observed = await request_settings(async_get_clientsession(hass), token, vin)
                 if observed["enabled"]:
                     await gate.hold(vin, observed)
                 else:

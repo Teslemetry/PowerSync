@@ -92,6 +92,7 @@ async def test_service_provider_monitoring_handover_and_readback(monkeypatch):
     root.__path__ = []
     provider = ['teslemetry']
     root.get_tesla_vehicle_api_token = lambda *args: ('secret', provider[0])
+    root.get_tesla_api_token = lambda *args: (None, 'none')
     monkeypatch.setitem(sys.modules, root.__name__, root)
     monkeypatch.setattr(m, '__package__', root.__name__)
     const = types.ModuleType(root.__name__ + '.const')
@@ -161,3 +162,60 @@ async def test_service_provider_monitoring_handover_and_readback(monkeypatch):
     responses.extend([None, {**SETTINGS, 'enabled': False}])
     result = await call(put, enabled=False)
     assert result['readback_confirmed'] and not gate.blocked(VIN)
+    # Fleet's Cloud transaction already includes readback: exactly one call.
+    entry.options.clear()
+    provider[0] = 'none'
+    root.get_tesla_api_token = lambda *args: ('powersync-secret', 'powersync')
+    fleet_calls = []
+    async def fleet_request(*args, **kwargs):
+        fleet_calls.append((args, kwargs))
+        return SETTINGS
+    monkeypatch.setattr(m, 'request_settings', fleet_request)
+    gate.requests.clear()
+    result = await call(put)
+    assert result['readback_confirmed'] and gate.blocked(VIN)
+    assert len(fleet_calls) == 1
+    assert fleet_calls[0][0][1] == 'powersync-secret'
+    assert fleet_calls[0][1] == {'provider': 'powersync'}
+    entry.options['monitoring_mode'] = True
+    with pytest.raises(m.SolarError): await call(put, enabled=False)
+    assert len(fleet_calls) == 1 and gate.blocked(VIN)
+
+
+@pytest.mark.asyncio
+async def test_powersync_fleet_uses_one_serialized_cloud_write_and_readback():
+    s = Session(Response({'settings': SETTINGS, 'readback_confirmed': True, 'powersync_control_blocked': True}))
+    assert await m.request_settings(s, 'powersync-secret', VIN, SETTINGS, provider='powersync') == SETTINGS
+    assert len(s.calls) == 1
+    args, options = s.calls[0]
+    assert args == ('POST', f'https://api.powersync.cc/v1/vehicles/{VIN}/native-solar')
+    assert options['json'] == {'action': 'set', 'provider': 'fleet', 'settings': SETTINGS, 'confirm_eligible': True}
+    assert options['headers'] == {'Authorization': 'Bearer powersync-secret'}
+    assert options['allow_redirects'] is False
+
+
+@pytest.mark.asyncio
+async def test_powersync_read_is_explicit_and_acknowledgement_is_not_readback():
+    s = Session(Response({'settings': SETTINGS}))
+    assert await m.request_settings(s, 'secret', VIN, provider='powersync') == SETTINGS
+    assert s.calls[0][1]['json'] == {'action': 'refresh', 'provider': 'fleet'}
+    for body in ({'response': {'result': True}}, {'settings': {'enabled': False}}, None):
+        with pytest.raises(m.SolarError):
+            await m.request_settings(Session(Response(body)), 'secret', VIN, SETTINGS, provider='powersync')
+    with pytest.raises(m.SolarError, match='HTTP 404'):
+        await m.request_settings(Session(Response({}, 404)), 'secret', VIN, provider='powersync')
+
+
+def test_native_connection_uses_provider_specific_credentials(monkeypatch):
+    import sys
+    import types
+    package = types.ModuleType('native_connection_probe')
+    package.get_tesla_vehicle_api_token = lambda *args: ('teslemetry-secret', 'teslemetry')
+    package.get_tesla_api_token = lambda *args: ('powersync-secret', 'powersync')
+    monkeypatch.setitem(sys.modules, package.__name__, package)
+    monkeypatch.setattr(m, '__package__', package.__name__)
+    assert m.native_solar_connection(None, None) == ('teslemetry-secret', 'teslemetry')
+    package.get_tesla_vehicle_api_token = lambda *args: ('ha-fleet-oauth', 'tesla_fleet')
+    assert m.native_solar_connection(None, None) == ('powersync-secret', 'powersync')
+    package.get_tesla_api_token = lambda *args: ('other-token', 'fleet_api')
+    assert m.native_solar_connection(None, None) == (None, 'none')

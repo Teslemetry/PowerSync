@@ -5,13 +5,12 @@ from __future__ import annotations
 import re
 import time
 
-from .teslemetry_solar import SolarError, ownership, validate_settings
+from .teslemetry_solar import SolarError, ownership, validate_settings, native_solar_connection
 
 
 def register_http_view(hass):
     from homeassistant.components.http import HomeAssistantView
     from homeassistant.exceptions import HomeAssistantError
-    from . import get_tesla_vehicle_api_token
 
     class NativeSolarView(HomeAssistantView):
         url = "/api/power_sync/ev/native_solar"
@@ -29,7 +28,7 @@ def register_http_view(hass):
                 return self.json({"success": False, "error": "A valid vehicle VIN is required"}, status_code=400)
             entries = []
             for entry in self.entries():
-                token, provider = get_tesla_vehicle_api_token(hass, entry)
+                token, provider = native_solar_connection(hass, entry)
                 gate = await ownership(hass, entry.entry_id)
                 async with gate.lock:
                     await gate.load()
@@ -37,7 +36,7 @@ def register_http_view(hass):
                     options = {**entry.data, **entry.options}
                     entries.append({
                         "entry_id": entry.entry_id, "name": entry.title,
-                        "available": provider == "teslemetry" and bool(token),
+                        "available": bool(token), "provider": provider,
                         "monitoring_mode": bool(options.get("monitoring_mode", False)),
                         "no_solar_installed": bool(options.get("no_solar_installed", False)),
                         "powersync_control_blocked": gate.blocked(vin),

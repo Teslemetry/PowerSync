@@ -33,10 +33,11 @@ def view(monkeypatch):
                 setattr(const, target.id, value)
                 package.__dict__[target.id] = value
     monkeypatch.setitem(sys.modules, const.__name__, const)
-    helper = next(node for node in ast.parse((ROOT / '__init__.py').read_text()).body
-                  if isinstance(node, ast.FunctionDef) and node.name == 'get_tesla_vehicle_api_token')
-    exec(compile(ast.Module(body=[helper], type_ignores=[]), str(ROOT / '__init__.py'),
-                 'exec', flags=__future__.annotations.compiler_flag), package.__dict__)
+    for helper_name in ('get_tesla_vehicle_api_token', 'get_tesla_api_token'):
+        helper = next(node for node in ast.parse((ROOT / '__init__.py').read_text()).body
+                      if isinstance(node, ast.FunctionDef) and node.name == helper_name)
+        exec(compile(ast.Module(body=[helper], type_ignores=[]), str(ROOT / '__init__.py'),
+                     'exec', flags=__future__.annotations.compiler_flag), package.__dict__)
     monkeypatch.setitem(sys.modules, package.__name__, package)
     modules = {}
     for name in ('teslemetry_solar', 'teslemetry_solar_api'):
@@ -110,6 +111,19 @@ async def test_get_returns_uncertain_hold_without_any_vehicle_or_service_request
     assert result['entries'][0]['no_solar_installed']
     assert result['entries'][0]['cached_settings'] is None
     assert 'secret' not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_powersync_fleet_metadata_never_contacts_cloud_or_tesla(view, monkeypatch):
+    api, _, _, calls = view
+    package = sys.modules['native_solar_api_probe']
+    monkeypatch.setattr(package, 'get_tesla_vehicle_api_token', lambda *args: (None, 'none'))
+    monkeypatch.setattr(package, 'get_tesla_api_token', lambda *args: ('psync-secret', 'powersync'))
+    status, result = await api.get(request())
+    assert status == 200 and not calls
+    assert result['entries'][0]['available']
+    assert result['entries'][0]['provider'] == 'powersync'
+    assert 'psync-secret' not in str(result)
 
 
 @pytest.mark.asyncio
