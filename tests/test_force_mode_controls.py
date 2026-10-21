@@ -1111,7 +1111,8 @@ def test_tesla_tou_upload_reports_accepted_before_readback_failure():
     assert function_source.index('accepted_status["accepted"] = True') < function_source.index(
         "await _confirm_tesla_tariff_uploaded("
     )
-    assert function_source.index("site_info did not confirm") < function_source.index("return False")
+    readback_failure = function_source.index("site_info did not confirm")
+    assert function_source.index("return False", readback_failure) > readback_failure
 
 
 def test_optimizer_restore_keeps_tesla_self_consumption_during_handoff():

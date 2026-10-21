@@ -5247,6 +5247,40 @@ async def _confirm_tesla_tariff_uploaded(
     return False
 
 
+# Per-site TOU upload generation. Each send_tariff_to_tesla call takes the next
+# generation for its site; a pending retry whose generation is no longer the
+# latest is stale and must not resend its older tariff over a newer upload.
+_TOU_UPLOAD_GENERATIONS: dict[str, int] = {}
+
+# Periodic price syncs run every 5 minutes. A Retry-After longer than this
+# puts the retry at the next sync boundary, where it would take the rate-limit
+# slot from the fresher tariff and resend the previous interval's prices.
+TOU_PERIODIC_SYNC_MAX_RETRY_AFTER_SECONDS = 60.0
+
+
+def _begin_tou_upload(site_id: str) -> int:
+    """Start a TOU upload for a site and return its generation."""
+    generation = _TOU_UPLOAD_GENERATIONS.get(str(site_id), 0) + 1
+    _TOU_UPLOAD_GENERATIONS[str(site_id)] = generation
+    return generation
+
+
+def _tou_upload_superseded(site_id: str, generation: int) -> bool:
+    """Return True when a newer TOU upload has started for the site."""
+    return _TOU_UPLOAD_GENERATIONS.get(str(site_id), 0) != generation
+
+
+def _tou_retry_after_too_long(
+    retry_after: float | None, max_retry_after: float | None
+) -> bool:
+    """Return True when a Retry-After wait is longer than the caller allows."""
+    return (
+        retry_after is not None
+        and max_retry_after is not None
+        and retry_after > max_retry_after
+    )
+
+
 async def send_tariff_to_tesla(
     hass: HomeAssistant,
     site_id: str,
@@ -5258,8 +5292,12 @@ async def send_tariff_to_tesla(
     fleet_base_url: str | None = None,
     confirm_readback: bool = True,
     accepted_status: dict[str, bool] | None = None,
+    max_retry_after_seconds: float | None = None,
 ) -> bool:
     """Send tariff data to Tesla via the configured provider with retry logic.
+
+    A pending retry is cancelled when a newer upload starts for the same site,
+    so an older tariff is never resent over a newer one.
 
     Args:
         hass: HomeAssistant instance
@@ -5273,10 +5311,14 @@ async def send_tariff_to_tesla(
         confirm_readback: Confirm the uploaded tariff appears in site_info before returning success.
         accepted_status: Optional mutable status populated with ``accepted=True``
             after Tesla accepts the upload, even if readback confirmation fails.
+        max_retry_after_seconds: Give up instead of retrying when a 429 or 5xx
+            Retry-After is longer than this. Periodic syncs set it so the next
+            sync sends a fresher tariff instead of a late retry of this one.
 
     Returns:
         True if successful, False otherwise
     """
+    generation = _begin_tou_upload(site_id)
     session = async_get_clientsession(hass)
     headers = {
         "Authorization": f"Bearer {api_token}",
@@ -5349,6 +5391,12 @@ async def send_tariff_to_tesla(
                     wait_time
                 )
                 await asyncio.sleep(wait_time)
+                if _tou_upload_superseded(site_id, generation):
+                    _LOGGER.info(
+                        "Cancelled stale TOU sync retry for site %s: a newer TOU sync started",
+                        site_id,
+                    )
+                    return False
 
             _LOGGER.debug(
                 "Sending TOU schedule to Tesla via %s for site %s (attempt %d/%d)",
@@ -5405,6 +5453,15 @@ async def send_tariff_to_tesla(
                         f"{retry_after_delay:.0f}s" if retry_after_delay else "not set",
                     )
                     last_error = f"Rate limited 429"
+                    if _tou_retry_after_too_long(retry_after_delay, max_retry_after_seconds):
+                        _LOGGER.warning(
+                            "Not retrying TOU sync for site %s: retry-after %.0fs exceeds %.0fs; "
+                            "the next sync will send a fresher tariff",
+                            site_id,
+                            retry_after_delay,
+                            max_retry_after_seconds,
+                        )
+                        return False
                     continue  # Retry on 429
 
                 if response.status >= 500:
@@ -5420,6 +5477,15 @@ async def send_tariff_to_tesla(
                         f", retry-after: {retry_after_delay:.0f}s" if retry_after_delay else "",
                     )
                     last_error = f"Server error {response.status}"
+                    if _tou_retry_after_too_long(retry_after_delay, max_retry_after_seconds):
+                        _LOGGER.warning(
+                            "Not retrying TOU sync for site %s: retry-after %.0fs exceeds %.0fs; "
+                            "the next sync will send a fresher tariff",
+                            site_id,
+                            retry_after_delay,
+                            max_retry_after_seconds,
+                        )
+                        return False
                     continue  # Retry on 5xx errors
 
                 # Other 4xx client errors — don't retry
@@ -26469,6 +26535,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 s_token,
                 s_provider,
                 fleet_base_url=entry.data.get(CONF_FLEET_API_BASE_URL),
+                max_retry_after_seconds=TOU_PERIODIC_SYNC_MAX_RETRY_AFTER_SECONDS,
             )
             if not site_success:
                 _LOGGER.error("Failed to sync TOU to Tesla site %s", site_id)
