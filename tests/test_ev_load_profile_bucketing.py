@@ -340,6 +340,16 @@ class _FakeOverlayCoordinator:
     def _get_planned_ev_load_forecast(self, n_intervals: int) -> list[float] | None:
         return self._external_forecast
 
+    def _incorporate_tesla_schedule_forecasts(self, n_intervals, smart, price):
+        from power_sync.optimization.tesla_schedules import merge_native_schedules
+
+        native = getattr(self, '_native_forecasts', {})
+        smart, price, self._pending_ev_charge_plan = merge_native_schedules(
+            native=native, smart=smart, price=price, plans=self._pending_ev_charge_plan,
+            canonical={}, interval_minutes=self._config.interval_minutes,
+        )
+        return smart, price, set(native)
+
     def _price_timestamps(self, n: int) -> list:
         return [None] * n
 
@@ -1073,6 +1083,43 @@ def test_blocked_smart_loadpoint_still_suppresses_price_level_takeover():
     load = _run_overlay(coordinator, [2000.0, 2000.0, 2000.0, 2000.0])
 
     assert load == [3200.0, 3200.0, 2000.0, 2000.0]
+
+
+@pytest.mark.parametrize('smart_enabled', [False, True])
+def test_tesla_schedules_enter_actual_overlay_with_smart_off_or_on(smart_enabled):
+    coordinator = _FakeOverlayCoordinator(
+        external_forecast=None,
+        internal_forecast=[7000.0, 7000.0, 0.0, 0.0],
+        ev_integration_enabled=smart_enabled,
+    )
+    coordinator._native_forecasts = {
+        'ev': SimpleNamespace(power_w=(7000.0, 7000.0, 0.0, 0.0), energy_needed_kwh=10.0)
+    }
+    if smart_enabled:
+        coordinator._ev_charge_plan = [SimpleNamespace(
+            vehicle_id='ev', energy_needed_kwh=10.0, charge_efficiency=1.0)]
+        coordinator._policy_loadpoints = ['ev']
+    load = _run_overlay(coordinator, [2000.0] * 4)
+    assert load == [9000.0, 9000.0, 2000.0, 2000.0]
+    assert coordinator._pending_ev_charge_plan == ([] if smart_enabled else None)
+    assert coordinator._fixed_ev_load_forecast_w == [7000.0, 7000.0, 0.0, 0.0]
+
+
+def test_fixed_tesla_and_solved_other_vehicle_are_both_published_once():
+    adopt = _extract_coordinator_method('_adopt_solved_ev_series')
+    coordinator = SimpleNamespace(
+        _fixed_ev_load_forecast_w=[7000.0, 0.0],
+        _last_planned_ev_load_forecast_w=[7000.0, 0.0],
+        _last_effective_ev_load_forecast_w=[7000.0, 0.0],
+    )
+    result = SimpleNamespace(
+        schedule=SimpleNamespace(actions=[SimpleNamespace(ev_charge_w=2000.0), SimpleNamespace(ev_charge_w=3000.0)]),
+        ev_charge_by_vehicle_w={'other': [2000.0, 3000.0]},
+    )
+    adopt(coordinator, result)
+    assert coordinator._last_planned_ev_load_forecast_w == [9000.0, 3000.0]
+    adopt(coordinator, result)
+    assert coordinator._last_effective_ev_load_forecast_w == [9000.0, 3000.0]
 
 
 def test_lp_plan_suppresses_only_its_loadpoint_overlay():

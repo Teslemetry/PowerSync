@@ -149,3 +149,15 @@ async def test_service_provider_monitoring_handover_and_readback(monkeypatch):
     result = await call(get)
     assert result['readback_confirmed'] and not result['powersync_control_blocked']
     assert not gate.blocked(VIN)
+    # The independently implemented zero-solar setting blocks new activation,
+    # without discarding an uncertain hold or preventing explicit disabling.
+    await gate.hold(VIN, {'status': 'unconfirmed'})
+    entry.options['no_solar_installed'] = True
+    previous_calls = len(calls)
+    with pytest.raises(m.SolarError, match='No solar installed'):
+        await call(put)
+    assert len(calls) == previous_calls and gate.blocked(VIN)
+    gate.requests.clear()
+    responses.extend([None, {**SETTINGS, 'enabled': False}])
+    result = await call(put, enabled=False)
+    assert result['readback_confirmed'] and not gate.blocked(VIN)

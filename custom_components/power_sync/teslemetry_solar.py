@@ -156,6 +156,10 @@ def register_services(hass):
                 if call.service == "set_teslemetry_charge_on_solar":
                     if entry.options.get(CONF_MONITORING_MODE, entry.data.get(CONF_MONITORING_MODE, False)):
                         raise SolarError("Vehicle commands are blocked in monitoring mode")
+                    if call.data["enabled"] and entry.options.get(
+                        "no_solar_installed", entry.data.get("no_solar_installed", False)
+                    ):
+                        raise SolarError("Charge on Solar cannot be enabled while No solar installed is selected")
                     if call.data["enabled"] and not call.data.get("confirm_eligible"):
                         raise SolarError("Confirm Tesla setup at a Powerwall site without export/site limits; turn off all other charging controllers first")
                     settings = validate_settings({"enabled": call.data["enabled"],

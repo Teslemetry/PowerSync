@@ -6934,8 +6934,9 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._last_resolved_optimizer_parameters = resolved_parameters
             self._optimizer.apply_resolved_parameters(resolved_parameters)
 
-            if self._ev_integration_enabled:
-                await self._refresh_ev_forecast_inputs()
+            # Tesla-owned schedules still affect site demand when PowerSync
+            # Smart EV charging is disabled or has never been configured.
+            await self._refresh_ev_forecast_inputs()
 
             # Collect forecast data
             self._last_export_boost_allowed_slots = []
@@ -6977,10 +6978,12 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._pending_ev_charge_plan = None
             self._last_planned_ev_load_forecast_w = None
             self._last_effective_ev_load_forecast_w = None
+            self._fixed_ev_load_forecast_w = None
             self._last_ev_charge_by_vehicle_w = None
             self._last_ev_charge_schedule_updated = None
             self._last_ev_source_by_vehicle_w = None
             self._last_ev_optimizer_policy = None
+            self._last_tesla_schedule_forecast = None
             self._last_smart_schedule_ev_load_w = None
             self._last_price_level_expected_ev_load_w = None
             self._last_price_level_projection = None
@@ -7022,6 +7025,12 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self._pending_ev_charge_plan = self._build_ev_charge_plan(
                         self._price_timestamps(n_ev)
                     )
+                    smart_components, price_components, native_loadpoint_ids = (
+                        self._incorporate_tesla_schedule_forecasts(
+                            n_ev, smart_components,
+                            price_projection.expected_by_loadpoint,
+                        )
+                    )
                     plan_loadpoint_ids = [
                         str(getattr(plan, "vehicle_id", "") or "")
                         for plan in (self._pending_ev_charge_plan or ())
@@ -7051,6 +7060,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         suppressed_loadpoint_ids = set(
                             self._canonical_ev_loadpoint_ids(owned_ids).values()
                         )
+                    suppressed_loadpoint_ids.difference_update(native_loadpoint_ids)
                     (
                         effective_ev_load_w,
                         smart_w,
@@ -7058,7 +7068,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     ) = self._merge_internal_ev_load_components(
                         n_intervals=n_ev,
                         smart_components=smart_components,
-                        price_components=price_projection.expected_by_loadpoint,
+                        price_components=price_components,
                         suppressed_loadpoints=suppressed_loadpoint_ids,
                     )
                     display_projection = price_projection
@@ -7100,6 +7110,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     )
 
                 if any(value > 0 for value in effective_ev_load_w):
+                    self._fixed_ev_load_forecast_w = list(effective_ev_load_w)
                     load = [
                         base + ev
                         for base, ev in zip(load, effective_ev_load_w)
@@ -8656,10 +8667,13 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         ]
         if not any(value > 0 for value in solved):
             return
-        if not self._last_planned_ev_load_forecast_w:
-            self._last_planned_ev_load_forecast_w = list(solved)
-        if not self._last_effective_ev_load_forecast_w:
-            self._last_effective_ev_load_forecast_w = list(solved)
+        # Fixed demand (including Tesla-owned schedules) can coexist with
+        # co-optimized demand from another car. Publish their total once.
+        fixed = getattr(self, "_fixed_ev_load_forecast_w", None) or []
+        combined = [value + (fixed[index] if index < len(fixed) else 0.0)
+                    for index, value in enumerate(solved)]
+        self._last_planned_ev_load_forecast_w = combined
+        self._last_effective_ev_load_forecast_w = list(combined)
 
     def _build_ev_charge_plan(
         self,
@@ -17005,6 +17019,22 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _refresh_ev_forecast_inputs(self) -> None:
         """Refresh EV schedule inputs before an LP solve without charger commands."""
         try:
+            from .tesla_schedules import TeslaScheduleReader
+
+            reader = getattr(self, "_tesla_schedule_reader", None)
+            if reader is None:
+                reader = self._tesla_schedule_reader = TeslaScheduleReader()
+            from ..teslemetry_solar import ownership
+
+            gate = await ownership(self.hass, self._entry.entry_id)
+            async with gate.lock:
+                await gate.load()
+            await reader.refresh(self.hass, dt_util.now())
+        except Exception as err:
+            _LOGGER.debug("Optimizer: Tesla schedule refresh unavailable: %s", err)
+        if not self._ev_integration_enabled:
+            return
+        try:
             from ..automations.ev_charging_planner import get_auto_schedule_executor
 
             executor = get_auto_schedule_executor()
@@ -17013,6 +17043,76 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 await refresh()
         except Exception as err:
             _LOGGER.debug("Optimizer: EV forecast refresh skipped: %s", err)
+
+    def _incorporate_tesla_schedule_forecasts(
+        self, n_intervals: int, smart_components: dict, price_components: dict,
+    ) -> tuple[dict, dict, set[str]]:
+        """Model Tesla and PowerSync windows once per physical vehicle."""
+        from ..automations.ev_vehicle_capacity import resolve_ev_battery_capacity
+        from .tesla_schedules import merge_native_schedules
+
+        reader = getattr(self, "_tesla_schedule_reader", None)
+        if reader is None:
+            return smart_components, price_components, set()
+        entry_data = self.hass.data.get("power_sync", {}).get(self._entry.entry_id, {})
+        store_data = getattr(entry_data.get("automation_store"), "_data", {}) or {}
+        configs = store_data.get("vehicle_charging_configs", [])
+        configs = [config for config in configs if isinstance(config, dict)] if isinstance(configs, list) else []
+        identifiers = [*reader.cache, *smart_components, *price_components,
+                       *(str(config.get("vehicle_id", "")) for config in configs)]
+        identifiers.extend(str(plan.vehicle_id) for plan in (self._pending_ev_charge_plan or ()))
+        canonical = self._canonical_ev_loadpoint_ids(identifiers)
+        gate = self.hass.data.get("power_sync_native_solar", {}).get(self._entry.entry_id)
+        holds = getattr(gate, "holds", None) or {}
+        blocked = {canonical.get(vin, vin) for vin in holds}
+        smart_components = {key: values for key, values in smart_components.items()
+                            if canonical.get(key, key) not in blocked}
+        price_components = {key: values for key, values in price_components.items()
+                            if canonical.get(key, key) not in blocked}
+        if self._pending_ev_charge_plan is not None:
+            self._pending_ev_charge_plan = [plan for plan in self._pending_ev_charge_plan
+                if canonical.get(plan.vehicle_id, plan.vehicle_id) not in blocked]
+        capacities, capacity_sources, power_limits = {}, {}, {}
+        for vin in reader.cache:
+            config = next((config for config in configs
+                           if canonical.get(str(config.get("vehicle_id", "")))
+                           == canonical.get(vin, vin)), {})
+            resolved_capacity = resolve_ev_battery_capacity(
+                manual_capacity_kwh=config.get("battery_capacity_kwh"),
+                provider_capacity_kwh=config.get("provider_battery_capacity_kwh"),
+                model=config.get("vehicle_model", config.get("model")),
+                trim=config.get("vehicle_trim", config.get("trim")),
+            )
+            capacities[vin] = resolved_capacity.effective_battery_capacity_kwh
+            capacity_sources[vin] = resolved_capacity.battery_capacity_source
+            try:
+                power_limits[vin] = (float(config.get("max_amps", config.get("max_charge_amps")))
+                                     * float(config.get("voltage", 230))
+                                     * int(config.get("phases", 1)) / 1000)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                pass
+        native = reader.forecasts(
+            timestamps=[timestamp.astimezone(dt_util.DEFAULT_TIME_ZONE)
+                        for timestamp in self._price_timestamps(n_intervals)],
+            interval_minutes=self._config.interval_minutes,
+            latitude=self.hass.config.latitude, longitude=self.hass.config.longitude,
+            capacities=capacities, power_limits=power_limits, now=dt_util.now(),
+            native_solar_settings=holds,
+        )
+        smart, price, self._pending_ev_charge_plan = merge_native_schedules(
+            native=native, smart=smart_components, price=price_components,
+            plans=self._pending_ev_charge_plan, canonical=canonical,
+            interval_minutes=self._config.interval_minutes,
+        )
+        self._last_tesla_schedule_forecast = {
+            "read_status": dict(reader.diagnostics),
+            "vehicles": {vin: {"planned_load_w": smart[vin],
+                               "energy_needed_kwh": forecast.energy_needed_kwh,
+                               "battery_capacity_kwh": capacities[vin],
+                               "battery_capacity_source": capacity_sources[vin]}
+                         for vin, forecast in native.items()},
+        }
+        return smart, price, {canonical.get(vin, vin) for vin in native}
 
     def _get_planned_ev_load_forecast(self, n_intervals: int) -> list[float] | None:
         """Read an optional forecast-only EV load overlay from a HA sensor."""
@@ -19955,6 +20055,9 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         ev_optimizer_policy = getattr(self, "_last_ev_optimizer_policy", None)
         if ev_optimizer_policy:
             data["ev_optimizer_policy_by_vehicle"] = ev_optimizer_policy
+        native_forecast = getattr(self, "_last_tesla_schedule_forecast", None)
+        if native_forecast:
+            data["tesla_schedule_forecast"] = native_forecast
 
         # Use actual tariff prices for display (not LP-adjusted values)
         disp_import = self._last_display_import_prices or self._last_import_prices
@@ -20505,6 +20608,9 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         ev_optimizer_policy = getattr(self, "_last_ev_optimizer_policy", None)
         if ev_optimizer_policy:
             data["ev_optimizer_policy_by_vehicle"] = ev_optimizer_policy
+        native_forecast = getattr(self, "_last_tesla_schedule_forecast", None)
+        if native_forecast:
+            data["tesla_schedule_forecast"] = native_forecast
 
         # Add daily cost breakdown (actual + predicted remaining)
         pred_remaining, baseline_remaining = self._get_predicted_cost_to_midnight()

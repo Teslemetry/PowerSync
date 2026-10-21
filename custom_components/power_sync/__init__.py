@@ -42206,6 +42206,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     from .teslemetry_solar import register_services as _register_native_solar_services
     _register_native_solar_services(hass)
+    from .teslemetry_solar_api import register_http_view as _register_native_solar_http
+    _register_native_solar_http(hass)
     _LOGGER.info(
         "🔌 Powerwall local control endpoints + services registered "
         "(pair/status/cancel/unpair/off_grid/local_status)"

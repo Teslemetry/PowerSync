@@ -127,6 +127,33 @@ def test_battery_and_ev_together_respect_the_site_import_limit(optimizer_module)
         assert battery_kw + ev_kw + 0.5 <= 16.1 + 1e-6
 
 
+@pytest.mark.parametrize('solver', ['lp', 'greedy'])
+def test_fixed_tesla_schedule_reserves_site_headroom_with_another_managed_car(
+    optimizer_module, solver,
+):
+    """Native demand stays in the load in both normal and fallback solves."""
+    optimizer = _optimizer(optimizer_module)
+    kwargs = _kwargs()
+    fixed_tesla_kw = [7.2, 7.2] + [0.0] * 6
+    kwargs['load_forecast'] = [0.5 + value for value in fixed_tesla_kw]
+    other = _ev_plan(optimizer_module, vehicle_id='other',
+                     max_power_kw=(3.6, 3.6) + (0.0,) * 6,
+                     energy_needed_kwh=7.2)
+    if solver == 'lp':
+        result = optimizer.optimize(**kwargs, ev_plan=other)
+    else:
+        result = optimizer._solve_greedy(
+            8, kwargs['import_prices'], kwargs['export_prices'],
+            kwargs['solar_forecast'], kwargs['load_forecast'], kwargs['current_soc'],
+            'cost', schedule_timestamps=kwargs['schedule_timestamps'], ev_plan=other,
+        )
+    assert sum(action.ev_charge_w for action in result.schedule.actions) / 1000 == pytest.approx(7.2, abs=0.05)
+    for index, action in enumerate(result.schedule.actions):
+        grid_kw = (0.5 + fixed_tesla_kw[index] + action.ev_charge_w / 1000
+                   + action.battery_charge_w / 1000 - action.battery_discharge_w / 1000)
+        assert grid_kw <= 16.1 + 1e-6
+
+
 def test_ev_energy_is_delivered_within_its_window(optimizer_module):
     optimizer = _optimizer(optimizer_module)
 
