@@ -37199,6 +37199,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         restore_was_force_discharging = bool(force_discharge_state.get("active"))
         restore_was_force_charging = bool(force_charge_state.get("active"))
         restore_was_hold_soc = bool(hold_soc_state.get("active"))
+        restore_was_self_consumption = bool(self_consumption_state.get("active"))
         if restore_was_force_discharging:
             # A restore/cleanup path owns the hardware lifecycle.  It must
             # not be delayed by the optimizer's conditional hold, including
@@ -38329,11 +38330,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # wrong mode switches (autonomous instead of self_consumption), and
         # spurious push notifications.
         has_active_force = force_discharge_state.get("active") or force_charge_state.get("active")
+        # A normal tariff cache is a fallback for genuine recovery, not proof
+        # that a force episode needs restoring. Repeated OFF calls must not
+        # upload a historical provider's tariff over a manual Tesla edit.
         restorable_saved_tariff = _select_restorable_tesla_tariff(
             force_discharge_state.get("saved_tariff"),
             force_charge_state.get("saved_tariff"),
-            _cached_restorable_tesla_tariff(),
-            _configured_restorable_tesla_tariff(),
         )
         saved_grid_charging_enabled = (
             force_discharge_state.get("saved_grid_charging_enabled")
@@ -38342,6 +38344,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
         has_saved_state = (
             restorable_saved_tariff or
+            force_discharge_state.get("saved_states") or force_charge_state.get("saved_states") or
+            force_discharge_state.get("saved_export_rule") or force_charge_state.get("saved_export_rule") or
+            restore_was_hold_soc or restore_was_self_consumption or
+            entry_data.get("pending_tesla_restore") or
             force_discharge_state.get("saved_operation_mode") or force_charge_state.get("saved_operation_mode") or
             force_discharge_state.get("saved_backup_reserve") is not None or
             force_charge_state.get("saved_backup_reserve") is not None or
@@ -38359,6 +38365,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 restore_was_hold_soc
                 and not has_active_force
                 and not restorable_saved_tariff
+                and not force_discharge_state.get("saved_states")
+                and not force_charge_state.get("saved_states")
                 and not force_discharge_state.get("saved_operation_mode")
                 and not force_charge_state.get("saved_operation_mode")
                 and saved_grid_charging_enabled is None
@@ -38501,11 +38509,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
             # Find saved tariff (prefer discharge, then charge), but never use
             # a temporary PowerSync force tariff as the restore tariff.
+            # Keep an episode's captured baseline authoritative. If it is
+            # missing after a switch to Custom TOU, use the configured tariff
+            # before a historical cache from the previous provider.
+            configured_tariff = _configured_restorable_tesla_tariff()
+            cached_tariff = _cached_restorable_tesla_tariff()
+            fallback_tariffs = (
+                (configured_tariff, cached_tariff)
+                if electricity_provider in ("other", "tou_only")
+                else (cached_tariff, configured_tariff)
+            )
             saved_tariff = _select_restorable_tesla_tariff(
                 force_discharge_state.get("saved_tariff"),
                 force_charge_state.get("saved_tariff"),
-                _cached_restorable_tesla_tariff(),
-                _configured_restorable_tesla_tariff(),
+                *fallback_tariffs,
             )
 
             # Dynamic pricing providers should sync fresh prices, not restore stale saved tariff.
@@ -38538,7 +38555,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     return
                 if tariff_restored is not True:
                     _mark_tesla_restore_failed("dynamic tariff restore did not verify")
-            elif saved_tariff:
+            elif saved_tariff or force_discharge_state.get("saved_states") or force_charge_state.get("saved_states"):
                 # Non-dynamic users - restore saved tariffs per site
                 _LOGGER.info("Restoring saved tariffs...")
                 # Check for per-site saved states or fall back to global saved tariff

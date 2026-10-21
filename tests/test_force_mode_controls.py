@@ -3492,7 +3492,7 @@ def test_tesla_restore_failure_keeps_force_state_for_retry():
     dynamic_start = function_source.index(
         'if electricity_provider in dynamic_providers:'
     )
-    dynamic_end = function_source.index('elif saved_tariff:', dynamic_start)
+    dynamic_end = function_source.index('elif saved_tariff', dynamic_start)
     dynamic_restore = function_source[dynamic_start:dynamic_end]
     assert 'force_discharge_state["active"] = False' not in dynamic_restore
     assert 'force_charge_state["active"] = False' not in dynamic_restore
@@ -3676,7 +3676,7 @@ def test_tesla_dynamic_restore_bypasses_active_force_tariff_defer_once():
     dynamic_start = restore_source.index(
         'if electricity_provider in dynamic_providers:'
     )
-    dynamic_end = restore_source.index('elif saved_tariff:', dynamic_start)
+    dynamic_end = restore_source.index('elif saved_tariff', dynamic_start)
     dynamic_restore = restore_source[dynamic_start:dynamic_end]
     assert override_key in dynamic_restore
     assert dynamic_restore.index(override_key) < dynamic_restore.index(
