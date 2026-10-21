@@ -134,6 +134,20 @@ def test_current_away_or_disconnected_state_does_not_erase_future_home_windows()
     assert forecast(vehicle(charging_state='Disconnected')).power_w == pytest.approx([0, 7200, 7200, 0, 0])
 
 
+def test_online_away_unplugged_vehicle_can_refresh_a_future_home_schedule():
+    async def run():
+        data = vehicle(charging_state='Disconnected')
+        data['drive_state'] = {'latitude': -33.86, 'longitude': 151.21, 'timestamp': NOW.timestamp() * 1000}
+        hass, api, _ = hass_for(data)
+        reader = m.TeslaScheduleReader()
+        await reader.refresh(hass, NOW)
+        native = reader.forecasts(timestamps=[NOW + timedelta(hours=i) for i in range(5)], interval_minutes=60,
+            latitude=-27.47, longitude=153.03, capacities={}, power_limits={}, now=NOW)
+        assert len(api.calls) == 1
+        assert native[VIN].power_w == pytest.approx([0, 7200, 7200, 0, 0])
+    asyncio.run(run())
+
+
 def test_one_time_schedule_does_not_repeat():
     data = vehicle([{**schedule(), "one_time": True}], battery_level=0, charge_limit_soc=100)
     result = forecast(data, count=48)
@@ -224,6 +238,25 @@ def test_sleeping_vehicle_is_never_polled_or_woken():
     asyncio.run(run())
 
 
+def test_disabled_native_planning_skips_paid_reads_and_cached_demand_for_only_that_car():
+    async def run():
+        hass, api, _ = hass_for(vehicle())
+        reader = m.TeslaScheduleReader()
+        reader.cache[VIN] = (NOW, vehicle())
+        await reader.refresh(hass, NOW, excluded_vins=frozenset({VIN}))
+        assert not api.calls and VIN in reader.cache
+        other = '5YJ3E1EA7KF000002'
+        reader.cache[other] = (NOW, vehicle())
+        forecasts = reader.forecasts(timestamps=[NOW + timedelta(hours=i) for i in range(5)], interval_minutes=60,
+            latitude=-27.47, longitude=153.03, capacities={}, power_limits={}, now=NOW,
+            excluded_vins=frozenset({VIN}))
+        assert set(forecasts) == {other}
+        assert sum(forecasts[other].power_w) > 0
+        await reader.refresh(hass, NOW)
+        assert len(api.calls) == 1 and 'confirmed' in reader.diagnostics[VIN].lower()
+    asyncio.run(run())
+
+
 def test_failed_read_retains_cache_but_confirmed_empty_removes_schedule():
     async def run():
         hass, api, _ = hass_for(vehicle())
@@ -252,7 +285,8 @@ def test_stale_charge_state_or_schedule_cache_never_produces_demand():
 
 
 @pytest.mark.parametrize('held', [False, True])
-def test_real_coordinator_handoff_resolves_capacity_power_and_native_ownership(monkeypatch, held):
+@pytest.mark.parametrize('excluded', [False, True])
+def test_real_coordinator_handoff_resolves_capacity_power_and_native_ownership(monkeypatch, held, excluded):
     package = ModuleType('tesla_schedule_coordinator_probe')
     package.__path__ = [str(ROOT)]
     optimization = ModuleType(package.__name__ + '.optimization')
@@ -286,9 +320,17 @@ def test_real_coordinator_handoff_resolves_capacity_power_and_native_ownership(m
         hass=SimpleNamespace(config=SimpleNamespace(latitude=-27.47, longitude=153.03), data={
             'power_sync': {'one': {'automation_store': SimpleNamespace(_data={'vehicle_charging_configs': [config]})}},
             'power_sync_native_solar': {'one': SimpleNamespace(holds=holds)},
+            'power_sync_tesla_schedule_planning': {'one': SimpleNamespace(excluded_vins=frozenset({VIN}) if excluded else frozenset())},
         }),
     )
     smart, prices, ids = namespace[function.name](coordinator, 4, {VIN: [3840] * 4}, {})
+    if excluded:
+        assert ids == set() and prices == {}
+        assert smart == ({} if held else {VIN: [3840] * 4})
+        assert len(coordinator._pending_ev_charge_plan) == (0 if held else 1)
+        assert coordinator._last_tesla_schedule_forecast['vehicles'] == {}
+        assert coordinator._last_tesla_schedule_forecast['excluded_vins'] == [VIN]
+        return
     assert ids == {VIN} and prices == {} and coordinator._pending_ev_charge_plan == []
     assert smart[VIN] == pytest.approx([3840, 3840, 3840, 0] if held else [3840] * 4)
     diagnostic = coordinator._last_tesla_schedule_forecast['vehicles'][VIN]

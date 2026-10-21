@@ -194,7 +194,7 @@ class TeslaScheduleReader:
         self.attempted: dict[str, datetime] = {}
         self.diagnostics: dict[str, str] = {}
 
-    async def refresh(self, hass: Any, now: datetime) -> None:
+    async def refresh(self, hass: Any, now: datetime, *, excluded_vins: frozenset[str] = frozenset()) -> None:
         seen: set[str] = set()
         # Prefer Teslemetry when the same VIN is exposed by both integrations.
         for domain in ("teslemetry", "tesla_fleet"):
@@ -213,6 +213,11 @@ class TeslaScheduleReader:
                     if cached and (now - cached[0]).total_seconds() > MAX_CACHE_SECONDS:
                         self.cache.pop(vin, None)
                         cached = None
+                    if vin in excluded_vins:
+                        self.diagnostics[vin] = "Tesla schedule planning disabled for this vehicle"
+                        continue
+                    if self.diagnostics.get(vin) == "Tesla schedule planning disabled for this vehicle":
+                        self.diagnostics[vin] = "Tesla schedule planning enabled; using bounded cache"
                     # Charge state comes from its own timestamp, never from a
                     # location/metadata update or the schedule refresh clock.
                     if cached:
@@ -274,9 +279,12 @@ class TeslaScheduleReader:
         latitude: float, longitude: float, capacities: Mapping[str, float],
         power_limits: Mapping[str, float], now: datetime,
         native_solar_settings: Mapping[str, Mapping[str, Any]] | None = None,
+        excluded_vins: frozenset[str] = frozenset(),
     ) -> dict[str, TeslaScheduleForecast]:
         forecasts = {}
         for vin, (read_at, data) in self.cache.items():
+            if vin in excluded_vins:
+                continue
             if not 0 <= (now - read_at).total_seconds() <= MAX_CACHE_SECONDS:
                 continue
             charge = _section(data, "charge_state")

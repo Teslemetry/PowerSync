@@ -17020,6 +17020,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Refresh EV schedule inputs before an LP solve without charger commands."""
         try:
             from .tesla_schedules import TeslaScheduleReader
+            from ..tesla_schedule_planning import preferences
 
             reader = getattr(self, "_tesla_schedule_reader", None)
             if reader is None:
@@ -17029,7 +17030,10 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             gate = await ownership(self.hass, self._entry.entry_id)
             async with gate.lock:
                 await gate.load()
-            await reader.refresh(self.hass, dt_util.now())
+            planning = await preferences(self.hass, self._entry.entry_id)
+            async with planning.lock:
+                await planning.load()
+            await reader.refresh(self.hass, dt_util.now(), excluded_vins=planning.excluded_vins)
         except Exception as err:
             _LOGGER.debug("Optimizer: Tesla schedule refresh unavailable: %s", err)
         if not self._ev_integration_enabled:
@@ -17050,6 +17054,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Model Tesla and PowerSync windows once per physical vehicle."""
         from ..automations.ev_vehicle_capacity import resolve_ev_battery_capacity
         from .tesla_schedules import merge_native_schedules
+        from ..tesla_schedule_planning import excluded_vins
 
         reader = getattr(self, "_tesla_schedule_reader", None)
         if reader is None:
@@ -17098,6 +17103,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             latitude=self.hass.config.latitude, longitude=self.hass.config.longitude,
             capacities=capacities, power_limits=power_limits, now=dt_util.now(),
             native_solar_settings=holds,
+            excluded_vins=excluded_vins(self.hass, self._entry.entry_id),
         )
         smart, price, self._pending_ev_charge_plan = merge_native_schedules(
             native=native, smart=smart_components, price=price_components,
@@ -17106,6 +17112,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self._last_tesla_schedule_forecast = {
             "read_status": dict(reader.diagnostics),
+            "excluded_vins": sorted(excluded_vins(self.hass, self._entry.entry_id)),
             "vehicles": {vin: {"planned_load_w": smart[vin],
                                "energy_needed_kwh": forecast.energy_needed_kwh,
                                "battery_capacity_kwh": capacities[vin],
