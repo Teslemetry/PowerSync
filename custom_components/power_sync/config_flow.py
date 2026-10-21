@@ -14545,6 +14545,10 @@ class PowerSyncOptionsFlow(AmberOptionsMixin, config_entries.OptionsFlow):
         if provider == "agl":
             return await self.async_step_agl_options()
         if provider in ("other", "tou_only"):
+            # Saving the tariff store alone does not change the config entry.
+            # Carry the selected provider through the shared pricing finish
+            # step so reload stops polling the former dynamic provider.
+            self._amber_options = {CONF_ELECTRICITY_PROVIDER: provider}
             return await self.async_step_custom_tariff_options()
         return await self.async_step_globird_options()
 

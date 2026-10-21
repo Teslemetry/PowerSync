@@ -9,6 +9,8 @@ import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_FLOW_PATH = ROOT / "custom_components" / "power_sync" / "config_flow.py"
@@ -148,6 +150,156 @@ def _options_flow_method(
                 ):
                     return item
     raise AssertionError(f"PowerSyncOptionsFlow.{name} not found")
+
+
+@pytest.mark.parametrize("provider", ["other", "tou_only"])
+@pytest.mark.parametrize("tariff_type", ["flat", "tou"])
+@pytest.mark.parametrize("old_provider_location", ["data", "options"])
+def test_custom_pricing_switch_persists_provider_with_tariff(
+    provider, tariff_type, old_provider_location,
+):
+    """A saved custom tariff must stop selecting the former dynamic provider."""
+    namespace = {}
+    for node in ast.parse(CONST_PATH.read_text()).body:
+        if isinstance(node, ast.Assign):
+            try:
+                value = ast.literal_eval(node.value)
+            except (ValueError, TypeError):
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    namespace[target.id] = value
+
+    selector = lambda *args, **kwargs: kwargs
+    namespace.update(
+        CUSTOM_TOU_PROVIDER_OPTIONS=("agl", "globird", "aemo_vpp", "other", "tou_only"),
+        normalize_currency=lambda value, fallback: value or fallback,
+        convert_custom_tariff_to_schedule=lambda tariff, **kwargs: tariff,
+        normalize_demand_charge_days=lambda value: value,
+        normalize_demand_charge_billing_day=lambda value: value,
+        _LOGGER=SimpleNamespace(info=lambda *args: None),
+        vol=SimpleNamespace(
+            Required=lambda name, **kwargs: name,
+            Optional=lambda name, **kwargs: name,
+            Schema=lambda fields: fields,
+        ),
+        NumberSelector=selector, NumberSelectorConfig=selector,
+        TextSelector=selector, TextSelectorConfig=selector,
+        SelectSelector=selector, SelectSelectorConfig=selector,
+        BooleanSelector=selector, SelectOptionDict=selector,
+        NumberSelectorMode=SimpleNamespace(BOX="box"),
+        TextSelectorType=SimpleNamespace(TEXT="text"),
+        SelectSelectorMode=SimpleNamespace(DROPDOWN="dropdown"),
+    )
+
+    class _Imports(ast.NodeTransformer):
+        def visit_ImportFrom(self, node):
+            # The two relative tariff imports use the injected boundaries above.
+            return None if node.level else node
+
+    methods = (
+        "async_step_pricing", "_async_route_custom_tou_options",
+        "async_step_custom_tariff_options", "async_step_tariff_period_options",
+        "async_step_demand_charge_options", "_save_custom_tariff",
+        "_save_and_finish",
+    )
+    for name in methods:
+        node = _Imports().visit(_options_flow_method(name))
+        module = ast.Module(
+            body=[ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0,
+            ), node],
+            type_ignores=[],
+        )
+        exec(compile(ast.fix_missing_locations(module), str(CONFIG_FLOW_PATH), "exec"), namespace)
+
+    class _Store:
+        tariff = None
+        saved = False
+
+        def set_custom_tariff(self, tariff):
+            self.tariff = tariff
+
+        def get_custom_tariff(self):
+            return None
+
+        async def async_save(self):
+            self.saved = True
+
+    store = _Store()
+
+    class _Flow:
+        def __init__(self):
+            data, options = {}, {"unrelated_option": "preserved"}
+            (data if old_provider_location == "data" else options).update(
+                electricity_provider="octopus",
+            )
+            self.config_entry = SimpleNamespace(data=data, options=options)
+            self.hass = SimpleNamespace(data={
+                "power_sync": {"entry": {"automation_store": store}},
+            })
+
+        def _get_option(self, key, default=None):
+            return self.config_entry.options.get(
+                key, self.config_entry.data.get(key, default),
+            )
+
+        def _currency(self):
+            return "GBP"
+
+        def _selector_unit(self, *args):
+            return "p/kWh"
+
+        def _custom_tariff_periods(self, tariff):
+            return []
+
+        def _custom_tariff_seasons(self, tariff):
+            return []
+
+        def _build_tariff_from_periods_compat(self, periods):
+            return {"currency": "GBP", "periods": periods}
+
+        def _apply_legacy_data_key_removals(self):
+            pass
+
+        def async_show_form(self, **kwargs):
+            return {"type": "form", **kwargs}
+
+        def async_create_entry(self, **kwargs):
+            return {"type": "create_entry", **kwargs}
+
+    for name in methods:
+        setattr(_Flow, name, namespace[name])
+
+    async def run():
+        flow = _Flow()
+        form = await flow.async_step_pricing({"electricity_provider": provider})
+        assert form["step_id"] == "custom_tariff_options"
+        result = await flow.async_step_custom_tariff_options({
+            "tariff_type": tariff_type, "flat_rate": 26.79,
+            "offpeak_rate": 7.0, "fit_rate": 5.0,
+        })
+        if tariff_type == "tou":
+            assert result["step_id"] == "tariff_period_options"
+            result = await flow.async_step_tariff_period_options({
+                "period_start": "06:00", "period_end": "23:00",
+                "period_days": "all_days", "import_rate": 26.79,
+                "export_rate": 5.0,
+            })
+        # Older code fell through to the unrelated demand-charge form and
+        # finishing it retained Octopus despite having saved the custom tariff.
+        if result["type"] == "form":
+            assert result["step_id"] == "demand_charge_options"
+            result = await flow.async_step_demand_charge_options({})
+        assert store.saved and store.tariff["currency"] == "GBP"
+        assert result["type"] == "create_entry"
+        assert result["data"]["electricity_provider"] == provider
+        assert result["data"]["unrelated_option"] == "preserved"
+        assert result["data"].get(
+            "electricity_provider", flow.config_entry.data.get("electricity_provider"),
+        ) != "octopus"
+
+    asyncio.run(run())
 
 
 def _init_class_method(
