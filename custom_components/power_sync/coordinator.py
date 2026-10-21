@@ -2403,14 +2403,17 @@ class AmberUsageCoordinator:
         if not stored:
             _LOGGER.info("Amber usage: no stored data (fresh start or version upgrade)")
             return
-        for day_dict in stored.get("days", []):
+        # Older aggregates used the interval-end date, moving the last interval
+        # into the following day. Re-fetch them; retain independent baselines.
+        billing_dates = stored.get("billing_dates") is True
+        for day_dict in stored.get("days", []) if billing_dates else []:
             try:
                 du = DayUsage(**day_dict)
                 self._days[du.date] = du
             except (TypeError, KeyError):
                 continue
         self._baselines = stored.get("baselines", {})
-        last_ts = stored.get("last_fetch")
+        last_ts = stored.get("last_fetch") if billing_dates else None
         if last_ts:
             try:
                 self._last_fetch = datetime.fromisoformat(last_ts)
@@ -2421,6 +2424,7 @@ class AmberUsageCoordinator:
     def _save_store(self) -> None:
         """Persist current data to HA Store (delayed write)."""
         data = {
+            "billing_dates": True,
             "days": [asdict(du) for du in self._days.values()],
             "baselines": self._baselines,
             "last_fetch": self._last_fetch.isoformat() if self._last_fetch else None,
@@ -2540,12 +2544,13 @@ class AmberUsageCoordinator:
         # Group by date and channel
         day_buckets: dict[str, dict[str, list[dict]]] = {}
         for iv in intervals:
-            dt_str = iv.get("nemTime") or iv.get("startTime") or ""
+            # Amber's date is the billing day. nemTime is the interval END,
+            # so its date is tomorrow for the final interval of a day.
+            day_key = iv.get("date", "")
             try:
-                day_key = dt_str[:10]  # "YYYY-MM-DD"
                 # Validate it's a real date
                 date.fromisoformat(day_key)
-            except (ValueError, IndexError):
+            except (ValueError, TypeError):
                 continue
             channel = iv.get("channelType", "general")
             day_buckets.setdefault(day_key, {}).setdefault(channel, []).append(iv)

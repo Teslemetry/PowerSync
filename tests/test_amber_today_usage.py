@@ -4,6 +4,7 @@ import ast
 from dataclasses import asdict, make_dataclass
 from datetime import date, datetime, timedelta, timezone
 import math
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -90,8 +91,10 @@ def usage_coordinator():
     names = {
         "__init__", "_daily_supply_fee", "_aggregate", "get_summary",
         "get_savings_summary", "get_range", "_get_days_for_period",
+        "_process_intervals",
+        "_load_store", "_save_store", "is_fresh",
     }
-    cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names]
+    cls.body = [n for n in cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in names]
     future = ast.ImportFrom(
         module="__future__", names=[ast.alias(name="annotations")], level=0
     )
@@ -99,8 +102,11 @@ def usage_coordinator():
     ast.fix_missing_locations(module)
     namespace = {
         "date": date,
+        "datetime": datetime,
         "timedelta": timedelta,
         "math": math,
+        "_QUALITY_RANK": {"estimated": 0, "mixed": 1, "billable": 2},
+        "_LOGGER": logging.getLogger(__name__),
         "asdict": asdict,
         "DayUsage": day_type,
         "AMBER_DEFAULT_MONTHLY_SUPPLY_FEE": 25.0,
@@ -194,3 +200,100 @@ def test_missing_usage_days_do_not_accrue_supply_charge(usage_coordinator):
     coordinator._days.clear()
     assert coordinator.get_summary("today")["supply_charge"] == 0.0
     assert coordinator.get_range("2026-10-19", "2026-10-20") == []
+
+
+def _usage_row(day, nem_time, kwh=0.0, cost=0.0, channel="general"):
+    return {"date": day, "nemTime": nem_time, "channelType": channel,
+            "kwh": kwh, "cost": cost, "quality": "billable"}
+
+
+def test_yesterdays_final_zero_interval_does_not_create_billable_today(usage_coordinator):
+    coordinator, entry = usage_coordinator
+    coordinator._days.clear()
+    entry.options["daily_supply_charge"] = 0.0
+    coordinator._process_intervals([
+        _usage_row("2026-10-19", "2026-10-19T23:30:00+10:00", 2.0, 60.0),
+        _usage_row("2026-10-19", "2026-10-20T00:00:00+10:00"),
+    ])
+
+    assert coordinator.get_summary("today")["days_count"] == 0
+    yesterday = coordinator.get_summary("yesterday")
+    assert yesterday["import_kwh"] == 2.0
+    assert yesterday["net_cost"] == 0.60
+
+
+@pytest.mark.parametrize("kwh,cost", [(0.0, 0.0), (2.0, 60.0)])
+def test_genuine_today_rows_include_final_interval_in_same_billing_day(usage_coordinator, kwh, cost):
+    coordinator, entry = usage_coordinator
+    coordinator._days.clear()
+    entry.options["daily_supply_charge"] = 0.0
+    coordinator._process_intervals([
+        _usage_row("2026-10-20", "2026-10-20T23:30:00+10:00", kwh, cost),
+        _usage_row("2026-10-20", "2026-10-21T00:00:00+10:00", 1.0, -10.0, "feedIn"),
+    ])
+
+    today = coordinator.get_summary("today")
+    assert today["days_count"] == 1
+    assert today["import_kwh"] == kwh
+    assert today["export_kwh"] == 1.0
+    assert today["net_cost"] == round(cost / 100 - 0.10, 2)
+    assert "2026-10-21" not in coordinator._days
+
+
+def test_genuinely_measured_zero_remains_billable(usage_coordinator):
+    coordinator, entry = usage_coordinator
+    coordinator._days.clear()
+    entry.options["daily_supply_charge"] = 0.0
+    coordinator._process_intervals([
+        _usage_row("2026-10-20", "2026-10-20T12:00:00+10:00")
+    ])
+    summary = coordinator.get_summary("today")
+    assert summary["days_count"] == 1
+    assert summary["quality"] == "billable"
+    assert summary["net_cost"] == 0.0
+
+
+@pytest.mark.parametrize("day", [None, "invalid", ""])
+def test_invalid_billing_date_cannot_create_today_from_interval_end(usage_coordinator, day):
+    coordinator, _ = usage_coordinator
+    coordinator._days.clear()
+    coordinator._process_intervals([
+        _usage_row(day, "2026-10-20T00:00:00+10:00")
+    ])
+    assert coordinator._days == {}
+
+
+@pytest.mark.asyncio
+async def test_restart_discards_old_date_buckets_preserves_baselines_and_refetches(usage_coordinator):
+    coordinator, _ = usage_coordinator
+    saved = {
+        "days": [asdict(du) for du in coordinator._days.values()],
+        "baselines": {"2026-10-19": 2.0},
+        "last_fetch": "2026-10-20T00:00:00+00:00",
+    }
+
+    async def load():
+        return saved
+
+    coordinator._store = SimpleNamespace(async_load=load)
+    coordinator._days.clear()
+    await coordinator._load_store()
+    assert coordinator._days == {}  # _fetch_usage will backfill 90 days
+    assert coordinator._baselines == {"2026-10-19": 2.0}
+    assert not coordinator.is_fresh()
+
+    coordinator._process_intervals([
+        _usage_row("2026-10-19", "2026-10-20T00:00:00+10:00")
+    ])
+    coordinator._last_fetch = datetime(2026, 10, 20, tzinfo=timezone.utc)
+    coordinator._store.async_delay_save = lambda callback, delay: saved.update(callback())
+    coordinator._save_store()
+    assert saved["billing_dates"] is True
+
+    coordinator._days.clear()
+    coordinator._last_fetch = None
+    await coordinator._load_store()
+    assert coordinator.is_fresh()
+    assert coordinator.get_summary("today")["days_count"] == 0
+    assert coordinator.get_summary("yesterday")["days_count"] == 1
+    assert coordinator._baselines == {"2026-10-19": 2.0}
