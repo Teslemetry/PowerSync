@@ -21617,6 +21617,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         expected_title = "PowerSync NZ"
     elif electricity_provider == "covau":
         expected_title = "PowerSync CovaU SolarMax"
+    elif electricity_provider == "other":
+        expected_title = "PowerSync Custom TOU"
     else:
         expected_title = "PowerSync Amber"
 
