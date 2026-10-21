@@ -1,4 +1,6 @@
 """Mobile requests use the native service, and status never contacts Tesla."""
+import ast
+import __future__
 import importlib.util
 from pathlib import Path
 import sys
@@ -15,7 +17,26 @@ SETTINGS = dict(enabled=True, lowerChargeLimit=50, upperChargeLimit=80)
 def view(monkeypatch):
     package = ModuleType('native_solar_api_probe')
     package.__path__ = [str(ROOT)]
-    package.get_tesla_ev_api_token = lambda *args: ('secret', 'teslemetry')
+    # Load the real credential helper without importing the full integration.
+    # A fabricated helper here previously hid an import that broke HA setup.
+    const = ModuleType(package.__name__ + '.const')
+    for node in ast.parse((ROOT / 'const.py').read_text()).body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            if isinstance(target, ast.Name) and target.id.startswith(
+                ('CONF_TESLA', 'CONF_TESLEMETRY', 'TESLA_PROVIDER', 'TESLA_EV_API_PROVIDER')
+            ):
+                try:
+                    value = ast.literal_eval(node.value)
+                except (ValueError, TypeError):
+                    continue
+                setattr(const, target.id, value)
+                package.__dict__[target.id] = value
+    monkeypatch.setitem(sys.modules, const.__name__, const)
+    helper = next(node for node in ast.parse((ROOT / '__init__.py').read_text()).body
+                  if isinstance(node, ast.FunctionDef) and node.name == 'get_tesla_vehicle_api_token')
+    exec(compile(ast.Module(body=[helper], type_ignores=[]), str(ROOT / '__init__.py'),
+                 'exec', flags=__future__.annotations.compiler_flag), package.__dict__)
     monkeypatch.setitem(sys.modules, package.__name__, package)
     modules = {}
     for name in ('teslemetry_solar', 'teslemetry_solar_api'):
@@ -39,7 +60,12 @@ def view(monkeypatch):
     exceptions = ModuleType('homeassistant.exceptions')
     exceptions.HomeAssistantError = type('HomeAssistantError', (Exception,), {})
     monkeypatch.setitem(sys.modules, exceptions.__name__, exceptions)
-    entry = SimpleNamespace(entry_id='one', title='Home', data={}, options={})
+    entry = SimpleNamespace(entry_id='one', title='Home', data={
+        const.CONF_TESLA_API_PROVIDER: const.TESLA_PROVIDER_POWERSYNC,
+        const.CONF_TESLEMETRY_API_TOKEN: 'site-secret',
+        const.CONF_TESLA_EV_API_PROVIDER: const.TESLA_EV_API_PROVIDER_TESLEMETRY,
+        const.CONF_TESLA_EV_TELEMETRY_TOKEN: 'secret',
+    }, options={})
     calls, views = [], []
     async def service(*args, **kwargs):
         calls.append((args, kwargs))
@@ -50,6 +76,19 @@ def view(monkeypatch):
         http=SimpleNamespace(register_view=views.append))
     modules['teslemetry_solar_api'].register_http_view(hass)
     return views[0], gate, entry, calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('provider', ['teslemetry', 'none'])
+async def test_startup_registration_and_status_use_real_vehicle_credentials(view, provider):
+    api, _, entry, calls = view
+    entry.data['tesla_ev_api_provider'] = provider
+    status, result = await api.get(request())
+    assert api.url == '/api/power_sync/ev/native_solar'
+    assert status == 200 and result['success']
+    assert result['entries'][0]['available'] is (provider == 'teslemetry')
+    assert calls == []
+    assert 'secret' not in str(result)
 
 
 def request(body=None):

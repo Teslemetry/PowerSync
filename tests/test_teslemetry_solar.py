@@ -91,7 +91,7 @@ async def test_service_provider_monitoring_handover_and_readback(monkeypatch):
     root = types.ModuleType('native_solar_service_test')
     root.__path__ = []
     provider = ['teslemetry']
-    root.get_tesla_ev_api_token = lambda *args: ('secret', provider[0])
+    root.get_tesla_vehicle_api_token = lambda *args: ('secret', provider[0])
     monkeypatch.setitem(sys.modules, root.__name__, root)
     monkeypatch.setattr(m, '__package__', root.__name__)
     const = types.ModuleType(root.__name__ + '.const')

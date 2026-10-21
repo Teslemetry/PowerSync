@@ -133,14 +133,14 @@ def register_services(hass):
     from .const import DOMAIN, CONF_MONITORING_MODE
 
     async def handle(call):
-        from . import get_tesla_ev_api_token
+        from . import get_tesla_vehicle_api_token
         from .automations.actions import _dynamic_ev_state
         entries = [e for e in hass.config_entries.async_entries(DOMAIN)
                    if e.entry_id == call.data["entry_id"] and e.entry_id in hass.data.get(DOMAIN, {})]
         if len(entries) != 1:
             raise HomeAssistantError("Select a loaded PowerSync entry")
         entry = entries[0]
-        token, provider = get_tesla_ev_api_token(hass, entry)
+        token, provider = get_tesla_vehicle_api_token(hass, entry)
         if provider != "teslemetry" or not token:
             raise HomeAssistantError("Select Teslemetry as the vehicle API provider in PowerSync settings")
         vin = call.data["vin"].upper()
