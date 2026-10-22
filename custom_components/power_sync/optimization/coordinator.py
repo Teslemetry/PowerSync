@@ -17077,7 +17077,7 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._pending_ev_charge_plan is not None:
             self._pending_ev_charge_plan = [plan for plan in self._pending_ev_charge_plan
                 if canonical.get(plan.vehicle_id, plan.vehicle_id) not in blocked]
-        capacities, capacity_sources, power_limits = {}, {}, {}
+        capacities, capacity_sources, power_limits, charging_parameters = {}, {}, {}, {}
         for vin in reader.cache:
             config = next((config for config in configs
                            if canonical.get(str(config.get("vehicle_id", "")))
@@ -17090,20 +17090,23 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             capacities[vin] = resolved_capacity.effective_battery_capacity_kwh
             capacity_sources[vin] = resolved_capacity.battery_capacity_source
+            charging_parameters[vin] = config
             try:
                 power_limits[vin] = (float(config.get("max_amps", config.get("max_charge_amps")))
                                      * float(config.get("voltage", 230))
                                      * int(config.get("phases", 1)) / 1000)
             except (KeyError, TypeError, ValueError, OverflowError):
                 pass
+        timestamps = [timestamp.astimezone(dt_util.DEFAULT_TIME_ZONE)
+                      for timestamp in self._price_timestamps(n_intervals)]
         native = reader.forecasts(
-            timestamps=[timestamp.astimezone(dt_util.DEFAULT_TIME_ZONE)
-                        for timestamp in self._price_timestamps(n_intervals)],
+            timestamps=timestamps,
             interval_minutes=self._config.interval_minutes,
             latitude=self.hass.config.latitude, longitude=self.hass.config.longitude,
             capacities=capacities, power_limits=power_limits, now=dt_util.now(),
             native_solar_settings=holds,
             excluded_vins=excluded_vins(self.hass, self._entry.entry_id),
+            charging_parameters=charging_parameters,
         )
         smart, price, self._pending_ev_charge_plan = merge_native_schedules(
             native=native, smart=smart_components, price=price_components,
@@ -17111,9 +17114,13 @@ class OptimizationCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             interval_minutes=self._config.interval_minutes,
         )
         self._last_tesla_schedule_forecast = {
+            "entry_id": self._entry.entry_id,
+            "timestamps": [timestamp.isoformat() for timestamp in timestamps],
+            "interval_minutes": self._config.interval_minutes,
             "read_status": dict(reader.diagnostics),
             "excluded_vins": sorted(excluded_vins(self.hass, self._entry.entry_id)),
-            "vehicles": {vin: {"planned_load_w": smart[vin],
+            "vehicles": {vin: {"display_name": charging_parameters[vin].get("display_name") or "Tesla",
+                               "planned_load_w": smart[vin],
                                "energy_needed_kwh": forecast.energy_needed_kwh,
                                "battery_capacity_kwh": capacities[vin],
                                "battery_capacity_source": capacity_sources[vin]}

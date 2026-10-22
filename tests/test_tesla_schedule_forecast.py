@@ -334,5 +334,100 @@ def test_real_coordinator_handoff_resolves_capacity_power_and_native_ownership(m
     assert ids == {VIN} and prices == {} and coordinator._pending_ev_charge_plan == []
     assert smart[VIN] == pytest.approx([3840, 3840, 3840, 0] if held else [3840] * 4)
     diagnostic = coordinator._last_tesla_schedule_forecast['vehicles'][VIN]
+    assert coordinator._last_tesla_schedule_forecast['entry_id'] == 'one'
+    assert coordinator._last_tesla_schedule_forecast['timestamps'][0] == NOW.isoformat()
+    assert coordinator._last_tesla_schedule_forecast['interval_minutes'] == 60
     assert diagnostic['battery_capacity_kwh'] == 72 and diagnostic['battery_capacity_source'] == 'manual'
     assert diagnostic['energy_needed_kwh'] == pytest.approx(24 if held else 48)
+
+
+@pytest.mark.parametrize('voltage', [0, 2, -1, 89, 301, None, float('nan')])
+def test_unplugged_voltage_uses_nominal_supply_not_32_watts(voltage):
+    data = vehicle(charger_voltage=voltage, charge_current_request=16,
+                   charging_state='Disconnected', battery_level=58, charge_limit_soc=70)
+    result = forecast(data, capacity=78, count=30)
+    assert max(result.power_w) == pytest.approx(3680)
+    assert sum(result.power_w) / 1000 == pytest.approx(10.4)
+
+
+def test_configured_three_phase_supply_is_used_when_unplugged():
+    result = m.forecast_vehicle(vehicle_id=VIN,
+        data=vehicle(charger_voltage=2, charger_phases=None, charge_current_request=16),
+        timestamps=[NOW + timedelta(hours=i) for i in range(5)], interval_minutes=60,
+        latitude=-27.47, longitude=153.03, capacity_kwh=60,
+        nominal_voltage=240, nominal_phases=3, max_power_kw=11.52)
+    assert max(result.power_w) == pytest.approx(11520)
+
+
+def provider_snapshot(*, age=60, flat=False, schedules=None):
+    data = vehicle(schedules, charging_state='Disconnected')
+    data['state'] = 'offline'
+    data['charge_schedule_data']['timestamp_seconds'] = (NOW - timedelta(seconds=age)).timestamp()
+    if flat:
+        return {f'{section}_{key}' if isinstance(value, dict) else section: item
+                for section, value in data.items()
+                for key, item in (value.items() if isinstance(value, dict) else [('', value)])}
+    return data
+
+
+@pytest.mark.parametrize('flat', [False, True])
+def test_restart_seeds_fresh_provider_schedules_without_waking_car(flat):
+    async def run():
+        data = provider_snapshot(flat=flat)
+        hass, api, _ = hass_for(data)
+        reader = m.TeslaScheduleReader()
+        await reader.refresh(hass, NOW)
+        assert not api.calls
+        assert VIN in reader.cache
+        assert reader.cache[VIN][0] == NOW - timedelta(seconds=60)
+        result = reader.forecasts(timestamps=[NOW + timedelta(hours=i) for i in range(5)],
+            interval_minutes=60, latitude=-27.47, longitude=153.03,
+            capacities={}, power_limits={}, now=NOW)
+        assert max(result[VIN].power_w) == 7200
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('age', [86401, -60])
+def test_provider_schedule_cache_requires_bounded_timestamp(age):
+    async def run():
+        hass, api, _ = hass_for(provider_snapshot(age=age))
+        reader = m.TeslaScheduleReader()
+        await reader.refresh(hass, NOW)
+        assert not api.calls and reader.cache == {}
+    asyncio.run(run())
+
+
+def test_fresh_provider_empty_schedules_replace_older_cache_without_a_read():
+    async def run():
+        hass, api, _ = hass_for(provider_snapshot(schedules=[]))
+        reader = m.TeslaScheduleReader()
+        reader.cache[VIN] = (NOW - timedelta(hours=1), vehicle())
+        await reader.refresh(hass, NOW)
+        assert not api.calls
+        assert reader.cache[VIN][1]['charge_schedule_data']['charge_schedules'] == []
+    asyncio.run(run())
+
+
+def test_older_provider_schedules_do_not_replace_newer_confirmed_empty_read():
+    async def run():
+        hass, api, _ = hass_for(provider_snapshot())
+        reader = m.TeslaScheduleReader()
+        reader.cache[VIN] = (NOW, vehicle([]))
+        await reader.refresh(hass, NOW)
+        assert not api.calls
+        assert reader.cache[VIN][1]['charge_schedule_data']['charge_schedules'] == []
+    asyncio.run(run())
+
+
+def test_fresh_schedule_cannot_make_stale_battery_data_usable():
+    async def run():
+        data = provider_snapshot()
+        data['charge_state']['timestamp'] = (NOW - timedelta(days=2)).timestamp() * 1000
+        hass, api, _ = hass_for(data)
+        reader = m.TeslaScheduleReader()
+        await reader.refresh(hass, NOW)
+        assert not api.calls
+        assert VIN in reader.cache
+        assert not reader.forecasts(timestamps=[NOW], interval_minutes=60,
+            latitude=-27.47, longitude=153.03, capacities={}, power_limits={}, now=NOW)
+    asyncio.run(run())

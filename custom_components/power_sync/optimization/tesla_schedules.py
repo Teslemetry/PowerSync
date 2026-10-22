@@ -80,6 +80,7 @@ def forecast_vehicle(
     capacity_kwh: float, max_power_kw: float | None = None,
     native_solar_settings: Mapping[str, Any] | None = None,
     one_time_reference: datetime | None = None,
+    nominal_voltage: float | None = None, nominal_phases: int | None = None,
 ) -> TeslaScheduleForecast | None:
     """Expand local recurring windows, union overlaps and cap energy once."""
     if not timestamps:
@@ -100,8 +101,15 @@ def forecast_vehicle(
     amps = _number(charge.get("charge_current_request"))
     if amps <= 0:
         amps = _number(charge.get("charge_current_request_max"))
-    voltage = _number(charge.get("charger_voltage")) or 230.0
-    phases = int(_number(charge.get("charger_phases"), 1))
+    supply_voltage = _number(nominal_voltage, 230.0)
+    if not 90 <= supply_voltage <= 300:
+        supply_voltage = 230.0
+    # Unplugged vehicles can report a nonzero residual voltage (e.g. 2 V).
+    # That is not the supply voltage of the next scheduled home charge.
+    voltage = _number(charge.get("charger_voltage"))
+    if not 90 <= voltage <= 300:
+        voltage = supply_voltage
+    phases = int(_number(nominal_phases or charge.get("charger_phases"), 1))
     phases = 3 if phases in (2, 3) else 1
     power = amps * voltage * phases / 1000
     if max_power_kw is not None and max_power_kw > 0:
@@ -218,6 +226,21 @@ class TeslaScheduleReader:
                         continue
                     if self.diagnostics.get(vin) == "Tesla schedule planning disabled for this vehicle":
                         self.diagnostics[vin] = "Tesla schedule planning enabled; using bounded cache"
+                    # HA providers may already hold schedules while the car is
+                    # asleep, including immediately after a PowerSync restart.
+                    # Their source timestamp bounds freshness; a metadata
+                    # refresh or this reader's clock must not renew old data.
+                    schedules = _section(data, "charge_schedule_data")
+                    schedule_stamp = _timestamp(schedules.get("timestamp_seconds", schedules.get("timestamp")))
+                    if (isinstance(schedules.get("charge_schedules"), list)
+                            and 0 <= now.timestamp() - schedule_stamp <= MAX_CACHE_SECONDS
+                            and (cached is None or schedule_stamp > cached[0].timestamp())):
+                        snapshot = {"charge_schedule_data": schedules,
+                                    "charge_state": _section(data, "charge_state")}
+                        for section in ("drive_state", "location_data"):
+                            snapshot[section] = _section(data, section)
+                        cached = self.cache[vin] = (
+                            datetime.fromtimestamp(schedule_stamp, timezone.utc), snapshot)
                     # Charge state comes from its own timestamp, never from a
                     # location/metadata update or the schedule refresh clock.
                     if cached:
@@ -234,7 +257,8 @@ class TeslaScheduleReader:
                     if previous and (now - previous).total_seconds() < REFRESH_SECONDS:
                         continue
                     if str(data.get("state", "")).lower() != "online":
-                        self.diagnostics[vin] = "Vehicle asleep/offline; no wake requested"
+                        self.diagnostics[vin] = ("Vehicle asleep/offline; using bounded schedule cache; no wake requested"
+                            if cached else "Vehicle asleep/offline; no wake requested")
                         continue
                     self.attempted[vin] = now
                     try:
@@ -280,6 +304,7 @@ class TeslaScheduleReader:
         power_limits: Mapping[str, float], now: datetime,
         native_solar_settings: Mapping[str, Mapping[str, Any]] | None = None,
         excluded_vins: frozenset[str] = frozenset(),
+        charging_parameters: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> dict[str, TeslaScheduleForecast]:
         forecasts = {}
         for vin, (read_at, data) in self.cache.items():
@@ -301,6 +326,8 @@ class TeslaScheduleReader:
                 capacity_kwh=capacities.get(vin, 60.0), max_power_kw=power_limits.get(vin),
                 native_solar_settings=(native_solar_settings or {}).get(vin),
                 one_time_reference=read_at,
+                nominal_voltage=(charging_parameters or {}).get(vin, {}).get("voltage"),
+                nominal_phases=(charging_parameters or {}).get(vin, {}).get("phases"),
             )
             if forecast is not None:
                 forecasts[vin] = forecast
