@@ -437,3 +437,36 @@ def test_restore_normal_marks_failed_sync_restores():
     assert "SERVICE_SYNC_TOU" not in restore_source
     assert 'if tariff_restored is not True:\n                    _mark_tesla_restore_failed(' in restore_source
     assert 'if fallback_restored is False:\n                        _mark_tesla_restore_failed(' in restore_source
+
+
+def test_periodic_upload_keeps_cooldown_after_dropping_long_5xx_retry(upload_harness):
+    """A dropped 503 retry must still hold every caller until Retry-After ends."""
+    upload, hass, session, clock = upload_harness
+    session.responses = [503, 200]
+    original_post = session.post
+
+    def post(url, **kwargs):
+        response = original_post(url, **kwargs)
+        if response.status == 503:
+            response.headers = {"Retry-After": "600"}
+        return response
+
+    session.post = post
+
+    async def run():
+        assert await upload(
+            hass, "site-a", {"name": "stale"}, "token", max_retry_after_seconds=60.0,
+        ) is False
+        clock.now = 300.0
+        assert await upload(
+            hass, "site-a", {"name": "early"}, "token", max_retry_after_seconds=60.0,
+        ) is False
+        assert len(session.posts) == 1
+        clock.now = 600.0
+        assert await upload(
+            hass, "site-a", {"name": "fresh"}, "token", max_retry_after_seconds=60.0,
+        ) is True
+        assert [(post[0], post[2]["tou_settings"]["tariff_content_v2"]["name"])
+                for post in session.posts] == [(0.0, "stale"), (600.0, "fresh")]
+
+    asyncio.run(run())

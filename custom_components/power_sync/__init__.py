@@ -6022,6 +6022,9 @@ async def _send_tariff_to_tesla(
                     )
                     last_error = f"Server error {response.status}"
                     if _tou_retry_after_too_long(retry_after_delay, max_retry_after_seconds):
+                        # Keep the shared cooldown so the next caller still
+                        # waits out this Retry-After after the slot is freed.
+                        rate_limit_state["retry_at"] = time.monotonic() + retry_after_delay
                         _LOGGER.warning(
                             "Not retrying periodic TOU sync for site %s: retry-after %.0fs "
                             "exceeds %.0fs; the next sync will send a fresher tariff",
